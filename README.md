@@ -4,9 +4,9 @@ This folder packages the local code and assets needed to replay the bundled Habi
 
 ## Demo Video
 
-<video src="demo.mp4" controls width="960">
-	Your browser does not support embedded video playback. Open `demo.mp4` directly.
-</video>
+[![Demo video preview](demo.gif)](demo.mp4)
+
+GitHub does not inline local `.mp4` files in README rendering, so this preview uses `demo.gif` and links to the full `demo.mp4`.
 
 Included files:
 
@@ -14,6 +14,7 @@ Included files:
 - `sim.py`
 - `pure_pursuit.py`
 - `17DRP5sb8fy.json.gz`
+- `demo.gif`
 - `tidybot_description/urdf/tidybot_base_minimal.urdf`
 - `tidybot_description/meshes/base/tidybot++/Kinova.stl`
 

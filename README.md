@@ -2,6 +2,12 @@
 
 This folder packages the local code and assets needed to replay the bundled Habitat human demonstration without depending on the rest of this repository's Python files.
 
+## Demo Video
+
+<video src="demo.mp4" controls width="960">
+	Your browser does not support embedded video playback. Open `demo.mp4` directly.
+</video>
+
 Included files:
 
 - `replay_human_demo.py`

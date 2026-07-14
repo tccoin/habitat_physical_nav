@@ -17,7 +17,7 @@ from habitat_sim.utils.settings import default_sim_settings
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_URDF_PATH = (
-    PACKAGE_DIR / "tidybot_description" / "urdf" / "tidybot_base_minimal.urdf"
+    PACKAGE_DIR / "tidybot_description" / "urdf" / "tidybot_base_stabilized.urdf"
 )
 
 
@@ -154,12 +154,15 @@ def extract_path_3d(
     episode: Dict[str, Any], max_steps: Optional[int] = None
 ) -> np.ndarray:
     replay = episode.get("reference_replay", [])
-    if len(replay) == 0:
+    if len(replay) <2:
         raise ValueError("Selected episode has no reference_replay data.")
-
+    # Skip entry 0: it is the pure initial state s_0 (its action is a placeholder
+    # STOP). In every other entry, `action` is the action that PRODUCED that
+    # entry's state, not the action taken from it. See REPLAY_DATA_FORMAT.md.
+    replay = replay[1:]
     if max_steps is not None:
         replay = replay[:max_steps]
-
+    
     path = np.array(
         [step["agent_state"]["position"] for step in replay], dtype=np.float32
     )
@@ -215,13 +218,14 @@ def replay_episode(
         robot_sim.reset(
             scene_id=str(scene_path),
             robot_translation=path_3d[0].copy(),
-            snap_to_navmesh=True,
+            robot_rotation=episode["start_rotation"].copy(),
+            snap_to_navmesh=False,
             vertical_offset=None,
         )
         controller = HolonomicRobotController(robot_sim, pure_pursuit_config=None)
         print(f"Goal category: {episode['object_category']}")
         print(f"Episode info:\n {episode['info']}")
-        timeout = 20
+        timeout = 15
         frames, _poses = record_path(
             robot_sim,
             controller,

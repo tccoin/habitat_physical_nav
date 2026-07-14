@@ -5,6 +5,7 @@ import habitat_sim
 from typing import Dict, List, Any, Optional
 from pure_pursuit import PurePursuitController,ControllerConfig
 import magnum as mn
+from PIL import Image
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -186,11 +187,18 @@ class HabitatRobotSim:
             if isinstance(robot_rotation, (np.ndarray, list, tuple)):
                 if len(robot_rotation) != 4:
                     raise ValueError("robot_rotation array must have 4 elements: [x, y, z, w]")
-                x, y, z, w = robot_rotation
-                robot_rotation = mn.Quaternion(mn.Vector3(x, y, z), w)
-            self.robot.rotation = robot_rotation* self.base_rotation_offset
-        else:
-            self.robot.rotation = self.base_rotation_offset
+                x, y, z, w = robot_rotation #habitat frame: x forward, y up, z right.
+                # want: x forward, y left,z up. 
+                # magnum returns zyx euler, we want standard yaw pitch roll. 
+                robot_rotation = mn.Quaternion(mn.Vector3(x, -z, y), w) # now in standard magnum frame: x forward, y left, z up.
+            # simply override joint homing for theta according to the rotation
+            if home_joint_positions is None:
+                home_joint_positions = {}
+            forward_vec = np.array([1.0, 0.0, 0.0])  # Forward in magnum frame
+            rotated_forward = robot_rotation.transform_vector(forward_vec)
+            
+            home_joint_positions["joint_th"] = float(np.arctan2(rotated_forward[1], rotated_forward[0]))  # Yaw angle in radians
+        self.robot.rotation = self.base_rotation_offset #TODO: allow non aligned base.
 
         # 3. Handle NavMesh Snapping & Vertical Offsets
         if robot_translation is not None:
@@ -216,6 +224,7 @@ class HabitatRobotSim:
         self.robot.joint_forces = [0.0] * num_dofs
 
         if home_joint_positions:
+            joint_positions = self.robot.joint_positions.copy()
             for j_name, pos_target in home_joint_positions.items():
                 m_id = self.joint_name_to_motor_id.get(j_name)
                 if m_id is not None:
@@ -223,12 +232,14 @@ class HabitatRobotSim:
                     l_id = self.robot.existing_joint_motor_ids[m_id]
                     pos_offset = self.robot.get_link_joint_pos_offset(l_id)
                     # joint_name = self.robot.get_link_joint_name(l_id)
-                    self.robot.joint_positions[pos_offset] = pos_target
+                    print(f"homing joint '{j_name}' to {pos_target} (motor_id={m_id}, link_id={l_id}, pos_offset={pos_offset})")
+                    joint_positions[pos_offset] = pos_target
+            self.robot.joint_positions = joint_positions
                     
-                    # Update the motor target so it doesn't try to snap back
-                    settings = self.robot.get_joint_motor_settings(m_id)
-                    settings.position_target = pos_target
-                    self.robot.update_joint_motor(m_id, settings)
+                    # # Update the motor target so it doesn't try to snap back
+                    # settings = self.robot.get_joint_motor_settings(m_id)
+                    # settings.position_target = pos_target
+                    # self.robot.update_joint_motor(m_id, settings)
         # self.robot.awake = True
         
     #TODO: fix this
@@ -329,14 +340,14 @@ class HabitatRobotSim:
         lr.draw_transformed_line(translation, mn.Vector3(0, axis_len, 0)+translation, green)
         lr.draw_transformed_line(translation, mn.Vector3(0, 0, axis_len)+translation, blue)
     
-    def draw_path(self,path_3d):
+    def draw_path(self,path_3d,color):
         lr = self.sim.get_debug_line_render()
         lr.set_line_width(5)
         opacity = 1.0   
         offset = mn.Vector3(0, 0.2, 0)
-        white = mn.Color4(1.0, 0.0, 1.0, opacity)
         for i in range(len(path_3d)-1):
-            lr.draw_transformed_line(path_3d[i]+offset, path_3d[i+1]+offset, white)
+            lr.draw_transformed_line(path_3d[i]+offset, path_3d[i+1]+offset, color)
+
 class HolonomicControllerConfig(ControllerConfig):
     pass
 
@@ -347,22 +358,23 @@ class HolonomicRobotController:
         if pure_pursuit_config is None:
             pure_pursuit_config = HolonomicControllerConfig(
             min_look_ahead_distance=0.05,
-            max_look_ahead_distance=0.5,
-            look_ahead_time=0.3,
+            max_look_ahead_distance=0.4,
+            look_ahead_time=0.2,
             v_max=2.0,
             v_min=0.0,
-            w_max=10.0,
-            w_min=-10.0,
+            w_max=70.0,
+            w_min=-70.0,
             a_max=3.0,
             aw_max=100.0,
             dt=1.0/30.0,
             approach_velocity_scaling_dist=0.5,
             min_approach_linear_velocity=0.1,
-            goal_tolerance_dist=0.15,  # Matches the dataclass spelling
+            goal_tolerance_dist=0.15,  
             regulated_linear_scaling_min_radius=0.01,
             regulated_linear_scaling_min_speed=0.1
             )
             print("Warning: No pure pursuit config provided. Using default values.")
+        
         self.pure_pursuit_config = pure_pursuit_config
         self.controller = PurePursuitController(self.pure_pursuit_config, method_name="dwpp")
         self.path_2d = None
@@ -371,13 +383,21 @@ class HolonomicRobotController:
     
     # to be called each simulator reset/episode
     def reset(self):
-        self.virtual_heading = 0.0  
-        self.virtual_angular_velocity = 0.0 
+        self.virtual_heading = 0.0
+        self.virtual_angular_velocity = 0.0
         self.align_virtual_heading = True
+        self.pose_history: List[np.ndarray] = []
+        
     # set 3d path in habitat coordinates (x forward, y up, z right) and convert to 2d path in robot coordinates (x forward, y left)
     def set_hab_path3(self, path_3d):
-        path_2d = path_3d[:, [0, 2]]*np.array([[1.0,-1.0]]) 
+        path_2d = path_3d[:, [0, 2]]*np.array([[1.0,-1.0]])
+        path_3d_standard = path_3d[:, [0, 2, 1]]*np.array([[1.0, -1.0, 1.0]])
+        resolution  = self.pure_pursuit_config.min_look_ahead_distance/4.0
+        self.path_3d_dense = self.controller.densify_path(path_3d_standard,resolution)[:, [0, 2, 1]]*np.array([[1.0, 1.0, -1.0]])
+        self.path_3d_base = path_3d
         self.set_rob_path2(path_2d)
+        
+        print(f"dense 3d path length: {len(self.path_3d_dense)}, 2d length: {len(self.controller.path)}")
         
     def set_rob_path2(self, path_2d):
         self.path_2d = np.asarray(path_2d, dtype=float)
@@ -408,15 +428,27 @@ class HolonomicRobotController:
         goal_reached = dist_to_goal < self.pure_pursuit_config.goal_tolerance_dist
         return goal_reached
     
-    def step(self, dt: float = 1.0 / 60.0, heading_alignment_gain: float = 1.0,max_vw:float=1.5) -> dict:
+    def step(self, dt: float = 1.0 / 60.0, heading_alignment_gain: float = 1.0,max_vw:float=1.5,final_heading = None) -> dict:
         if self.path_2d is None or self.goal_pos is None:
             raise RuntimeError("No path set. Call set_hab_path3() or set_rob_path2() first.")
 
         self.virtual_heading += self.virtual_angular_velocity * dt
+
         self.current_pose, controller_velocity = self.robot_sim.get_2d_pose_and_twist(
             virtual_heading=self.virtual_heading
         )
-        
+        # proj_idx = self.controller._calc_index(self.current_pose)
+        # proj_point = self.controller.path[proj_idx]
+        # angle = np.arctan2(proj_point[1]-self.current_pose[1], proj_point[0]-self.current_pose[0])
+        # # invert the virtual heading if the angle to the projected point is more than 90 degrees away from the virtual heading
+        # if angle < -np.pi/2:
+        #     self.virtual_heading += np.pi
+        #     controller_velocity*=-1.0
+        # if angle > np.pi/2:
+        #     self.virtual_heading -= np.pi
+        #     controller_velocity*=-1.0 
+                   
+        self.pose_history.append(self.current_pose[:2].copy())
         virtual_pose = np.array(
             [self.current_pose[0], self.current_pose[1], self.virtual_heading], dtype=float
         )
@@ -427,14 +459,23 @@ class HolonomicRobotController:
         goal_reached = self.is_goal_reached()
         heading_error = 0.0
         w_body = 0.0
-        if not goal_reached:
-            heading_error = self.virtual_heading - self.robot_sim.get_joint_state("joint_th")
-            w_body = max(-max_vw, min(max_vw, heading_error*heading_alignment_gain))
-
         next_velocity_ref, debug_info = self.controller.compute_velocity(
             virtual_pose, virtual_velocity
         )
         v_ref, w_ref = next_velocity_ref
+        if not goal_reached:
+            #heading_error = self.virtual_heading - self.robot_sim.get_joint_state("joint_th")
+            tangent_heading = self.controller.get_look_ahead_heading()
+            goal_heading = np.arctan2(self.goal_pos[1]-self.current_pose[1],self.goal_pos[0]-self.current_pose[0]) if final_heading is None else final_heading
+            # smoothly blend between tangent heading and goal heading based on distance to goal
+            dist_to_goal = self.get_distance_to_goal()
+            blend_factor = np.clip(dist_to_goal / 3.0, 0.0, 1.0)
+            blended_heading = blend_factor * tangent_heading + (1.0 - blend_factor) * goal_heading
+            heading_error = blended_heading - self.robot_sim.get_joint_state("joint_th")
+            # Normalize heading error to [-pi, pi]
+            heading_error = (heading_error + math.pi) % (2 * math.pi) - math.pi
+            w_body = max(-max_vw, min(max_vw, heading_error*heading_alignment_gain))
+
 
         if goal_reached:
             twist_command = np.array([0.0, 0.0, 0.0], dtype=float)
@@ -447,7 +488,195 @@ class HolonomicRobotController:
             "twist_frame": (self.virtual_heading, self.virtual_angular_velocity),
             "chassis_twist": twist_command,
         }
-    
+    def draw_path(self):
+        if self.path_3d_dense is not None:
+            last_idx = self.controller.last_idx
+            purple = mn.Color4(1.0, 0.0, 1.0, 1.0)
+            # draw the completed portion of the path and uncompleted portions separately
+            self.robot_sim.draw_path(self.path_3d_base,purple)
+            # self.robot_sim.draw_path(self.path_3d_dense[last_idx:], purple)
+            # self.robot_sim.draw_path(self.path_3d_dense[:last_idx], mn.Color4(0.0, 1.0, 1.0, 1.0))
+
+    def visualize_bev(self, figsize=(5, 5), dpi=100) -> np.ndarray:
+        """Renders a top-down (BEV) debug plot of the path-following state as an RGB image.
+
+        Draws the reference trajectory and the robot's traveled path so far, plus the robot's
+        actual pose as a large arrow with the controller's internal virtual heading (used for
+        path tracking, which can drift from the true heading) overlaid as a smaller arrow at the
+        same position -- this divergence is often exactly what a path-following bug looks like.
+        """
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+
+        if self.controller.path is not None:
+            ref_path = self.controller.path
+            ax.plot(ref_path[:, 0], ref_path[:, 1], "--", color="0.5", linewidth=1.0,
+                     label="reference path", zorder=1)
+        if self.goal_pos is not None:
+            ax.scatter([self.goal_pos[0]], [self.goal_pos[1]], color="red", marker="*", s=150,
+                       zorder=4, label="goal")
+
+        if len(self.pose_history) > 1:
+            hist = np.array(self.pose_history)
+            ax.plot(hist[:, 0], hist[:, 1], "-", color="tab:blue", linewidth=1.5,
+                    label="traveled path", zorder=2)
+
+        if hasattr(self.controller, "look_ahead_idx") and self.controller.path is not None:
+            look_ahead_pos = self.controller.path[self.controller.look_ahead_idx][:2]
+            ax.scatter([look_ahead_pos[0]], [look_ahead_pos[1]], color="tab:green", marker="o",
+                       s=40, zorder=4, label="look-ahead pt")
+
+        x, y, actual_heading = self.robot_sim.get_2d_pose()
+
+        arrow_len = 0.5
+        ax.annotate(
+            "", xytext=(x, y),
+            xy=(x + arrow_len * math.cos(actual_heading), y + arrow_len * math.sin(actual_heading)),
+            arrowprops=dict(facecolor="black", edgecolor="black", width=2.5, headwidth=12, headlength=12),
+            zorder=6,
+        )
+        v_arrow_len = 0.3
+        ax.annotate(
+            "", xytext=(x, y),
+            xy=(x + v_arrow_len * math.cos(self.virtual_heading), y + v_arrow_len * math.sin(self.virtual_heading)),
+            arrowprops=dict(facecolor="tab:orange", edgecolor="tab:orange", width=1.2, headwidth=7, headlength=7),
+            zorder=7,
+        )
+        ax.scatter([x], [y], color="black", s=15, zorder=8)
+
+        ax.set_aspect("equal", adjustable="datalim")
+        ax.margins(0.15)
+        ax.set_xlabel("x (m)")
+        ax.set_ylabel("y (m)")
+        ax.set_title(f"BEV debug (dist to goal: {self.get_distance_to_goal():.2f}m)")
+        ax.legend(loc="upper right", fontsize=6)
+        ax.grid(True, linewidth=0.3, alpha=0.5)
+        fig.tight_layout()
+
+        fig.canvas.draw()
+        img = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
+        plt.close(fig)
+        return img
+
+class HeadingRotationController:
+    """Rotates the robot in place through a sequence of target headings smoothly.
+
+    Unlike HolonomicRobotController (which follows a 2D path), this controller only
+    commands angular velocity: the chassis is driven through a 1D trajectory of yaw
+    headings, advancing to the next heading once the current one is reached.
+    """
+
+    def __init__(
+        self,
+        robot_sim: HabitatRobotSim,
+        w_max: float = 2.0,
+        heading_tolerance: float = 0.03,
+    ):
+        self.robot_sim = robot_sim
+        self.w_max = w_max
+        self.heading_tolerance = heading_tolerance
+        self.headings = None
+        self.reset()
+
+    # to be called each simulator reset/episode
+    def reset(self):
+        self.target_idx = 0
+        self.current_pose = None
+        self.pose_history: List[np.ndarray] = []
+
+    # set the 1D heading trajectory (sequence of target yaw angles in radians)
+    def set_heading_trajectory(self, headings, remove_redundant: bool = False):
+        headings = np.asarray(headings, dtype=float).reshape(-1)
+        if len(headings) == 0:
+            raise ValueError("headings must contain at least one target heading")
+        if remove_redundant:
+            headings = self._remove_redundant_headings(headings)
+        self.headings = headings
+        self.target_idx = 0
+
+    @staticmethod
+    def _remove_redundant_headings(headings):
+        """Drops intermediate waypoints the robot would sweep through anyway.
+
+        The controller always rotates the *shortest way* to each kept target, so we can
+        only drop a waypoint if a single shortest-path move from the last kept anchor still
+        sweeps monotonically through it, in order, on the way to the next waypoint. That
+        means tracking the signed rotation accumulated since the last kept heading: a
+        waypoint must be kept whenever continuing to the next one would either reverse the
+        turn direction or push the accumulated sweep to +/-180 degrees (past which a
+        shortest-path move no longer covers the intended arc). Endpoints are always kept.
+        """
+        def signed_delta(a, b):
+            # shortest-path rotation from a to b, in [-pi, pi]
+            return (b - a + math.pi) % (2 * math.pi) - math.pi
+
+        n = len(headings)
+        kept_idx = [0]
+        acc = 0.0  # signed rotation from the last kept anchor to headings[i-1] (|acc| < pi)
+        for i in range(1, n):
+            d = signed_delta(headings[i - 1], headings[i])  # continuous rotation to the next waypoint
+            new_acc = acc + d
+            same_dir = (d == 0.0) or (acc == 0.0) or (acc * d > 0.0)
+            # can we bridge over headings[i-1], i.e. reach headings[i] from the anchor with one
+            # shortest-path move that still passes through everything dropped so far, in order?
+            bridges = same_dir and abs(new_acc) < math.pi - 1e-9
+            if i == n - 1:
+                # the final waypoint is always kept; anchor headings[i-1] first if we can't bridge
+                if not bridges and kept_idx[-1] != i - 1:
+                    kept_idx.append(i - 1)
+                kept_idx.append(i)
+            elif bridges:
+                acc = new_acc  # headings[i-1] is redundant; extend the sweep to reach headings[i]
+            else:
+                if kept_idx[-1] != i - 1:
+                    kept_idx.append(i - 1)  # headings[i-1] needed to preserve direction/order
+                acc = d
+        return headings[kept_idx]
+
+    def is_trajectory_complete(self) -> bool:
+        return self.headings is None or self.target_idx >= len(self.headings)
+
+    def get_heading_error(self) -> float:
+        current_heading = self.robot_sim.get_joint_state("joint_th")
+        target_heading = self.headings[self.target_idx]
+        # shortest-path error normalized to [-pi, pi]
+        error = (target_heading - current_heading + math.pi) % (2 * math.pi) - math.pi
+        return error
+
+    def step(self, dt: float = 1.0 / 60.0, heading_alignment_gain: float = 3.0) -> dict:
+        if self.headings is None:
+            raise RuntimeError("No heading trajectory set. Call set_heading_trajectory() first.")
+
+        self.current_pose = self.robot_sim.get_2d_pose()
+        self.pose_history.append(self.current_pose[:2].copy())
+
+        if self.is_trajectory_complete():
+            return {
+                "twist_frame": "robot",
+                "chassis_twist": np.array([0.0, 0.0, 0.0], dtype=float),
+            }
+
+        heading_error = self.get_heading_error()
+
+        # advance to the next heading once the current one is reached
+        while abs(heading_error) < self.heading_tolerance:
+            self.target_idx += 1
+            if self.is_trajectory_complete():
+                return {
+                    "twist_frame": "robot",
+                    "chassis_twist": np.array([0.0, 0.0, 0.0], dtype=float),
+                }
+            heading_error = self.get_heading_error()
+
+        w_cmd = np.clip(heading_error * heading_alignment_gain, -self.w_max, self.w_max)
+        return {
+            "twist_frame": "robot",
+            "chassis_twist": np.array([0.0, 0.0, float(w_cmd)], dtype=float),
+        }
+
 from habitat_sim.utils.settings import default_sim_settings
 
 def record_path(robot_sim: HabitatRobotSim, controller: HolonomicRobotController, path_3d, timeout=10, fps=30, debug_draw=True):
@@ -459,16 +688,25 @@ def record_path(robot_sim: HabitatRobotSim, controller: HolonomicRobotController
         if debug_draw:
             robot_sim.draw_axes(path_3d[0], axis_len=1)
             robot_sim.draw_axes(path_3d[-1], axis_len=1)
-            robot_sim.draw_path(path_3d)
         obs =robot_sim.get_obs()
         step_args = controller.step(dt=1.0/fps, heading_alignment_gain=1.0,max_vw=1.5)
+        if debug_draw:
+            controller.draw_path()
         robot_sim.step(
             **step_args,
             dt=1.0 / fps
         )
         rgb_frame = obs["color_sensor"][..., :3]
         pose_2d = robot_sim.get_2d_pose()
-        frames.append(rgb_frame)
+        if debug_draw:
+            bev_frame = controller.visualize_bev()
+            bev_frame = np.array(
+                Image.fromarray(bev_frame).resize((rgb_frame.shape[0], rgb_frame.shape[0]))
+            )
+            frame = np.hstack([rgb_frame, bev_frame])
+        else:
+            frame = rgb_frame
+        frames.append(frame)
         poses.append(pose_2d)
         if controller.is_goal_reached() and robot_sim.is_stationary(lin_vel_threshold=0.01, ang_vel_threshold=0.01):
             print("Goal reached!")
@@ -585,6 +823,99 @@ def main():
     print(f"Saving video to {output_file}...")
     imageio.mimsave(output_file, frames, fps=fps)
     print("Done!")
-    
+
+
+def test_rotation_controller():
+    import imageio
+    import math
+    import random
+    import time
+
+    # 1. Deduce settings (mirrors main())
+    sim_settings = default_sim_settings.copy()
+    sim_settings["scene"] = str(DEFAULT_SCENE_PATH)
+    sim_settings["enable_physics"] = True
+    sim_settings["window_width"] = 640
+    sim_settings["window_height"] = 480
+    sim_settings["default_agent"] = 0
+
+    urdf_path = str(DEFAULT_URDF_PATH)
+
+    # 2. Configure the sensor
+    color_sensor_spec = habitat_sim.sensor.CameraSensorSpec()
+    color_sensor_spec.uuid = "color_sensor"
+    color_sensor_spec.sensor_type = habitat_sim.sensor.SensorType.COLOR
+    color_sensor_spec.resolution = [sim_settings["window_height"], sim_settings["window_width"]]
+    sensor_setup = {"base_camera_link": [color_sensor_spec]}
+
+    # 3. Initialize Simulator
+    print("Initializing simulator...")
+    robot_sim = HabitatRobotSim(
+        sim_settings=sim_settings,
+        urdf_path=urdf_path,
+        sensor_setup=sensor_setup,
+        fixed_base=True,
+    )
+    robot_sim.navmesh_config_and_recompute()
+    robot_sim.sim.seed(random.randint(1, 999999))
+
+    # Reset and snap to a random navigable point
+    print("Resetting and snapping to NavMesh...")
+    pathfinder = robot_sim.sim.pathfinder
+    if pathfinder.is_loaded:
+        initial_position = pathfinder.get_random_navigable_point()
+        print(f"Sampled random initial position: {initial_position}")
+    else:
+        print("Warning: NavMesh not loaded. Falling back to origin.")
+        initial_position = np.array([0.0, 0.0, 0.0])
+
+    robot_sim.reset(
+        scene_id=sim_settings["scene"],
+        robot_translation=initial_position,
+        snap_to_navmesh=True,
+        vertical_offset=None,
+    )
+
+    # 4. Build a heading trajectory relative to the robot's current heading and rotate through it
+    print("Rotating robot through heading trajectory and recording observations...")
+    fps = 30
+    duration_seconds = 10
+
+    start_heading = robot_sim.get_joint_state("joint_th")
+    # sweep a full turn in both directions, in quarter-turn increments
+    heading_trajectory = start_heading + np.array(
+        [math.pi / 2, math.pi, 3 * math.pi / 2, 2 * math.pi, math.pi, 0.0]
+    )
+
+    controller = HeadingRotationController(robot_sim)
+    controller.set_heading_trajectory(heading_trajectory,remove_redundant=True)
+
+    frames = []
+    t0 = time.perf_counter()
+    for _ in range(duration_seconds * fps):
+        obs = robot_sim.get_obs()
+        step_args = controller.step(dt=1.0 / fps)
+        robot_sim.step(**step_args, dt=1.0 / fps)
+        frames.append(obs["color_sensor"][..., :3])
+        if controller.is_trajectory_complete() and robot_sim.is_stationary(
+            lin_vel_threshold=0.01, ang_vel_threshold=0.01
+        ):
+            print("Heading trajectory complete!")
+            break
+        if robot_sim.is_tipped_over(angle_threshold_degrees=45.0):
+            print("Robot tipped over! Stopping simulation.")
+            break
+    t1 = time.perf_counter()
+
+    print(f"Rotated for {len(frames)/fps} seconds in simulation. Total frames captured: {len(frames)}")
+    print(f"Simulation time: {t1 - t0:.2f} seconds. Speedup: {len(frames)/fps / (t1 - t0):.2f}x real-time.")
+    print(f"Trajectory complete: {controller.is_trajectory_complete()}")
+
+    output_file = "robot_rotation_output.mp4"
+    print(f"Saving video to {output_file}...")
+    imageio.mimsave(output_file, frames, fps=fps)
+    print("Done!")
+
+
 if __name__ == "__main__":
-    main()
+    test_rotation_controller()

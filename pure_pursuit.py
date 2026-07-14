@@ -47,6 +47,34 @@ class PurePursuitController:
         self.path = self.densify_path(path, resolution=self.config.min_look_ahead_distance/4.0)
         self._path_distances = self._calc_path_distances(self.path)
         self.last_idx = 0
+        self.last_idx_stale = False
+        
+    def calc_heading(self,idx):
+        """Calculates the heading angle at a given index in the path."""
+        if self.path is None:
+            raise ValueError("Path not set. Call set_path() first.")
+        
+        if idx < 0 or idx > len(self.path) - 1:
+            raise IndexError("Index out of bounds for path array.")
+        
+        # use lower or upper delta to avoid index error at the end of the path
+        if idx == len(self.path) - 1:
+            delta = self.path[idx][:2] - self.path[idx - 1][:2]
+        else:
+            delta = self.path[idx + 1][:2] - self.path[idx][:2]
+        heading_angle = math.atan2(delta[1], delta[0])
+        return heading_angle
+    
+    def get_look_ahead_heading(self):
+        """Returns the heading angle at the current look-ahead index."""
+        if self.path is None:
+            raise ValueError("Path not set. Call set_path() first.")
+        
+        if not hasattr(self, 'look_ahead_idx'):
+            raise AttributeError("Look-ahead index not set. Call compute_velocity() first.")
+        
+        return self.calc_heading(self.look_ahead_idx)
+    
     def compute_velocity(self, current_pose: np.ndarray, current_velocity: np.ndarray) -> Tuple[np.ndarray, Dict]:
         """
         Calculates the next optimal velocity command based on the selected pursuit method.
@@ -108,7 +136,7 @@ class PurePursuitController:
             "curvature": curvature,
             "regulated_v": regulated_v
         }
-        
+        self.last_idx_stale = True  # Mark the last index as stale for the next iteration
         return next_velocity_ref, debug_info
 
     # ---------------------------------------------------------
@@ -148,9 +176,12 @@ class PurePursuitController:
         - at or ahead of the previously selected index, and
         - within one control-step travel budget of that index.
         """
+        if not self.last_idx_stale:
+            # If the last index is still valid, return it directly
+            return self.last_idx
         prev_idx = self.last_idx
         prev_path_distance = self._path_distances[prev_idx]
-        max_advance = self.config.v_max * self.config.dt
+        # max_advance = self.config.v_max * self.config.dt * 3.0 #self.config.max_look_ahead_distance#
 
         candidate_mask = np.logical_and(
             self._path_distances >= prev_path_distance,
@@ -159,12 +190,14 @@ class PurePursuitController:
 
         candidate_indices = np.flatnonzero(candidate_mask)
         if len(candidate_indices) == 0:
-            candidate_indices = np.arange(prev_idx, len(self.path))
+            return self.last_idx
+            # candidate_indices = np.arange(prev_idx, len(self.path))
 
         candidate_points = self.path[candidate_indices, :2]
         distances = np.linalg.norm(candidate_points - current_pose[:2], axis=1)
         idx = candidate_indices[np.argmin(distances)]
         self.last_idx = idx
+        self.last_idx_stale = False
         return idx
 
     def _calc_path_distances(self, path: np.ndarray) -> np.ndarray:
@@ -196,6 +229,7 @@ class PurePursuitController:
         L = float(np.linalg.norm(look_ahead_pos - current_pose[:2]))
         curvature = 2.0 * math.sin(look_ahead_angle) / L
         
+        self.look_ahead_idx = look_ahead_idx # bad to do this with state, TODO: refactor
         return curvature, look_ahead_pos
 
     def _calc_regulated_translational_velocity(self, curvature: float) -> float:
@@ -281,11 +315,13 @@ class PurePursuitController:
         return np.array(next_velocity)
 
     def densify_path(self,path: np.ndarray, resolution: float = 0.1) -> np.ndarray:
-        """Linearly interpolates between waypoints to guarantee a maximum spatial resolution."""
+        """Linearly interpolates between waypoints to guarantee a maximum spatial resolution. Skips points within 1e-6 distance to avoid duplicates."""
         dense_path = [path[0]]
         for i in range(len(path) - 1):
             p1, p2 = path[i], path[i+1]
             dist = np.linalg.norm(p2[:2] - p1[:2])
+            if dist < 1e-6:
+                continue
             num_points = int(np.ceil(dist / resolution))
             
             if num_points > 1:

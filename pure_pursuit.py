@@ -182,7 +182,7 @@ class PurePursuitController:
         prev_idx = self.last_idx
         prev_path_distance = self._path_distances[prev_idx]
         # max_advance = self.config.v_max * self.config.dt * 3.0 #self.config.max_look_ahead_distance#
-
+        max_advance = self.config.max_look_ahead_distance # TODO: make this a config param
         candidate_mask = np.logical_and(
             self._path_distances >= prev_path_distance,
             self._path_distances <= prev_path_distance + max_advance,

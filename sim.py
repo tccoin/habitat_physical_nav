@@ -7,6 +7,51 @@ from pure_pursuit import PurePursuitController,ControllerConfig
 import magnum as mn
 from PIL import Image
 
+# =============================================================================
+# COORDINATE FRAME CONVENTIONS
+# -----------------------------------------------------------------------------
+# Three frames appear in this file. Keeping them straight is essential; the
+# habitat one in particular was previously mis-documented (see reset()).
+#
+# 1. HABITAT WORLD FRAME  (right-handed, y-up)
+#    The frame of `robot.translation`, scene geometry, and every quaternion in
+#    the demonstration `reference_replay`. Per habitat's own constants
+#    (`habitat_sim.geo`):  RIGHT = +x,  UP = +y,  FRONT = -z.
+#    So an agent's *forward* is local -z (NOT +x). Axes: +x right, +y up,
+#    +z backward.
+#
+# 2. ROBOT BODY FRAME  (right-handed, ROS/URDF style)
+#    +x forward, +y left, +z up. `step()` reads `chassis_twist = [v_x, v_y, w]`
+#    in this frame: v_x drives the robot's own forward, v_y its left, w yaws
+#    about +z. Commanding [1,0,0] moves the robot visually forward.
+#
+# 3. PLANAR CONTROL / WORLD FRAME  (2D, right-handed, up = habitat +y)
+#    The ground-projected world frame the base actually navigates in, and the
+#    frame `joint_th` is measured in. Axes:  X = habitat_x,  Y = -habitat_z,
+#    heading theta = joint_th measured CCW from +X.  (X x Y = +habitat_y = up,
+#    so it is right-handed.) Used consistently by the world prismatic joints
+#    joint_x/joint_y, by `get_2d_pose` ([jx + habitat_x, jy - habitat_z, theta]),
+#    and by the controllers (`set_hab_path3` projects paths to (habitat_x,
+#    -habitat_z)).
+#
+#    IMPORTANT: frames 2 and 3 are the SAME convention (x forward, y left, z up).
+#    Frame 3 is the fixed WORLD instance; frame 2 is that same frame CARRIED BY
+#    THE BASE -- translated by (joint_x, joint_y) and yawed by joint_th. Set
+#    joint_x = joint_y = joint_th = 0 and the body frame coincides exactly with
+#    the planar world frame (body +x -> +X, body +y -> +Y, body +z -> up). This
+#    follows directly from step()'s twist rotation at theta = 0, and was verified
+#    in-sim: a [1,0,0] body twist at heading theta moves the base along theta in
+#    frame 3 to <0.01 deg. (So frame 3's theta=0 reference direction, +X =
+#    habitat_x, is simply where the robot's forward points at zero yaw.)
+#
+#    Conversions between HABITAT (1) and the PLANAR frame (3):
+#      * position:  (hx, hy, hz)  ->  (X, Y) = (hx, -hz)
+#      * heading:   rotate FRONT=(0,0,-1) by the habitat quaternion to get the
+#        world forward (fx, fy, fz), then  theta = atan2(-fz, fx).
+#        This is exactly `hab_quat_to_heading`, and it is what maps a demo
+#        agent's orientation onto a robot joint_th target.
+# =============================================================================
+
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_URDF_PATH = (
@@ -69,6 +114,10 @@ class HabitatRobotSim:
                 intertia_from_urdf=False,
             )
         self.robot.auto_clamp_joint_limits = True
+        # The URDF is authored z-up (ROS/URDF convention), but habitat world is
+        # y-up. This -90 deg rotation about +x tilts the whole model so its z-up
+        # sits along habitat +y. It is a fixed model-mounting offset, independent
+        # of joint_th (planar heading is still driven entirely by joint_th).
         self.base_rotation_offset = mn.Quaternion.rotation(
             mn.Rad(-math.pi / 2), mn.Vector3(1.0, 0.0, 0.0)
         )
@@ -109,10 +158,15 @@ class HabitatRobotSim:
                 if sensor_node is not None:
                     # Detach from agent and attach to the robot link
                     sensor_node.object.parent = link_scene_node
-                    # Counteract the base rotation offset so the camera looks forward (-Z) and not at the floor
-                    sensor_node.object.rotation = sensor_node.object.rotation = mn.Quaternion.rotation(mn.Rad(-math.pi/2), mn.Vector3(0, 1, 0))*mn.Quaternion.rotation(mn.Rad(-math.pi/2), mn.Vector3(0, 0, 1)) 
+                    # The sensor now inherits the link's frame (which carries the
+                    # z-up base_rotation_offset). Re-orient it so the camera looks
+                    # along the robot's forward (+x body) in habitat's -z-forward
+                    # image convention, instead of pointing at the floor.
+                    sensor_node.object.rotation = sensor_node.object.rotation = mn.Quaternion.rotation(mn.Rad(-math.pi/2), mn.Vector3(0, 1, 0))*mn.Quaternion.rotation(mn.Rad(-math.pi/2), mn.Vector3(0, 0, 1))
                     # Ensure the sensor is exactly at the URDF link's origin
                     sensor_node.object.translation = mn.Vector3(0, 0, 0)
+    
+    
     def step(
         self, 
         chassis_twist: np.ndarray, 
@@ -120,7 +174,17 @@ class HabitatRobotSim:
         twist_frame: str = "robot",
         dt: float = 1.0 / 60.0
     ) -> dict:
-        
+        """Advance physics under a base twist command.
+
+        chassis_twist = [v_x, v_y, w] is in the ROBOT BODY frame (frame 2):
+        v_x = forward (+x), v_y = left (+y), w = yaw rate about +z. With
+        twist_frame="robot" the body velocity is rotated into the planar world
+        frame (frame 3: X=habitat_x, Y=-habitat_z) by the current heading
+        joint_th and applied to the world prismatic joints joint_x/joint_y; w
+        goes straight to joint_th. twist_frame="world" applies [v_x, v_y]
+        directly in that planar world frame; a (theta0, w) tuple integrates the
+        heading across substeps (used by the pure-pursuit virtual heading).
+        """
         # Determine substepping
         num_steps = max(1, math.ceil(dt / self.max_substep_dt))
         substep_dt = dt / num_steps
@@ -182,22 +246,29 @@ class HabitatRobotSim:
             self.sim.reset()
             self._setup_robot_and_sensors()
 
-        # 2. Process Rotation (Convert [x, y, z, w] to mn.Quaternion)
+        # 2. Seed the base yaw (joint_th) from the requested orientation.
+        # Goal: joint_th = the requested facing as a heading in the planar control
+        # frame (frame 3 in the header): theta CCW from +X, X=habitat_x, Y=-habitat_z.
         if robot_rotation is not None:
             if isinstance(robot_rotation, (np.ndarray, list, tuple)):
                 if len(robot_rotation) != 4:
                     raise ValueError("robot_rotation array must have 4 elements: [x, y, z, w]")
-                x, y, z, w = robot_rotation #habitat frame: x forward, y up, z right.
-                # want: x forward, y left,z up. 
-                # magnum returns zyx euler, we want standard yaw pitch roll. 
-                robot_rotation = mn.Quaternion(mn.Vector3(x, -z, y), w) # now in standard magnum frame: x forward, y left, z up.
-            # simply override joint homing for theta according to the rotation
+                # Habitat agent quaternion [x, y, z, w]. Habitat is x=right, y=up,
+                # z=back, so the agent's FORWARD is -z (habitat_sim.geo.FRONT), NOT
+                # +x. Remap the quaternion into the magnum/planar frame ((hx,hy,hz)
+                # -> (hx,-hz,hy)); under that same remap habitat FRONT=(0,0,-1) maps
+                # to +y, so the agent's forward axis is +y here (not +x).
+                x, y, z, w = robot_rotation
+                robot_rotation = mn.Quaternion(mn.Vector3(x, -z, y), w)
+                forward_vec = np.array([0.0, 1.0, 0.0])  # habitat FRONT (-z) in magnum frame
+            else:
+                # Already a magnum quaternion in the planar frame; its +x is forward.
+                forward_vec = np.array([1.0, 0.0, 0.0])
             if home_joint_positions is None:
                 home_joint_positions = {}
-            forward_vec = np.array([1.0, 0.0, 0.0])  # Forward in magnum frame
             rotated_forward = robot_rotation.transform_vector(forward_vec)
-            
-            home_joint_positions["joint_th"] = float(np.arctan2(rotated_forward[1], rotated_forward[0]))  # Yaw angle in radians
+            # Heading in the control frame X=habitat_x, Y=-habitat_z (== hab_quat_to_heading).
+            home_joint_positions["joint_th"] = float(np.arctan2(rotated_forward[1], rotated_forward[0]))
         self.robot.rotation = self.base_rotation_offset #TODO: allow non aligned base.
 
         # 3. Handle NavMesh Snapping & Vertical Offsets
@@ -262,27 +333,37 @@ class HabitatRobotSim:
             return self.robot.joint_positions[pos_offset]
         
     def get_2d_pose_and_twist(self, virtual_heading = None) -> tuple[np.ndarray, np.ndarray]:
+        """Pose [X, Y, theta] and twist [v_forward, w] in the planar control frame.
+
+        The world position is X = habitat_x, Y = -habitat_z, assembled as the
+        prismatic joint value plus the base translation on each axis
+        (jx + habitat_x, jy - habitat_z). theta = joint_th, CCW from +X. Passing
+        virtual_heading substitutes the controller's virtual heading for joint_th
+        (used by pure-pursuit path tracking).
+        """
         jx = self.get_joint_state("joint_x")
         jy = self.get_joint_state("joint_y")
         jth = self.get_joint_state("joint_th") if virtual_heading is None else virtual_heading  # Adjust for URDF orientation
-        
+
         # Retrieve current velocity
         vx = self.get_joint_state("joint_x", is_vel=True)
         vy = self.get_joint_state("joint_y", is_vel=True)
         vth = self.get_joint_state("joint_th", is_vel=True)
-        
+
+        # rx = habitat_x, rz = habitat_z of the base; planar Y uses -habitat_z.
         rz,rx = self.robot.translation[2],self.robot.translation[0]
         v_forward = vx * math.cos(jth) + vy * math.sin(jth)
-        
+
         # limit jth to [-pi, pi]
         jth = (jth + math.pi) % (2 * math.pi) - math.pi
         return np.array([jx+rx,jy-rz, jth]), np.array([v_forward, vth])
-    
+
     def get_2d_pose(self) -> np.ndarray:
+        """Planar pose [X, Y, theta] with X=habitat_x, Y=-habitat_z, theta=joint_th."""
         jx = self.get_joint_state("joint_x")
         jy = self.get_joint_state("joint_y")
-        jth = self.get_joint_state("joint_th") 
-        
+        jth = self.get_joint_state("joint_th")
+
         jth = (jth + math.pi) % (2 * math.pi) - math.pi
         rz,rx = self.robot.translation[2],self.robot.translation[0]
         return np.array([jx+rx,jy-rz, jth])
@@ -388,11 +469,19 @@ class HolonomicRobotController:
         self.align_virtual_heading = True
         self.pose_history: List[np.ndarray] = []
         
-    # set 3d path in habitat coordinates (x forward, y up, z right) and convert to 2d path in robot coordinates (x forward, y left)
     def set_hab_path3(self, path_3d):
+        """Set a path given in HABITAT world coords (x=right, y=up, z=back).
+
+        The controller works in the planar frame (X=habitat_x, Y=-habitat_z), so:
+          * path_2d = (habitat_x, -habitat_z)          -- the 2D tracking path.
+          * path_3d_standard = (habitat_x, -habitat_z, habitat_y) -- a z-up copy
+            used only to densify in 3D; it is mapped straight back to habitat
+            coords (path_3d_dense) afterward for debug drawing.
+        """
         path_2d = path_3d[:, [0, 2]]*np.array([[1.0,-1.0]])
         path_3d_standard = path_3d[:, [0, 2, 1]]*np.array([[1.0, -1.0, 1.0]])
         resolution  = self.pure_pursuit_config.min_look_ahead_distance/4.0
+        # densify in the z-up frame, then reorder/sign back to habitat (x,y,z).
         self.path_3d_dense = self.controller.densify_path(path_3d_standard,resolution)[:, [0, 2, 1]]*np.array([[1.0, 1.0, -1.0]])
         self.path_3d_base = path_3d
         self.set_rob_path2(path_2d)
@@ -428,7 +517,7 @@ class HolonomicRobotController:
         goal_reached = dist_to_goal < self.pure_pursuit_config.goal_tolerance_dist
         return goal_reached
     
-    def step(self, dt: float = 1.0 / 60.0, heading_alignment_gain: float = 1.0,max_vw:float=1.5,final_heading = None) -> dict:
+    def step(self, dt: float = 1.0 / 60.0, heading_alignment_gain: float = 3.0,max_vw:float=1.5,final_heading = None) -> dict:
         if self.path_2d is None or self.goal_pos is None:
             raise RuntimeError("No path set. Call set_hab_path3() or set_rob_path2() first.")
 
@@ -715,6 +804,184 @@ def record_path(robot_sim: HabitatRobotSim, controller: HolonomicRobotController
             print("Robot tipped over! Stopping simulation.")
             break
     return frames, poses
+
+
+def hab_quat_to_heading(rotation_xyzw) -> float:
+    """Convert a Habitat ``[x, y, z, w]`` agent rotation to the robot's 2D heading.
+
+    The heading is returned in the planar control frame (frame 3 in the module
+    header) -- the frame ``joint_th`` drives motion in and that
+    ``HolonomicRobotController`` aligns to: axes ``X = habitat_x``,
+    ``Y = -habitat_z`` (see ``get_2d_pose`` / ``set_hab_path3``). The agent's
+    forward axis is habitat local ``-z`` (``habitat_sim.geo.FRONT``); we rotate it
+    by the quaternion and take its heading in the control plane as
+    ``atan2(-forward_z, forward_x)``. Verified to match the actual per-step
+    displacement of every ``MOVE_FORWARD`` in the demos to 0.000 deg, so
+    ``HeadingRotationController`` tracks these headings faithfully and a look phase
+    leaves the robot facing the direction it must next walk.
+
+    This is the same convention ``HabitatRobotSim.reset`` now uses to seed
+    ``joint_th`` (both take habitat FRONT = -z as forward), so spawn heading and
+    tracked headings agree.
+    """
+    x, y, z, w = (float(c) for c in rotation_xyzw)
+    # World-frame forward direction = quaternion applied to habitat local -z.
+    forward_x = -(2.0 * (x * z + w * y))
+    forward_z = -(1.0 - 2.0 * (x * x + y * y))
+    # Control/motion plane is (X = habitat_x, Y = -habitat_z).
+    return float(math.atan2(-forward_z, forward_x))
+
+
+def _build_phases(num_actions, looking_slices):
+    """Tile the action timeline ``[0, num_actions)`` with ordered move/look phases.
+
+    ``looking_slices`` are ``[start, end)`` half-open ranges in ACTION-index space
+    (ascending, non-overlapping, as returned by
+    ``replay_human_demo.find_looking_slices``). Every gap between them -- plus the
+    head and tail -- becomes a ``move`` phase. Returns a list of
+    ``(kind, start, end)`` tuples, ``kind in {'move', 'look'}``, that exactly
+    covers ``[0, num_actions)`` in order.
+    """
+    phases = []
+    cursor = 0
+    for start, end in looking_slices:
+        if start > cursor:
+            phases.append(("move", cursor, start))
+        phases.append(("look", start, end))
+        cursor = end
+    if cursor < num_actions:
+        phases.append(("move", cursor, num_actions))
+    return phases
+
+
+def record_segmented_demo(
+    robot_sim: HabitatRobotSim,
+    path_3d,
+    path_headings,
+    looking_slices,
+    timeout: int = 15,
+    fps: int = 30,
+    debug_draw: bool = False,
+    pure_pursuit_config: Optional[HolonomicControllerConfig] = None,
+):
+    """Replay a discrete demonstration as a continuous trajectory, switching
+    between a path-following controller (while moving) and an in-place rotation
+    controller (while "looking": panoramic scans / peeks).
+
+    ------------------------------------------------------------------------
+    Index conventions and the action -> path-index conversion (read carefully)
+    ------------------------------------------------------------------------
+    The arrays are built by ``replay_human_demo.extract_demo`` so that they are
+    all mutually aligned:
+
+      * ``path_3d[m]``       -- world position at demo path point ``m``
+      * ``path_headings[m]`` -- ``joint_th``-frame yaw at demo path point ``m``
+        for ``m = 0 .. M``  (there are ``M + 1`` path points).
+      * The action timeline has ``M = len(path_3d) - 1`` entries. Action ``j``
+        is exactly the demo action that carries the robot FROM path point ``j``
+        TO path point ``j + 1``. ``looking_slices`` are ``[start, end)`` ranges
+        in this action space, ``0 <= start < end <= M``.
+
+    Converting an action-index phase ``[p, q)`` to reference data:
+
+      * MOVE phase -> follow the sub-path ``path_3d[p : q + 1]``. Actions
+        ``p .. q-1`` span path segments ``(p->p+1), ..., (q-1->q)``, i.e. path
+        points ``p`` through ``q`` inclusive; hence the ``q + 1`` slice end.
+      * LOOK phase -> rotate in place through ``path_headings[p : q + 1]``. Turns
+        and looks do not translate, so path points ``p .. q`` share one position;
+        instead of a path we track the heading at the phase's anchor point ``p``
+        followed by one heading per look action (points ``p+1 .. q``). The robot
+        never moves, only re-orients.
+
+    Because move phases start their sub-path at point ``p`` and the preceding look
+    phase ended (position-wise) at that same point ``p``, and vice versa, phases
+    chain together with no positional gap -- continuity is carried by the shared
+    ``robot_sim`` state, which each controller reads live.
+    """
+    path_3d = np.asarray(path_3d, dtype=np.float32)
+    path_headings = np.asarray(path_headings, dtype=float)
+    num_actions = len(path_3d) - 1
+    if num_actions < 1:
+        return [], []
+
+    phases = _build_phases(num_actions, looking_slices)
+
+    # One controller instance of each type, reconfigured (via reset + set_*) per
+    # phase; the robot's live pose provides continuity across the handoffs.
+    move_controller = HolonomicRobotController(robot_sim, pure_pursuit_config)
+    look_controller = HeadingRotationController(robot_sim)
+
+    robot_sim.sim.navmesh_visualization = debug_draw
+    frames = []
+    poses = []
+
+    for kind, p, q in phases:
+        if kind == "move":
+            move_controller.reset()
+            move_controller.set_hab_path3(path_3d[p : q + 1])
+            local_timeout = int(np.ceil(move_controller.controller._path_distances[-1] / 0.5 + 0.5))
+            # print(local_timeout)
+            # print(type(local_timeout))
+            print(f"Move phase: {p} -> {q}, path length: {move_controller.controller._path_distances[-1]:.2f}m, timeout: {local_timeout:.1f}s")
+        else:
+            look_controller.reset()
+            look_controller.set_heading_trajectory(
+                path_headings[p : q + 1], remove_redundant=True
+            )
+            local_timeout =  2 * (q - p + 1)  # allow more time for longer look phases
+            print(f"Look phase: {p} -> {q}, num headings: {len(look_controller.headings)}, timeout: {local_timeout:.1f}s")
+        for _ in range(local_timeout * fps):
+            obs = robot_sim.get_obs()
+            if debug_draw:
+                robot_sim.draw_axes(path_3d[0], axis_len=1)
+                robot_sim.draw_axes(path_3d[-1], axis_len=1)
+
+            if kind == "move":
+                step_args = move_controller.step(
+                    dt=1.0 / fps, heading_alignment_gain=3.0, max_vw=2.0
+                )
+                if debug_draw:
+                    move_controller.draw_path()
+            else:
+                step_args = look_controller.step(dt=1.0 / fps)
+
+            robot_sim.step(**step_args, dt=1.0 / fps)
+
+            rgb_frame = obs["color_sensor"][..., :3]
+            if debug_draw:
+                if kind == "move":
+                    panel = move_controller.visualize_bev()
+                else:
+                    # HeadingRotationController has no BEV; pad with a blank panel
+                    # so every frame keeps the same shape for imageio.mimsave.
+                    panel = np.zeros(
+                        (rgb_frame.shape[0], rgb_frame.shape[0], 3), dtype=rgb_frame.dtype
+                    )
+                panel = np.array(
+                    Image.fromarray(panel).resize((rgb_frame.shape[0], rgb_frame.shape[0]))
+                )
+                frame = np.hstack([rgb_frame, panel])
+            else:
+                frame = rgb_frame
+            frames.append(frame)
+            poses.append(robot_sim.get_2d_pose())
+
+            if kind == "move":
+                phase_done = move_controller.is_goal_reached() and robot_sim.is_stationary(
+                    lin_vel_threshold=0.01, ang_vel_threshold=0.01
+                )
+            else:
+                phase_done = look_controller.is_trajectory_complete() and robot_sim.is_stationary(
+                    lin_vel_threshold=0.01, ang_vel_threshold=0.01
+                )
+            if phase_done:
+                break
+            if robot_sim.is_tipped_over(angle_threshold_degrees=45.0):
+                print("Robot tipped over! Stopping simulation.")
+                return frames, poses
+        
+    return frames, poses
+
 
 def main():
     import imageio

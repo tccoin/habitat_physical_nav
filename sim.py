@@ -922,14 +922,14 @@ def record_segmented_demo(
             local_timeout = int(np.ceil(move_controller.controller._path_distances[-1] / 0.5 + 0.5))
             # print(local_timeout)
             # print(type(local_timeout))
-            print(f"Move phase: {p} -> {q}, path length: {move_controller.controller._path_distances[-1]:.2f}m, timeout: {local_timeout:.1f}s")
+            # print(f"Move phase: {p} -> {q}, path length: {move_controller.controller._path_distances[-1]:.2f}m, timeout: {local_timeout:.1f}s")
         else:
             look_controller.reset()
             look_controller.set_heading_trajectory(
                 path_headings[p : q + 1], remove_redundant=True
             )
             local_timeout =  2 * (q - p + 1)  # allow more time for longer look phases
-            print(f"Look phase: {p} -> {q}, num headings: {len(look_controller.headings)}, timeout: {local_timeout:.1f}s")
+            # print(f"Look phase: {p} -> {q}, num headings: {len(look_controller.headings)}, timeout: {local_timeout:.1f}s")
         for _ in range(local_timeout * fps):
             obs = robot_sim.get_obs()
             if debug_draw:
@@ -977,9 +977,11 @@ def record_segmented_demo(
             if phase_done:
                 break
             if robot_sim.is_tipped_over(angle_threshold_degrees=45.0):
-                print("Robot tipped over! Stopping simulation.")
+                # print("Robot tipped over! Stopping simulation.")
                 return frames, poses
-        
+        if len(frames) >= timeout * fps:
+            # print("Timeout reached! Stopping simulation.")
+            break
     return frames, poses
 
 

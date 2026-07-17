@@ -1,0 +1,147 @@
+<?xml version="1.0" ?>
+<!-- Minimal Tidybot base: virtual holonomic gantry + passive suspension + body.
+     No arm, no gripper.  Use this for fast loading / base-only experiments. -->
+<robot name="tidybot_base">
+  <link name="world"/>
+
+  <!-- Virtual holonomic gantry -->
+  <link name="joint_x_jointbody">
+    <inertial>
+      <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.0"/>
+      <mass value="0.001"/>
+      <inertia ixx="1e-09" ixy="0" ixz="0" iyy="1e-09" iyz="0" izz="1e-09"/>
+    </inertial>
+  </link>
+  <joint name="joint_x" type="prismatic">
+    <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.085"/>
+    <parent link="world"/>
+    <child link="joint_x_jointbody"/>
+    <axis xyz="1 0 0"/>
+    <limit effort="1000" lower="-1024.0" upper="1024.0" velocity="5"/>
+    <dynamics damping="6.0" friction="0.0"/>
+  </joint>
+
+  <link name="joint_y_jointbody">
+    <inertial>
+      <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.0"/>
+      <mass value="0.001"/>
+      <inertia ixx="1e-09" ixy="0" ixz="0" iyy="1e-09" iyz="0" izz="1e-09"/>
+    </inertial>
+  </link>
+  <joint name="joint_y" type="prismatic">
+    <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.0"/>
+    <parent link="joint_x_jointbody"/>
+    <child link="joint_y_jointbody"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="1000" lower="-1024.0" upper="1024.0" velocity="5"/>
+    <dynamics damping="6.0" friction="0.0"/>
+  </joint>
+
+  <link name="joint_th_jointbody">
+    <inertial>
+      <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.0"/>
+      <mass value="0.001"/>
+      <inertia ixx="1e-09" ixy="0" ixz="0" iyy="1e-09" iyz="0" izz="1e-09"/>
+    </inertial>
+  </link>
+  <joint name="joint_th" type="revolute">
+    <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.0"/>
+    <parent link="joint_y_jointbody"/>
+    <child link="joint_th_jointbody"/>
+    <axis xyz="0.0 0.0 1.0"/>
+    <limit effort="500" lower="-1024" upper="1024" velocity="10"/>
+    <dynamics damping="1.0" friction="0.0"/>
+  </joint>
+
+  <!-- Passive suspension (z / pitch / roll) -->
+  <link name="joint_z_jointbody">
+    <inertial>
+      <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.0"/>
+      <mass value="0.001"/>
+      <inertia ixx="1e-09" ixy="0" ixz="0" iyy="1e-09" iyz="0" izz="1e-09"/>
+    </inertial>
+  </link>
+  <joint name="joint_z" type="prismatic">
+    <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.0"/>
+    <parent link="joint_th_jointbody"/>
+    <child link="joint_z_jointbody"/>
+    <axis xyz="0.0 0.0 1.0"/>
+    <limit effort="0" lower="-100.0" upper="100.0" velocity="100"/>
+    <dynamics damping="0.0" friction="0.0"/>
+  </joint>
+
+  <link name="joint_pitch_jointbody">
+    <inertial>
+      <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.0"/>
+      <mass value="0.001"/>
+      <inertia ixx="1e-09" ixy="0" ixz="0" iyy="1e-09" iyz="0" izz="1e-09"/>
+    </inertial>
+  </link>
+  <joint name="joint_pitch" type="revolute">
+    <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.0"/>
+    <parent link="joint_z_jointbody"/>
+    <child link="joint_pitch_jointbody"/>
+    <axis xyz="0.0 1.0 0.0"/>
+    <limit effort="0" lower="-0.2" upper="0.2" velocity="1.0"/>
+    <dynamics damping="3.0" friction="0.0"/>
+  </joint>
+
+  <link name="joint_roll_jointbody">
+    <inertial>
+      <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.0"/>
+      <mass value="0.001"/>
+      <inertia ixx="1e-09" ixy="0" ixz="0" iyy="1e-09" iyz="0" izz="1e-09"/>
+    </inertial>
+  </link>
+  <joint name="joint_roll" type="revolute">
+    <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.0"/>
+    <parent link="joint_pitch_jointbody"/>
+    <child link="joint_roll_jointbody"/>
+    <axis xyz="1.0 0.0 0.0"/>
+    <limit effort="0" lower="-0.2" upper="0.2" velocity="1.0"/>
+    <dynamics damping="3.0" friction="0.0"/>
+  </joint>
+
+  <!-- Body -->
+  <joint name="joint_body_mount" type="fixed">
+    <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.0"/>
+    <parent link="joint_roll_jointbody"/>
+    <child link="base"/>
+  </joint>
+
+  <link name="base">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <mass value="34"/>
+      <inertia ixx="1e-09" ixy="0" ixz="0" iyy="1e-09" iyz="0" izz="1e-09"/>
+    </inertial>
+    <visual>
+      <origin rpy="0 -0 0" xyz="-0.3066 0.06523 0.085"/>
+      <geometry>
+        <mesh filename="../meshes/base/tidybot++/Kinova.stl"/>
+      </geometry>
+      <material name="grey">
+        <color rgba="0.5 0.5 0.5 1"/>
+      </material>
+    </visual>
+    <collision>
+      <!-- Box primitive: avoids flat-mesh contact point explosion in Bullet.
+           Centre matches visual mesh origin; bottom face at z=0 (ground). -->
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <box size="0.2 0.2 0.1"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <link name="base_camera_link"/>
+  <joint name="base_camera_joint" type="fixed">
+    <origin rpy="0 0.0 0" xyz="-0.1 0.0 1.1"/>
+    <parent link="base"/>
+    <child link="base_camera_link"/>
+  </joint>
+
+  <material name="grey">
+    <color rgba="0.5 0.5 0.5 1"/>
+  </material>
+</robot>

@@ -78,6 +78,47 @@ def sanitize(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "_", str(name))
 
 
+def load_done_episode_ids(metadata_dir: Path, scene: str) -> set:
+    """Episode ids already completed for ``scene``, read from its own JSONL only.
+
+    Because the metadata is sharded per scene (``<scene>.jsonl``), resuming a run
+    -- even one targeting a single scene -- never has to scan the other scenes'
+    files: we open just the shard that matches the scene being generated.
+    """
+    path = metadata_dir / f"{scene}.jsonl"
+    done: set = set()
+    if not path.exists():
+        return done
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # tolerate a torn final line from an interrupted run
+            ep = rec.get("episode_id")
+            if ep is not None:
+                done.add(ep)
+    return done
+
+
+def load_failed_episode_ids(log_file: Path) -> set:
+    """Episode ids previously logged as skipped/failed (so we don't retry them)."""
+    failed: set = set()
+    if not log_file.exists():
+        return failed
+    with open(log_file, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("#") or not line.strip():
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 2 and parts[1]:
+                failed.add(parts[1])  # episode_id column
+    return failed
+
+
 def reference_final_xy(path_3d: np.ndarray) -> np.ndarray:
     """Planar (X, Y) of the demo's final reference position.
 
@@ -194,21 +235,37 @@ def generate(
 
     n_ok = 0
     n_failed = 0
+    n_resumed = 0  # episodes skipped because a prior run already handled them
     processed = 0
 
-    # Open the log up front so early length-filtered episodes are recorded even
-    # if a scene fails to load later.
-    with open(log_file, "w", encoding="utf-8") as log:
-        log.write(f"# Failed / skipped episodes for {dataset_path}\n")
-        log.write("# columns: episode_index\tepisode_id\tscene\treason\n")
+    # Resume support: episodes already completed (per-scene JSONL shards, read
+    # lazily below) or previously failed (the log) are skipped. Load the failed
+    # set once up front; done ids are loaded per scene so a single-scene run only
+    # ever touches that scene's shard.
+    failed_ids = load_failed_episode_ids(log_file)
+    log_is_new = not log_file.exists() or log_file.stat().st_size == 0
+
+    # Append so failures accumulate across resumed runs instead of being wiped.
+    with open(log_file, "a", encoding="utf-8") as log:
+        if log_is_new:
+            log.write(f"# Failed / skipped episodes for {dataset_path}\n")
+            log.write("# columns: episode_index\tepisode_id\tscene\treason\n")
         for idx, ep_id, reason in too_long:
+            if ep_id in failed_ids:
+                continue  # already recorded on a previous run
             log.write(f"{idx}\t{ep_id}\t-\t{reason}\n")
+            failed_ids.add(ep_id)
             n_failed += 1
         log.flush()
 
         for scene_id, scene_episodes in by_scene.items():
             scene = scene_name(scene_id)
-            print(f"\n=== Scene {scene} ({len(scene_episodes)} episode(s)) ===")
+            done_ids = load_done_episode_ids(metadata_dir, scene)
+            print(
+                f"\n=== Scene {scene} ({len(scene_episodes)} episode(s)"
+                + (f", {len(done_ids)} already done" if done_ids else "")
+                + ") ==="
+            )
 
             try:
                 scene_path = resolve_scene_path(scene_id, scene_root)
@@ -224,19 +281,27 @@ def generate(
                 print(f"  ! Skipping scene {scene}: {exc}")
                 for idx, episode in scene_episodes:
                     ep_id = episode.get("episode_id", str(idx))
+                    if ep_id in done_ids or ep_id in failed_ids:
+                        continue
                     log.write(f"{idx}\t{ep_id}\t{scene}\tscene load failed: {exc}\n")
+                    failed_ids.add(ep_id)
                     n_failed += 1
                 log.flush()
                 continue
 
             jsonl_path = metadata_dir / f"{scene}.jsonl"
             try:
-                with open(jsonl_path, "w", encoding="utf-8") as jf:
+                # Append so records from prior runs are preserved (resume).
+                with open(jsonl_path, "a", encoding="utf-8") as jf:
                     for idx, episode in scene_episodes:
+                        ep_id = episode.get("episode_id", str(idx))
+                        # Resume: skip anything a prior run already finished or logged.
+                        if ep_id in done_ids or ep_id in failed_ids:
+                            n_resumed += 1
+                            continue
                         if max_episodes is not None and processed >= max_episodes:
                             break
                         processed += 1
-                        ep_id = episode.get("episode_id", str(idx))
                         ep_dir_name = sanitize(ep_id)
 
                         try:
@@ -299,7 +364,8 @@ def generate(
                 robot_sim.sim.close(destroy=True)
 
     print(
-        f"\nDone. {n_ok} episode(s) written, {n_failed} skipped/failed. "
+        f"\nDone. {n_ok} episode(s) written, {n_failed} skipped/failed, "
+        f"{n_resumed} skipped (already done/failed on a prior run). "
         f"Log: {log_file}"
     )
 

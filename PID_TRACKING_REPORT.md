@@ -56,14 +56,20 @@ steps, i.e. ~8s to ~55s of demo) to cover short/medium/long variety.
 the raw human-demo start position (`path_3d[0]`) with navmesh snapping
 re-applied does *not* reliably reproduce the exact spawn point the stored
 `pose2d` trajectory started from — for one test episode the snap now resolves
-to a point ~1m away from where it did when `data/` was generated, an
-environment/navmesh drift unrelated to tracking quality, which briefly showed
-up as a spurious 1m tracking "error" at step 0 and (when accel limits were
+to a point ~1m away from where it did when `data/` was generated (693
+re-simulated poses vs. 710 stored for the same episode). The root cause
+wasn't fully diagnosed — it's consistent with navmesh/pathfinder state or
+version drift between when `data/` was generated and now, but that's an
+inference, not a confirmed mechanism. Whatever the cause, it briefly showed up
+as a spurious 1m tracking "error" at step 0 and (when accel limits were
 raised) an unstable-looking 3.8m position spike downstream while the
 controller tried to catch up. Fixed by spawning directly from the recorded
 `pose2d[0]` (holding height from `path_3d[0]`, which comes from the human
 demo and isn't subject to snapping) with `snap_to_navmesh=False` — this
-sidesteps the drift and lets the metrics measure what they're supposed to.
+sidesteps the drift for this eval, but **the underlying non-reproducibility of
+sim state across runs is a separate, unresolved concern worth flagging for
+anyone planning RL rollouts or VLA eval in this simulator**, where exact
+episode reproducibility may matter more than it does here.
 
 ## Results (5 episodes, final gains)
 
@@ -101,6 +107,24 @@ generated artifacts, so these aren't checked in.)
   starting values (`a_max=3.0`, `w_max=70°/s`, `aw_max=100°/s²`) was the
   single biggest lever — it cut angular saturation from ~60–68% of steps down
   to ~1–6%, and roughly halved ADE on the episodes with heavy scanning.
+
+## Step-response check (single-setpoint regulation, not just on-trajectory tracking)
+
+The 5-episode validation above always tracks a *feasible* reference — spawned
+exactly on `pose2d[0]`, with consecutive setpoints only `v_max * dt` ≈ 0.07 m
+apart, so the feedback loop is always correcting a near-zero error. That's
+the trajectory-tracking case, but it doesn't exercise the single-step
+"position control" case the task also names (and that a VLA/RL caller
+commanding one target pose at a time will always hit): servoing to a
+setpoint you're not already at, under the same aggressive `a_max`/`w_max`
+limits tuned above.
+
+Checked separately: spawned on `pose2d[0]` of the shortest episode, then held
+a constant target 0.4 m/0.4 m/30° away for 90 ticks (3 s) with no
+feedforward. Error decreased monotonically with no overshoot: 0.56 m/29.6°
+at tick 0 → 0.16 m/3.7° at tick 20 → 0.03 m/0.2° at tick 45 → 0.002 m/0.001°
+at tick 89. The raised accel/velocity limits do not cause oscillation on a
+genuine step setpoint.
 
 ## How to reproduce
 

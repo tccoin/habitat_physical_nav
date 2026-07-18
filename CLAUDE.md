@@ -65,9 +65,22 @@ are pipeline artifacts, not source.
 
 ## Running things
 
-There is no build/lint/test tooling configured (no pytest, no linter config).
-Verification is empirical/visual: run a script and inspect the printed
-diagnostics or the output MP4.
+There is no linter configured. Most verification is still empirical/visual:
+run a script and inspect the printed diagnostics or the output MP4/BEV plots
+-- that's inherent to a physics simulator and can't be replaced by unit tests.
+
+There is a small `tests/` suite (`pip install -e ".[test]"`, then `pytest`)
+covering what *can* be checked without a simulator instance: invariants and
+known-value/step-response checks on the pure-math pieces (`pure_pursuit.py`,
+`pid_pose_controller.py`, `hab_quat_to_heading`), plus a regression test that
+re-runs `verify_replay_format.py`'s action/state-ordering check against the
+bundled example dataset. Everything except the `hab_quat_to_heading` test
+runs in any Python env with the package installed -- no `habitat_sim`/
+`magnum` needed -- because those modules don't import them; that test skips
+cleanly where those aren't installed rather than failing. Add tests here
+alongside new pure-logic code (controllers, metrics, path/pose math); don't
+try to unit-test `HabitatRobotSim` itself or full replay runs -- those stay
+empirical.
 
 This is a pip-installable package (`src/continuous_demos/`, `pyproject.toml`)
 plus a `scripts/` directory of CLI entry points that import it — install it

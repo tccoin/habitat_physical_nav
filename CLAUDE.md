@@ -41,6 +41,19 @@ Python files.
    `REPLAY_DATA_FORMAT.md`. Re-run this on any new dataset shard before
    trusting the alignment recipe.
 
+Separately, `eval_pid_tracking.py` validates a different, simpler action
+interface: `src/continuous_demos/pid_pose_controller.py`'s PID-based global
+pose/trajectory tracker (position-control, one target pose per tick — the
+kind of action space a VLA/RL policy would emit), as opposed to the
+pure-pursuit path follower steps 1-2 use. It replays already-generated
+`pose2d` trajectories from step 2's output and reports tracking-error
+metrics. See `docs/PID_TRACKING_REPORT.md` for the full design/validation
+writeup, including a known sim non-reproducibility gotcha: navmesh snapping
+can resolve to a different point across runs/environments for the same
+episode, which looks like tracking error if you don't spawn from the
+recorded trajectory's own first pose. Relevant to anyone building further
+RL/VLA-eval work in this simulator, not just PID tracking.
+
 `batch_gen.bash` fans step 2 out across every `.json.gz` shard in a dataset
 directory (`xargs -P` workers, one `generate_pose2d_dataset.py` process per
 scene file). Its `PYTHON_BIN`/`INPUT_DIR`/`OUTPUT_DIR` are hardcoded paths —
@@ -56,7 +69,19 @@ There is no build/lint/test tooling configured (no pytest, no linter config).
 Verification is empirical/visual: run a script and inspect the printed
 diagnostics or the output MP4.
 
+This is a pip-installable package (`src/continuous_demos/`, `pyproject.toml`)
+plus a `scripts/` directory of CLI entry points that import it — install it
+editable once per env before running anything: `pip install -e .`. Scripts
+are meant to be run from the repo root as `python scripts/<name>.py`, and
+never import from each other (only from `continuous_demos.*`); if you add a
+new script that needs something another script defines, move that thing into
+an appropriate `src/continuous_demos/` module instead of importing the
+sibling script.
+
 ```bash
+# One-time setup (per Python env)
+pip install -e .
+
 # Single-episode debug replay (run from this folder)
 python scripts/replay_human_demo.py examples/17DRP5sb8fy.json.gz --episode-index 4 --output demo.mp4 --debug-draw
 

@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from continuous_demos.pid_pose_controller import PIDPoseController, PIDPoseControllerConfig, track_trajectory, wrap_angle
-from replay_human_demo import (
+from continuous_demos.episode_io import (
     DEFAULT_URDF_PATH,
     build_robot_sim,
     extract_demo,

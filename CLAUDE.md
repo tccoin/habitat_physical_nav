@@ -134,17 +134,35 @@ Frames 2 and 3 share the same axis convention; frame 2 is frame 3 carried by
 and yawed with the base (`joint_x`, `joint_y`, `joint_th` all zero ⇒ they
 coincide).
 
-Key pieces in `sim.py`:
-- `HabitatRobotSim` — owns the Habitat-Sim instance, the URDF-loaded robot,
-  sensors, and stepping/kinematic integration.
-- `HolonomicRobotController` — wraps `pure_pursuit.PurePursuitController` to
-  drive the base along a 2D path (`HolonomicControllerConfig` tunes
-  velocity/acceleration/look-ahead limits).
-- `HeadingRotationController` — drives pure in-place rotation through a
-  sequence of target yaw headings (used for the `LOOK_UP`/`LOOK_DOWN`/turn
+`sim.py` itself now contains only `HabitatRobotSim` — the simulator: it owns
+the Habitat-Sim instance, the URDF-loaded robot, sensors, and
+stepping/kinematic integration. Everything that drives the simulator but
+isn't the simulator lives in sibling modules under `src/continuous_demos/`:
+
+- `controllers.py` — `HolonomicRobotController` (wraps
+  `pure_pursuit.PurePursuitController` to drive the base along a 2D path;
+  `HolonomicControllerConfig` tunes velocity/acceleration/look-ahead limits)
+  and `HeadingRotationController` (drives pure in-place rotation through a
+  sequence of target yaw headings, used for the `LOOK_UP`/`LOOK_DOWN`/turn
   segments of a replay, as opposed to path-following).
-- `record_segmented_demo` / `record_path` — top-level replay recording used
-  by `replay_human_demo.py`.
+- `replay.py` — `record_segmented_demo` / `record_path`, the top-level replay
+  recording used by `scripts/replay_human_demo.py` and
+  `scripts/generate_pose2d_dataset.py`, plus `hab_quat_to_heading` (the
+  habitat-quaternion → planar-heading conversion).
+- `episode_io.py` — dataset/episode IO and scene-resolution helpers shared by
+  `replay_human_demo.py`, `generate_pose2d_dataset.py`, and
+  `eval_pid_tracking.py` (`load_demo_objectnav`, `resolve_scene_path`,
+  `find_scene_dataset_config`, `build_robot_sim`, `extract_demo`,
+  `find_looking_slices`, `DEFAULT_URDF_PATH`). Pulled out of
+  `replay_human_demo.py` specifically so scripts stop importing from other
+  scripts — a script should only ever be a `scripts/` entry point, never an
+  import target.
+- `pid_pose_controller.py` — the PID global-pose/trajectory tracker (see
+  `docs/PID_TRACKING_REPORT.md`), independent of the pure-pursuit stack above.
+
+`scripts/sim_debug_drive.py` holds `sim.py`'s former manual/debug entry points
+(`main()`/`test_rotation_controller()`) — ad hoc driving scripts, not part of
+the documented pipeline, and not imported by anything.
 
 `pure_pursuit.py` implements Pure Pursuit / Adaptive / Regulated / Dynamic
 Window Pure Pursuit variants (ported from

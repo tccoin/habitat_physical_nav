@@ -56,8 +56,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import imageio.v2 as imageio
 import numpy as np
 
-from continuous_demos.sim import record_segmented_demo
-from replay_human_demo import (
+from continuous_demos.replay import record_segmented_demo
+from continuous_demos.episode_io import (
     DEFAULT_URDF_PATH,
     build_robot_sim,
     extract_demo,

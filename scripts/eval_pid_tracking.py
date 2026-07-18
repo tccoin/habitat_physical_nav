@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from pid_pose_controller import PIDPoseController, PIDPoseControllerConfig, track_trajectory, wrap_angle
+from continuous_demos.pid_pose_controller import PIDPoseController, PIDPoseControllerConfig, track_trajectory, wrap_angle
 from replay_human_demo import (
     DEFAULT_URDF_PATH,
     build_robot_sim,

@@ -58,17 +58,17 @@ diagnostics or the output MP4.
 
 ```bash
 # Single-episode debug replay (run from this folder)
-python replay_human_demo.py 17DRP5sb8fy.json.gz --episode-index 4 --output demo.mp4 --debug-draw
+python scripts/replay_human_demo.py examples/17DRP5sb8fy.json.gz --episode-index 4 --output demo.mp4 --debug-draw
 
 # Same, with scenes living outside the parent repo's data/ layout
-python replay_human_demo.py 17DRP5sb8fy.json.gz --episode-index 4 --scene-root /path/to/data/scene_datasets --output demo.mp4
+python scripts/replay_human_demo.py examples/17DRP5sb8fy.json.gz --episode-index 4 --scene-root /path/to/data/scene_datasets --output demo.mp4
 
 # Re-verify the reference_replay ordering/axis assumptions on a dataset shard
-python verify_replay_format.py 17DRP5sb8fy.json.gz
+python scripts/verify_replay_format.py examples/17DRP5sb8fy.json.gz
 
 # Batch-generate the pose2d dataset, then spot-check via video
-python generate_pose2d_dataset.py 17DRP5sb8fy.json.gz --output-dir data
-python render_pose2d_videos.py --output-dir data --episode-index 4
+python scripts/generate_pose2d_dataset.py examples/17DRP5sb8fy.json.gz --output-dir data
+python scripts/render_pose2d_videos.py --output-dir data --episode-index 4
 ```
 
 `replay_human_demo.py` resolves relative scene paths (if `--scene-root` is

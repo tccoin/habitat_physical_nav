@@ -11,17 +11,18 @@ import numpy as np
 
 import habitat_sim
 
-from sim import (
+from continuous_demos.sim import (
     HabitatRobotSim,
     record_segmented_demo, record_path, HolonomicRobotController,
     hab_quat_to_heading,
 )
+from continuous_demos import ASSETS_DIR
 from habitat_sim.utils.settings import default_sim_settings
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_URDF_PATH = (
-    PACKAGE_DIR / "tidybot_description" / "urdf" / "tidybot_base_stabilized.urdf"
+    ASSETS_DIR / "tidybot_description" / "urdf" / "tidybot_base_stabilized.urdf"
 )
 
 

@@ -10,13 +10,13 @@ GitHub does not inline local `.mp4` files in README rendering, so this preview u
 
 Included files:
 
-- `replay_human_demo.py`
-- `sim.py`
-- `pure_pursuit.py`
-- `17DRP5sb8fy.json.gz`
+- `scripts/replay_human_demo.py`
+- `src/continuous_demos/sim.py`
+- `src/continuous_demos/pure_pursuit.py`
+- `examples/17DRP5sb8fy.json.gz`
 - `demo.gif`
-- `tidybot_description/urdf/tidybot_base_minimal.urdf`
-- `tidybot_description/meshes/base/tidybot++/Kinova.stl`
+- `src/continuous_demos/assets/tidybot_description/urdf/tidybot_base_minimal.urdf`
+- `src/continuous_demos/assets/tidybot_description/meshes/base/tidybot++/Kinova.stl`
 
 Not included:
 
@@ -53,13 +53,13 @@ That means this packaged folder works directly in its current location under the
 Run from this folder:
 
 ```bash
-python replay_human_demo.py 17DRP5sb8fy.json.gz --episode-index 4 --output demo.mp4 --debug-draw
+python scripts/replay_human_demo.py examples/17DRP5sb8fy.json.gz --episode-index 4 --output demo.mp4 --debug-draw
 ```
 
 If your MP3D scenes live outside the parent repo layout, pass the scene root explicitly:
 
 ```bash
-python replay_human_demo.py 17DRP5sb8fy.json.gz --episode-index 4 --scene-root /path/to/data/scene_datasets --output demo.mp4 --debug-draw
+python scripts/replay_human_demo.py examples/17DRP5sb8fy.json.gz --episode-index 4 --scene-root /path/to/data/scene_datasets --output demo.mp4 --debug-draw
 ```
 
 The script prints the episode goal category and episode info before following the demonstration path.

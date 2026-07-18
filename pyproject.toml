@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "continuous-demos"
+version = "0.1.0"
+description = "Replay Habitat-web ObjectNav human demonstrations as continuous holonomic-base trajectories."
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "imageio",
+    "pillow",
+]
+
+# NOTE: habitat_sim and magnum are required at runtime by src/continuous_demos/sim.py
+# and most scripts/ entry points, but they are not pip-installable packages -- they
+# must come from a conda environment (see this repo's docs; the "habitat" conda env).
+# They are intentionally not listed as dependencies here.
+
+[project.optional-dependencies]
+build = ["datasets"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

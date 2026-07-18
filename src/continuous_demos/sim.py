@@ -3,7 +3,7 @@ from pathlib import Path
 import numpy as np
 import habitat_sim
 from typing import Dict, List, Any, Optional
-from pure_pursuit import PurePursuitController,ControllerConfig
+from continuous_demos.pure_pursuit import PurePursuitController,ControllerConfig
 import magnum as mn
 from PIL import Image
 
@@ -55,10 +55,16 @@ from PIL import Image
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_URDF_PATH = (
-    PACKAGE_DIR / "tidybot_description" / "urdf" / "tidybot_base_minimal.urdf"
+    PACKAGE_DIR / "assets" / "tidybot_description" / "urdf" / "tidybot_base_minimal.urdf"
 )
+# NOTE: legacy dev-convenience default for this file's own main()/
+# test_rotation_controller() debug entry points, not exercised by the
+# documented pipeline. Before the src-layout move, PACKAGE_DIR was the repo
+# root and PACKAGE_DIR.parent pointed one level above it (the parent habitat
+# checkout); PACKAGE_DIR is now src/continuous_demos, so parents[2] is used
+# to keep pointing at that same conceptual location.
 DEFAULT_SCENE_PATH = (
-    PACKAGE_DIR.parent
+    PACKAGE_DIR.parents[2]
     / "data"
     / "scene_datasets"
     / "mp3d_example"

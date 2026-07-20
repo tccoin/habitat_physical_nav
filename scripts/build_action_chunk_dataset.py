@@ -19,14 +19,23 @@ with mutually-aligned ``pose2d`` / ``rgb_paths`` (native fps, per
   1. ``action_chunking.build_observation_records`` slides the observation
      window over ``pose2d``/``rgb_paths`` and returns one dict per observation
      (``obs_index``, ``frame_index``, ``image``, ``obs_pose``, ``action_chunk``)
-     -- see that function's docstring for the exact drop/stride rule.
+     -- see that function's docstring for the exact drop/stride rule. By
+     default consecutive observations are ``obs_stride_frames`` apart, every
+     time (``--obs-spacing-mode fixed``); ``--obs-spacing-mode uniform`` or
+     ``poisson`` instead draw each gap from a distribution centered on that
+     same mean stride, simulating variable inference latency between
+     observations -- see ``action_chunking.SpacingConfig`` for the exact
+     distributions and why the alignment math doesn't otherwise change.
   2. Each dict becomes one output row, with the episode's ``episode_id`` /
      ``scene_id`` / ``goal_text`` copied onto every row it produces, the image
      path resolved to an absolute path under ``--image-root``, and the
-     resolved ``ChunkConfig`` fields (``native_fps``, ``obs_hz``,
-     ``obs_stride_frames``, ``action_chunk_len``, ``dt_native``) repeated onto
-     every row so a row is self-describing without needing the sidecar
-     ``chunk_config.json`` this script also writes next to the dataset.
+     resolved ``ChunkConfig``/``SpacingConfig`` fields (``native_fps``,
+     ``obs_hz``, ``obs_stride_frames``, ``action_chunk_len``, ``dt_native``,
+     ``obs_spacing_mode``) repeated onto every row so a row is self-describing
+     without needing the sidecar ``chunk_config.json`` this script also writes
+     next to the dataset. Note ``obs_stride_frames`` is always the *mean*
+     stride, even under random spacing -- the realized per-row gap is
+     whatever ``frame_index`` deltas between consecutive rows work out to.
   3. Rows across all episodes/scenes are collected into one flat list and
      handed to ``datasets.Dataset.from_list`` -- one arrow row per
      observation, NOT one row per episode. (Contrast with the per-frame
@@ -50,9 +59,15 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 from datasets import Dataset, DatasetDict
 
-from continuous_demos.action_chunking import ChunkConfig, build_observation_records, make_chunk_config
+from continuous_demos.action_chunking import (
+    ChunkConfig,
+    SpacingConfig,
+    build_observation_records,
+    make_chunk_config,
+)
 
 
 def load_scene_jsonl(path: Path) -> List[Dict[str, Any]]:
@@ -67,10 +82,14 @@ def load_scene_jsonl(path: Path) -> List[Dict[str, Any]]:
 
 
 def build_rows_for_episode(
-    episode: Dict[str, Any], image_root: Path, chunk_config: ChunkConfig
+    episode: Dict[str, Any],
+    image_root: Path,
+    chunk_config: ChunkConfig,
+    spacing_config: SpacingConfig,
+    rng: np.random.Generator,
 ) -> List[Dict[str, Any]]:
     obs_records = build_observation_records(
-        episode["pose2d"], episode["rgb_paths"], chunk_config
+        episode["pose2d"], episode["rgb_paths"], chunk_config, spacing_config, rng
     )
     rows = []
     for rec in obs_records:
@@ -90,14 +109,25 @@ def build_rows_for_episode(
                 "obs_stride_frames": chunk_config.obs_stride_frames,
                 "action_chunk_len": chunk_config.action_chunk_len,
                 "dt_native": chunk_config.dt_native,
+                "obs_spacing_mode": spacing_config.mode,
             }
         )
     return rows
 
 
 def build_all_rows(
-    metadata_dir: Path, image_root: Path, chunk_config: ChunkConfig, max_length: Optional[int]
+    metadata_dir: Path,
+    image_root: Path,
+    chunk_config: ChunkConfig,
+    spacing_config: SpacingConfig,
+    max_length: Optional[int],
 ) -> List[Dict[str, Any]]:
+    # One rng shared across every episode in the run (not reseeded per
+    # episode) so the draws for episode 2 aren't a repeat of episode 1's --
+    # still fully reproducible given --obs-spacing-seed plus this traversal
+    # order (sorted scene files, then dataset order within each file).
+    rng = np.random.default_rng(spacing_config.seed)
+
     all_rows: List[Dict[str, Any]] = []
     n_episodes = 0
     n_dropped_short = 0
@@ -107,7 +137,7 @@ def build_all_rows(
             if max_length is not None and len(episode["pose2d"]) > max_length:
                 continue
             n_episodes += 1
-            rows = build_rows_for_episode(episode, image_root, chunk_config)
+            rows = build_rows_for_episode(episode, image_root, chunk_config, spacing_config, rng)
             if not rows:
                 n_dropped_short += 1
                 continue
@@ -168,6 +198,26 @@ def parse_args() -> argparse.Namespace:
         "--max-length", type=int, default=None,
         help="Skip episodes whose native trajectory is longer than this many frames.",
     )
+    parser.add_argument(
+        "--obs-spacing-mode", default="fixed", choices=["fixed", "uniform", "poisson"],
+        help="How far apart consecutive observations land. 'fixed': constant "
+             "obs_stride_frames apart (default, matches --obs-hz exactly). 'uniform'/"
+             "'poisson': each gap is sampled from a distribution centered on that same "
+             "mean stride, simulating variable inference latency -- see "
+             "continuous_demos.action_chunking.SpacingConfig.",
+    )
+    parser.add_argument(
+        "--obs-spacing-jitter", type=float, default=0.5,
+        help="Only used by --obs-spacing-mode uniform: half-width of the sampling window "
+             "as a fraction of the mean stride (0.5 = +/-50%%).",
+    )
+    parser.add_argument(
+        "--obs-spacing-seed", type=int, default=0,
+        help="RNG seed for --obs-spacing-mode uniform/poisson (ignored for 'fixed'). "
+             "One rng is shared across every episode in the run, so this seed alone "
+             "(plus the fixed scene/episode traversal order) fully determines every "
+             "sampled gap in the dataset.",
+    )
     return parser.parse_args()
 
 
@@ -182,6 +232,9 @@ def main() -> None:
     chunk_config = make_chunk_config(
         native_fps=args.native_fps, obs_hz=args.obs_hz, action_chunk_len=args.action_chunk_len
     )
+    spacing_config = SpacingConfig(
+        mode=args.obs_spacing_mode, jitter=args.obs_spacing_jitter, seed=args.obs_spacing_seed
+    )
     print(
         f"ChunkConfig: native_fps={chunk_config.native_fps} obs_hz(requested)={chunk_config.obs_hz} "
         f"obs_hz(effective)={chunk_config.effective_obs_hz:.3f} "
@@ -189,8 +242,14 @@ def main() -> None:
         f"chunk_duration={chunk_config.chunk_duration:.3f}s obs_interval={chunk_config.obs_interval:.3f}s "
         f"overlap_fraction={chunk_config.overlap_fraction:.3f}"
     )
+    print(
+        f"SpacingConfig: mode={spacing_config.mode!r} jitter={spacing_config.jitter} "
+        f"seed={spacing_config.seed} "
+        f"(mean stride {chunk_config.obs_stride_frames} frames; every draw is clipped to "
+        f"[1, {chunk_config.action_chunk_len}])"
+    )
 
-    rows = build_all_rows(metadata_dir, image_root, chunk_config, args.max_length)
+    rows = build_all_rows(metadata_dir, image_root, chunk_config, spacing_config, args.max_length)
     if not rows:
         raise ValueError("No observation rows produced -- check --data-dir / --max-length.")
 
@@ -226,6 +285,9 @@ def main() -> None:
                 "obs_interval": chunk_config.obs_interval,
                 "chunk_duration": chunk_config.chunk_duration,
                 "overlap_fraction": chunk_config.overlap_fraction,
+                "obs_spacing_mode": spacing_config.mode,
+                "obs_spacing_jitter": spacing_config.jitter,
+                "obs_spacing_seed": spacing_config.seed,
                 "image_root": str(image_root),
             },
             f,

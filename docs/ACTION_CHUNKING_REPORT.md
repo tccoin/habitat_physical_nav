@@ -8,10 +8,12 @@ Two additions to the pipeline, built directly on the raw
 `rgb_paths`):
 
 - `build_action_chunk_dataset.py` — resamples that native-fps trajectory down
-  to a configurable, lower observation frequency, and pairs each surviving
-  observation with a configurable-length chunk of *future* actions expressed
-  relative to that observation's own pose. Output is an arrow `DatasetDict`,
-  one row per observation.
+  to a configurable, lower observation frequency (fixed-stride by default, or
+  drawn per-observation from a distribution to simulate variable inference
+  latency — see "Variable observation spacing" below), and pairs each
+  surviving observation with a configurable-length chunk of *future* actions
+  expressed relative to that observation's own pose. Output is an arrow
+  `DatasetDict`, one row per observation.
 - `replay_chunked_actions.py` — reads that arrow dataset back with no trained
   model involved and drives the simulator through it, to check the encoding
   round-trips: since every chunk is ground truth (not model-predicted),
@@ -262,6 +264,75 @@ itself is unaffected by any of this and is checked independently, with no
 simulator involved, in `tests/test_action_chunking.py`
 (`recon_ref` vs `pose2d` differ by ≤ 2e-15, float64 machine epsilon).
 
+## Variable observation spacing (simulated inference latency)
+
+Real deployment doesn't query the policy on a metronome — inference latency
+varies, so the gap between one observation and the next varies too. Added
+`--obs-spacing-mode {fixed, uniform, poisson}` (plus `--obs-spacing-jitter`
+and `--obs-spacing-seed`) to `build_action_chunk_dataset.py` to simulate that:
+instead of every observation landing exactly `obs_stride_frames` native
+frames after the last, the gap is drawn per-observation from a distribution
+centered on that same mean stride (`obs_hz` keeps its meaning as the *mean*
+rate in every mode). `uniform` draws from a symmetric window
+(`mean * (1 ± jitter)`); `poisson` draws from `Poisson(mean)`, unbounded
+above and asymmetric — closer to a real latency distribution's occasional
+spike. All three modes live in `action_chunking.SpacingConfig` /
+`sample_gap_frames`.
+
+**The one thing that must never vary with the mode**: whatever gap gets
+realized, the earlier observation's chunk must have enough actions to cover
+it, or replay hits an uncovered gap — the exact failure mode
+`make_chunk_config`'s `chunk_duration >= obs_interval` check exists to
+prevent under fixed spacing. Under variable spacing this is enforced per
+draw: `sample_gap_frames` clips every sample to `[1, action_chunk_len]`, so
+it's structurally impossible for a realized gap to exceed what its chunk
+covers, regardless of how the distribution is parameterized (verified for a
+worst-case setup — mean stride pinned to `action_chunk_len` — in
+`test_sample_gap_frames_poisson_clips_the_mean_stride_edge_case`).
+
+**Why the replay side needed no fixed/variable branch at all.** The key
+design choice: `reconstruct_reference_trajectory` never takes a stride
+parameter. It reads the *realized* gap directly off consecutive rows'
+`frame_index` values (`rows[i+1]["frame_index"] - rows[i]["frame_index"]`),
+which is `obs_stride_frames` every time under fixed spacing and whatever
+`sample_gap_frames` actually drew under variable spacing — the same
+line of code covers both, because a dataset row already records exactly
+where it landed. Chunk *construction* doesn't need to know the mode either:
+each observation's chunk is anchored purely on its own pose, independent of
+how far the previous observation was; spacing only decides where the next
+`idx` starts. Net effect: **the "mathematical alignment of the chunked
+execution is exactly the same as in the fixed interval case,"** as expected
+going in — not asserted, but structural, since fixed spacing is just the
+zero-variance special case of the same gap-reading code path. This is also
+why `replay_chunked_actions.py` needed zero changes beyond dropping the
+now-unnecessary `obs_stride_frames` parameter it used to thread through.
+
+**Validation, held to the identical standard as the fixed-interval case**
+(same paired-vs-inherent-noise protocol, same episodes, same simulator):
+built the arrow dataset with `--obs-spacing-mode poisson --obs-spacing-seed
+123` (165,244 rows vs. 164,578 for fixed spacing at the same mean rate — as
+expected, since the observation *count* per episode is governed by the same
+mean stride either way, just realized with different exact frame indices).
+Confirmed exact reconstruction against the recorded `pose2d` first
+(`exact_recon_err` at float64 machine epsilon, same as the fixed case), then
+ran the same interleaved single-process paired/cross-iteration comparison:
+
+| episode | realized gap range / mean | inherent noise (nc vs nc) | paired (nc vs ch) |
+|---|---|---|---|
+| short (226 frames) | [1, 10], mean 5.0 | range 0.0000 – 0.0131 m | 0.0131 – 0.0213 m |
+| long (1661 frames) | [1, 10], mean ≈5 | range 0.00046 – 0.0132 m | 0.0000 – 0.0006 m |
+
+Both rows land inside the same noise envelope observed for fixed spacing on
+the same two episodes (compare to the table above) — in fact the short
+episode's numbers are the *identical* five values, because
+`reconstruct_reference_trajectory` decodes exactly the same underlying
+`pose2d[0 : last_covered]` regardless of which frames were designated
+observations, so the sequence of setpoints handed to the (same-seeded)
+simulator run-for-run doesn't depend on the spacing mode at all — only which
+subset of frames got an image attached differs between the two datasets, not
+the trajectory that gets replayed. Variable spacing gets the exact same
+correctness guarantee as fixed spacing, for that reason.
+
 ## Known limitations / things not handled
 
 - **No padding**: an episode whose native trajectory has fewer than
@@ -277,3 +348,11 @@ simulator involved, in `tests/test_action_chunking.py`
   `image` / `obs_pose` / `action_chunk` columns; turning a row into a
   model-facing training example is left to the training pipeline, as
   requested.
+- **Variable spacing's realized mean can undershoot the requested one** when
+  the distribution's clip is doing a lot of work (e.g. `poisson` with a mean
+  close to `action_chunk_len`, where the upper tail gets clipped far more
+  than the lower tail is extended) — `uniform`'s window is symmetric and
+  clipped only at the `jitter >= 1` extreme, so it holds its target mean much
+  better in practice. No automatic warning is emitted if a configuration's
+  realized mean drifts noticeably from the requested `obs_hz`; inspect
+  `frame_index` deltas in the built dataset if this matters for a given run.

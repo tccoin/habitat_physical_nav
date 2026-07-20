@@ -60,11 +60,48 @@ rotated into ``anchor``'s local frame (anchor's heading becomes local ``+X``):
 and add the anchor's translation); ``compose(anchor, relative(anchor, p)) == p``
 for every ``p``, verified for random poses (including wrapped angles) in
 ``tests/test_action_chunking.py``.
+
+------------------------------------------------------------------------
+Variable observation spacing (simulated inference latency)
+------------------------------------------------------------------------
+By default observations land on a fixed stride (``obs_stride_frames`` native
+frames apart, every time). :class:`SpacingConfig` / :func:`sample_gap_frames`
+instead let the *gap* to the next observation be drawn per-observation from a
+distribution -- standing in for a policy whose inference latency (hence how
+long it takes to produce the next action chunk) varies run to run rather than
+being a fixed clock tick.
+
+The one hard constraint is unchanged and unrelated to which mode is active:
+whatever gap is realized between two observations, the earlier one's chunk
+must have enough actions to cover it (``gap <= action_chunk_len``), or replay
+would run out of actions before the next chunk arrives. Under fixed spacing
+this is checked once, up front, against the constant stride (see
+``make_chunk_config``). Under variable spacing it's enforced per-sample by
+clipping every draw to ``[1, action_chunk_len]`` (:func:`sample_gap_frames`) --
+so it can never be violated by construction, at the cost of flattening the
+tail of whatever distribution was requested into a point mass at
+``action_chunk_len`` if the distribution's mean is set too close to (or past)
+it. ``make_chunk_config`` still rejects a *mean* stride that exceeds
+``action_chunk_len`` even in variable-spacing mode, since at that point
+every draw would clip and "variable" spacing would silently degrade into
+"fixed, at the chunk boundary" -- almost certainly not what was intended.
+
+Downstream, nothing about chunk *construction* or *reconstruction* needs to
+know which spacing mode produced a given dataset: an observation's chunk is
+still built the same way regardless of how far the *previous* observation
+was (each chunk is self-contained, anchored on its own pose -- spacing only
+decides where the next ``idx`` lands). And on the replay side,
+:func:`reconstruct_reference_trajectory` never reads a stride parameter at
+all -- it derives each row's realized gap directly from consecutive
+``frame_index`` values, which is exactly the fixed stride when spacing is
+fixed and exactly the sampled-and-clipped gap when it isn't. This is why the
+same replay code, and the same round-trip-exactness argument, cover both
+modes without a fixed/variable branch anywhere in the reconstruction math.
 """
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -145,6 +182,69 @@ def make_chunk_config(native_fps: float, obs_hz: float, action_chunk_len: int) -
     )
 
 
+_SPACING_MODES = ("fixed", "uniform", "poisson")
+
+
+@dataclass
+class SpacingConfig:
+    """How far the *next* observation lands from the current one, in native
+    frames -- see the module docstring's "Variable observation spacing"
+    section.
+
+    ``mode="fixed"`` reproduces the original constant-stride behavior exactly
+    (every gap equals ``ChunkConfig.obs_stride_frames``) and is the default,
+    so existing callers are unaffected. ``"uniform"`` and ``"poisson"`` both
+    center on that same mean stride -- ``obs_hz`` keeps its meaning as the
+    *mean* observation rate in every mode -- and differ only in how spread
+    out the realized gaps are around it:
+
+    * ``"uniform"``: gap ~ ``Uniform[round(mean * (1 - jitter)),
+      round(mean * (1 + jitter))]`` (inclusive), i.e. a symmetric window
+      whose half-width is ``jitter`` as a fraction of the mean stride.
+    * ``"poisson"``: gap ~ ``Poisson(mean)`` -- unbounded above in principle
+      (clipped to ``action_chunk_len`` in practice, see
+      :func:`sample_gap_frames`), asymmetric, more realistic for a latency
+      that's usually close to its mean but occasionally spikes.
+
+    ``seed`` makes a build reproducible: the same seed (plus the same
+    episode traversal order) always draws the same sequence of gaps.
+    """
+
+    mode: str = "fixed"
+    jitter: float = 0.5
+    seed: int = 0
+
+    def __post_init__(self) -> None:
+        if self.mode not in _SPACING_MODES:
+            raise ValueError(f"mode must be one of {_SPACING_MODES}, got {self.mode!r}")
+        if self.jitter < 0:
+            raise ValueError(f"jitter must be >= 0, got {self.jitter}")
+
+
+def sample_gap_frames(
+    rng: np.random.Generator, spacing_config: SpacingConfig, chunk_config: ChunkConfig
+) -> int:
+    """Draw one observation-to-observation gap, in native frames.
+
+    Always returns an integer in ``[1, chunk_config.action_chunk_len]`` --
+    the clip is what guarantees the "chunk covers the gap to the next
+    observation" invariant holds for every draw, not just in expectation
+    (see the module docstring).
+    """
+    mean = chunk_config.obs_stride_frames
+    if spacing_config.mode == "fixed":
+        raw = mean
+    elif spacing_config.mode == "uniform":
+        lo = max(1, round(mean * (1.0 - spacing_config.jitter)))
+        hi = max(lo, round(mean * (1.0 + spacing_config.jitter)))
+        raw = int(rng.integers(lo, hi + 1))  # rng.integers high is exclusive
+    elif spacing_config.mode == "poisson":
+        raw = int(rng.poisson(mean))
+    else:  # pragma: no cover -- guarded by SpacingConfig.__post_init__
+        raise ValueError(f"Unknown spacing mode {spacing_config.mode!r}")
+    return int(np.clip(raw, 1, chunk_config.action_chunk_len))
+
+
 def pose_to_relative(anchor: Sequence[float], target: Sequence[float]) -> np.ndarray:
     """Express ``target`` (``[x, y, theta]``) relative to ``anchor``'s local frame."""
     x0, y0, th0 = float(anchor[0]), float(anchor[1]), float(anchor[2])
@@ -173,6 +273,8 @@ def build_observation_records(
     pose2d: Sequence[Sequence[float]],
     rgb_paths: Sequence[str],
     chunk_config: ChunkConfig,
+    spacing_config: Optional[SpacingConfig] = None,
+    rng: Optional[np.random.Generator] = None,
 ) -> List[Dict[str, Any]]:
     """Slide an observation window over one episode's native trajectory.
 
@@ -193,17 +295,31 @@ def build_observation_records(
     An observation at native index ``idx`` is only emitted if the full chunk
     fits inside the recorded trajectory, i.e. ``idx + action_chunk_len <= N - 1``
     (0-indexed last valid frame is ``N - 1``). Trailing frames that can't
-    anchor a full chunk are silently dropped -- there is no padding -- so an
-    episode contributes
-    ``floor((N - 1 - action_chunk_len) / obs_stride_frames) + 1`` observations
-    (0 if ``N - 1 < action_chunk_len``, i.e. the whole episode is shorter than
-    one chunk).
+    anchor a full chunk are silently dropped -- there is no padding.
+
+    ``spacing_config`` controls how far apart consecutive observations land
+    (see the module docstring's "Variable observation spacing" section);
+    defaults to fixed-stride spacing (``obs_stride_frames`` apart every time,
+    the original behavior) when omitted. ``rng`` defaults to
+    ``np.random.default_rng(spacing_config.seed)`` when omitted -- pass one
+    explicitly to share a single draw sequence across multiple episodes in
+    one build run rather than resetting the seed per episode.
+
+    Note there is no closed-form observation count under variable spacing
+    (unlike the fixed-stride case's
+    ``floor((N - 1 - action_chunk_len) / obs_stride_frames) + 1``) since it
+    depends on the realized gaps; the loop below simply runs until the next
+    would-be chunk no longer fits.
     """
     n = len(pose2d)
     if len(rgb_paths) != n:
         raise ValueError(f"pose2d ({n}) and rgb_paths ({len(rgb_paths)}) length mismatch")
 
-    stride = chunk_config.obs_stride_frames
+    if spacing_config is None:
+        spacing_config = SpacingConfig(mode="fixed")
+    if rng is None:
+        rng = np.random.default_rng(spacing_config.seed)
+
     length = chunk_config.action_chunk_len
 
     records: List[Dict[str, Any]] = []
@@ -222,5 +338,58 @@ def build_observation_records(
             }
         )
         obs_index += 1
-        idx += stride
+        idx += sample_gap_frames(rng, spacing_config, chunk_config)
     return records
+
+
+def reconstruct_reference_trajectory(rows: Sequence[Dict[str, Any]]) -> np.ndarray:
+    """Invert :func:`build_observation_records`: decode a sorted-by-``obs_index``
+    run of a single episode's observation rows back into an absolute,
+    native-fps pose trajectory -- the input this whole module started from.
+
+    No spacing/stride parameter is taken or needed. Each row already records
+    exactly where it landed (``frame_index``), so the realized gap to the
+    next observation is simply
+    ``rows[i + 1]["frame_index"] - rows[i]["frame_index"]`` -- this is
+    ``obs_stride_frames`` under fixed spacing and the sampled-and-clipped
+    draw under variable spacing, with no code-level distinction between the
+    two: whichever mode built the dataset, the gap that actually happened is
+    what's replayed. Only the first ``gap`` actions of row ``i``'s chunk are
+    kept (de-relativized against that row's own ``obs_pose``) -- the rest
+    would be superseded by row ``i + 1``'s chunk before ever being used. The
+    last row, which nothing supersedes, is decoded in full.
+
+    The returned array is prefixed with the first row's own ``obs_pose`` as
+    its leading pose (matching ``eval_pid_tracking.py``'s ``ref_traj[0]`` --
+    the pose the robot is already spawned at -- see
+    ``replay_chunked_actions.py`` for why dropping that leading tick produces
+    a real, non-decaying tracking discrepancy rather than a negligible one).
+
+    Raises ``ValueError`` if any consecutive pair's gap isn't covered by the
+    earlier row's chunk (``1 <= gap <= len(chunk)``) -- this should be
+    unreachable for a dataset built by ``build_observation_records`` (which
+    clips every gap at construction time), so tripping it means the rows
+    passed in didn't actually come from one, in original order.
+    """
+    if not rows:
+        return np.zeros((0, 3), dtype=float)
+
+    targets = [np.asarray(rows[0]["obs_pose"], dtype=float)]
+    n = len(rows)
+    for i, row in enumerate(rows):
+        anchor = row["obs_pose"]
+        chunk = row["action_chunk"]
+        if i == n - 1:
+            gap = len(chunk)
+        else:
+            gap = rows[i + 1]["frame_index"] - row["frame_index"]
+            if not (1 <= gap <= len(chunk)):
+                raise ValueError(
+                    f"row {i} (obs_index={row.get('obs_index')}) has a gap of {gap} frames "
+                    f"to the next observation, outside its own chunk's coverage "
+                    f"[1, {len(chunk)}] -- rows are not a valid, in-order single-episode "
+                    "observation stream."
+                )
+        for j in range(gap):
+            targets.append(relative_to_pose(anchor, chunk[j]))
+    return np.asarray(targets, dtype=float)

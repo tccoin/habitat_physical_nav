@@ -10,18 +10,25 @@ Reconstruction -- "synchronous at the observation rate"
 ------------------------------------------------------------------------
 Per ``continuous_demos.action_chunking``, chunk ``i`` (issued at observation
 ``i``, anchored on that observation's own ``obs_pose``) and chunk ``i + 1``
-(issued ``obs_stride_frames`` native frames later) overlap: the first
-``obs_stride_frames`` actions of chunk ``i`` are the ones that stay in force
-until chunk ``i + 1`` takes over; anything chunk ``i`` predicts past that
-point is superseded before it would ever be used. Replaying "synchronously at
-the observation rate" means exactly that: consume only each chunk's first
-``obs_stride_frames`` actions (the last observation's chunk, which nothing
-supersedes, is consumed in full). De-relativizing those actions against their
-own chunk's ``obs_pose`` and concatenating across observations reconstructs
-the *exact* original native-fps ``pose2d`` trajectory (frames
-``frame_index[0] + 1 .. frame_index[-1] + action_chunk_len``), since ground
-truth chunks are lossless relative encodings of it -- see
-``tests/test_action_chunking.py`` for the round-trip proof this relies on.
+(issued however many native frames later that observation actually landed --
+a fixed stride, or a per-observation sampled gap simulating variable
+inference latency, see ``action_chunking.SpacingConfig``) overlap: the
+actions of chunk ``i`` up to that realized gap are the ones that stay in
+force until chunk ``i + 1`` takes over; anything chunk ``i`` predicts past
+that point is superseded before it would ever be used. Replaying
+"synchronously at the observation rate" means exactly that: consume only
+each chunk's actions up to the realized gap to the next observation (the
+last observation's chunk, which nothing supersedes, is consumed in full).
+``action_chunking.reconstruct_reference_trajectory`` does this generically
+for both fixed and variable spacing -- it reads the realized gap straight
+off consecutive rows' ``frame_index`` values rather than taking a stride
+parameter, so the alignment math is identical either way; see that
+function's docstring. De-relativizing those actions against their own
+chunk's ``obs_pose`` and concatenating across observations reconstructs the
+*exact* original native-fps ``pose2d`` trajectory (frames ``frame_index[0]
+.. frame_index[-1] + action_chunk_len``), since ground truth chunks are
+lossless relative encodings of it -- see ``tests/test_action_chunking.py``
+for the round-trip proof this relies on, under both spacing modes.
 
 That reconstructed trajectory (prefixed with the first observation's own
 ``obs_pose`` -- see ``reconstruct_reference_trajectory`` for why that leading
@@ -52,7 +59,7 @@ from typing import Any, Dict, List
 import numpy as np
 from datasets import load_from_disk
 
-from continuous_demos.action_chunking import relative_to_pose
+from continuous_demos.action_chunking import reconstruct_reference_trajectory
 from continuous_demos.pid_pose_controller import PIDPoseController, PIDPoseControllerConfig, track_trajectory
 from continuous_demos.episode_io import (
     DEFAULT_URDF_PATH,
@@ -94,57 +101,23 @@ def select_episode_ids(by_episode: Dict[str, List[Dict[str, Any]]], num_episodes
     return [ids_by_len[i] for i in seen[:num_episodes]]
 
 
-def reconstruct_reference_trajectory(rows: List[Dict[str, Any]], obs_stride_frames: int) -> np.ndarray:
-    """De-relativize each row's action chunk against its own ``obs_pose``,
-    keeping only the first ``obs_stride_frames`` actions of every row except
-    the last (see module docstring). Returns an ``(K + 1, 3)`` array of
-    absolute ``[x, y, theta]`` poses: the reconstructed native-fps trajectory,
-    prefixed with the first observation's own ``obs_pose``.
-
-    That leading pose matters for matching ``eval_pid_tracking.py`` tick for
-    tick, not just for content: ``track_trajectory`` there is called with
-    ``ref_traj = pose2d``, i.e. its *first* setpoint is ``pose2d[0]`` itself
-    -- the pose the robot is already spawned at. That "already there" first
-    tick is not a no-op: the spawn (``robot_sim.reset`` + navmesh/URDF joint
-    homing) lands a few hundredths of a degree off the recorded heading, so
-    the controller issues a real, small corrective command on tick 0 before
-    it ever starts chasing ``pose2d[1]``. Dropping that tick (i.e. handing
-    ``track_trajectory`` only ``[target_1, target_2, ...]`` and letting it
-    chase ``target_1`` -- which is already further down the path *and* is a
-    different distance from the spawn's heading error -- from tick 0) was
-    tried first and produces a small but real and non-decaying deviation from
-    the non-chunked baseline (confirmed empirically: back-to-back non-chunked
-    reruns of the same episode agree to ~1e-4m while that version disagreed
-    with the baseline by ~1e-2m, a systematic gap, not sim noise). Prepending
-    ``obs_pose`` here reproduces the exact same first tick, and with it,
-    replaces that systematic gap with just the same run-to-run tracking noise
-    a non-chunked rerun would show.
-    """
-    targets = [np.asarray(rows[0]["obs_pose"], dtype=float)]
-    n = len(rows)
-    for i, row in enumerate(rows):
-        anchor = row["obs_pose"]
-        chunk = row["action_chunk"]
-        n_ticks = len(chunk) if i == n - 1 else min(obs_stride_frames, len(chunk))
-        for j in range(n_ticks):
-            targets.append(relative_to_pose(anchor, chunk[j]))
-    return np.asarray(targets, dtype=float)
-
-
 def run_chunked_episode(
     robot_sim,
     controller: PIDPoseController,
     episode: Dict[str, Any],
     rows: List[Dict[str, Any]],
     dt_native: float,
-    obs_stride_frames: int,
 ):
     """Spawn at the first observation's own recorded pose (same rationale as
     ``eval_pid_tracking.run_episode``: avoids re-triggering navmesh-snap
-    drift), then track the chunk-reconstructed reference trajectory.
+    drift), then track the chunk-reconstructed reference trajectory. See
+    ``action_chunking.reconstruct_reference_trajectory`` for why its leading
+    pose (the robot's own spawn pose) matters and isn't optional -- dropping
+    it produces a real, non-decaying tracking discrepancy, not a negligible
+    one (see ``docs/ACTION_CHUNKING_REPORT.md``).
     """
     path_3d, _headings, _actions = extract_demo(episode)
-    ref_traj = reconstruct_reference_trajectory(rows, obs_stride_frames)
+    ref_traj = reconstruct_reference_trajectory(rows)
 
     obs_pose0 = np.asarray(rows[0]["obs_pose"], dtype=float)
     height = float(path_3d[0][1])
@@ -194,10 +167,13 @@ def main() -> None:
         raise ValueError(f"Split '{args.split}' of {args.dataset_dir} is empty.")
 
     dt_native = float(split_ds[0]["dt_native"])
-    obs_stride_frames = int(split_ds[0]["obs_stride_frames"])
+    obs_spacing_mode = split_ds[0].get("obs_spacing_mode", "fixed")
     print(
         f"Loaded {len(split_ds)} row(s) from split '{args.split}'. "
-        f"dt_native={dt_native:.4f}s obs_stride_frames={obs_stride_frames}"
+        f"dt_native={dt_native:.4f}s obs_spacing_mode={obs_spacing_mode!r} "
+        f"(mean obs_stride_frames={split_ds[0]['obs_stride_frames']}; realized per-observation "
+        "gaps are read from consecutive rows' frame_index, not this mean, so this script needs "
+        "no special-casing between fixed and variable spacing)"
     )
 
     by_episode = group_rows_by_episode(split_ds)
@@ -226,9 +202,7 @@ def main() -> None:
             print(f"  [skip] {ep_id}: scene mismatch ({rows[0]['scene_id']} != {scene_id})")
             continue
 
-        actual, ref, result = run_chunked_episode(
-            robot_sim, controller, episode, rows, dt_native, obs_stride_frames
-        )
+        actual, ref, result = run_chunked_episode(robot_sim, controller, episode, rows, dt_native)
         metrics = compute_metrics(actual, ref)
         metrics["episode_id"] = ep_id
         metrics["num_steps"] = result["num_steps"]

@@ -28,6 +28,17 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 
+# Default control period. Habitat advances physics only in whole multiples of its
+# fixed 0.008 s timestep, so an off-grid dt makes the physics time delivered per
+# tick alternate between two values and puts a ~24% ripple on a constant
+# commanded velocity (see HabitatRobotSim.step). 25 Hz is the only usable integer
+# rate on that grid and is what the pipeline records at, so a controller default
+# of 1/30 was both off-grid and 20% wrong against the data it is validated
+# against. Callers that know their shard's rate should still pass dt explicitly:
+# a PID gain set is only meaningful at the period it was tuned for.
+DEFAULT_DT = 1.0 / 25.0
+
+
 def wrap_angle(angle: float) -> float:
     """Wrap an angle (radians) to [-pi, pi]."""
     return (angle + math.pi) % (2 * math.pi) - math.pi
@@ -81,7 +92,7 @@ class PIDPoseController:
         self,
         ref_pose: np.ndarray,
         ref_vel: Optional[np.ndarray] = None,
-        dt: float = 1.0 / 30.0,
+        dt: float = DEFAULT_DT,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Compute one control tick toward ``ref_pose``.
 
@@ -186,7 +197,7 @@ def track_trajectory(
     robot_sim,
     controller: PIDPoseController,
     ref_traj: np.ndarray,
-    dt: float = 1.0 / 30.0,
+    dt: float = DEFAULT_DT,
     ref_vel_traj: Optional[np.ndarray] = None,
     initial_pose: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:

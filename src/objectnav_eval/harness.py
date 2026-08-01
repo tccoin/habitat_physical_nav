@@ -45,15 +45,51 @@ def build_scene_simulator(episode: EvalEpisode, config: Any):
     return robot_sim, scene_path
 
 
-def run_episodes(
-    episodes: Sequence[EvalEpisode], config: Any, server_script: str
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Evaluate every episode, reusing one simulator per scene."""
+def _build_runner(robot_sim, scene_id: str, config: Any, policy) -> EpisodeRunner:
     from continuous_demos.pid_pose_controller import (
         PIDPoseController,
         PIDPoseControllerConfig,
     )
 
+    return EpisodeRunner(
+        RunnerContext(
+            robot_sim=robot_sim,
+            task=build_task(
+                robot_sim,
+                success_distance=config.success_distance,
+                distance_to=config.distance_to,
+                scene_id=scene_id,
+                scene_root=config.scene_root,
+                live_height=config.live_height,
+            ),
+            executor=ChunkExecutor(
+                robot_sim,
+                PIDPoseController(robot_sim, PIDPoseControllerConfig()),
+                dt=config.dt,
+                gap=config.gap,
+            ),
+            policy=policy,
+            config=config,
+            output_dir=Path(config.output_dir),
+            probes=default_probes(config.keep_tracking_series),
+        )
+    )
+
+
+def run_episodes(
+    episodes: Sequence[EvalEpisode], config: Any, server_script: str
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Evaluate every episode, reusing one simulator per scene.
+
+    ``HabitatRobotSim.reset()`` does not fully restore the physics state between
+    episodes -- measured with a *stateless* image-blind policy, the same episode
+    executes a ~1.4% different path depending on whether another episode ran
+    before it in the same simulator (see docs/OBJECTNAV_EVAL.md, "Episode order
+    matters"). ``--fresh-sim-per-episode`` trades a scene load per episode for a
+    clean slate. It is off by default because the aggregate metrics are stable
+    without it and the cost is large; turn it on when per-episode numbers have
+    to be reproducible independently of shard composition.
+    """
     from objectnav_eval.policies import build_policy
 
     log_path = (
@@ -68,7 +104,8 @@ def run_episodes(
             robot_sim, scene_path = build_scene_simulator(scene_episodes[0], config)
             print(
                 f"[shard {config.shard_index}] scene {Path(scene_path).stem} "
-                f"({len(scene_episodes)} episodes)",
+                f"({len(scene_episodes)} episodes)"
+                + ("  [fresh sim per episode]" if config.fresh_sim_per_episode else ""),
                 flush=True,
             )
             try:
@@ -78,31 +115,8 @@ def run_episodes(
                     success_distance=config.success_distance,
                     screen_trivial=config.screen_trivial,
                 )
-                task = build_task(
-                    robot_sim,
-                    success_distance=config.success_distance,
-                    distance_to=config.distance_to,
-                    scene_id=scene_id,
-                    scene_root=config.scene_root,
-                    live_height=config.live_height,
-                )
-                runner = EpisodeRunner(
-                    RunnerContext(
-                        robot_sim=robot_sim,
-                        task=task,
-                        executor=ChunkExecutor(
-                            robot_sim,
-                            PIDPoseController(robot_sim, PIDPoseControllerConfig()),
-                            dt=config.dt,
-                            gap=config.gap,
-                        ),
-                        policy=policy,
-                        config=config,
-                        output_dir=Path(config.output_dir),
-                        probes=default_probes(config.keep_tracking_series),
-                    )
-                )
-                for episode in scene_episodes:
+                runner = _build_runner(robot_sim, scene_id, config, policy)
+                for index, episode in enumerate(scene_episodes):
                     verdict = screener.screen(episode)
                     if not verdict.ok:
                         screening.add(episode, verdict)
@@ -112,6 +126,13 @@ def run_episodes(
                             flush=True,
                         )
                         continue
+                    if config.fresh_sim_per_episode and index > 0:
+                        # Close before opening: two live habitat-sim Simulators
+                        # abort the process at teardown.
+                        robot_sim.sim.close()
+                        robot_sim, _ = build_scene_simulator(episode, config)
+                        screener.robot_pathfinder = robot_sim.sim.pathfinder
+                        runner = _build_runner(robot_sim, scene_id, config, policy)
                     record = runner.run(episode, verdict)
                     results.append(record)
                     print(format_episode_line(record, config.shard_index), flush=True)

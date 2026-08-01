@@ -50,6 +50,11 @@ class EvalConfig:
     snap_start: bool = False
     screen_trivial: bool = True
     live_height: bool = True
+    # Rebuild the simulator before every episode. HabitatRobotSim.reset() does
+    # not fully restore the physics state, so an episode's trajectory depends on
+    # what ran before it in the same process (~1.4% of path length, measured
+    # with a stateless policy). Costs a scene load per episode.
+    fresh_sim_per_episode: bool = False
     width: int = DEFAULT_WIDTH
     height: int = DEFAULT_HEIGHT
     sensor_uuid: str = "color_sensor"
@@ -177,6 +182,12 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     run.add_argument("--keep-trivial", dest="screen_trivial", action="store_false",
                      help="score episodes that start inside the success radius instead of "
                           "screening them out (they are free successes)")
+    run.add_argument("--fresh-sim-per-episode", action="store_true",
+                     help="rebuild the simulator before every episode. HabitatRobotSim's "
+                          "reset() leaves physics state behind, so without this an "
+                          "episode's trajectory depends on what ran before it in the same "
+                          "worker. Costs one scene load per episode; aggregate metrics are "
+                          "stable without it, per-episode ones are not")
     run.add_argument("--frozen-height", dest="live_height", action="store_false",
                      help="query goal distances at the spawn height for the whole episode "
                           "(the task layer's own behaviour) instead of tracking joint_z")

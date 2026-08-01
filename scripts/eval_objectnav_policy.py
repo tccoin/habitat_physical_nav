@@ -75,8 +75,14 @@ def worker_main(shard_path: str) -> None:
     """The ``--worker-shard`` role: run exactly the episodes this shard lists."""
     spec = read_shard_spec(shard_path)
     config = EvalConfig.from_dict(spec["config"])
-    all_episodes, _ = load_selected(config)
-    episodes = select_by_uid(all_episodes, spec["episodes"])
+    # Resolve against the *selected* list, not the raw source list, so a worker
+    # runs its episodes in the same canonical order a single-process run would.
+    # This is not cosmetic: episode results depend on what ran before them in
+    # the same worker (see docs/OBJECTNAV_EVAL.md, "Episode order matters"), so
+    # resolving against source order would make a parallel run irreproducible
+    # from a single-process one.
+    _all, selected = load_selected(config)
+    episodes = select_by_uid(selected, spec["episodes"])
     results, skipped = run_episodes(episodes, config, str(SERVER_SCRIPT))
     write_shard_output(spec["out"], results, skipped)
     print(

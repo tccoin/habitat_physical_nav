@@ -181,7 +181,39 @@ finite episodes only and the excluded count is reported as
 line is strict JSON (`json.dumps` otherwise emits bare `Infinity`, which most
 parsers reject).
 
-### 6. Sharding by scene idles workers
+### 6. Episode order matters — the simulator carries state across episodes
+
+**`HabitatRobotSim.reset()` does not fully restore the physics state.** Measured
+with the *stateless* `forward` control (so the policy cannot be the cause), the
+same episode executes a different trajectory depending on whether another
+episode ran before it in the same simulator:
+
+| episode | run alone | after 1–2 other episodes | Δ |
+| --- | --- | --- | --- |
+| `TEEsavR23oF:87` | 1.798399 m | 1.824174 m | +1.4% |
+| `TEEsavR23oF:93` | 2.900846 m | 2.939657 m | +1.3% |
+
+`--fresh-sim-per-episode` rebuilds the simulator before each episode and
+reproduces the run-alone trajectory **exactly** (Δ = 0.000000 m on both), which
+both confirms the diagnosis and provides the workaround. It costs one scene load
+per episode, which is why it is off by default.
+
+Under a closed-loop policy this amplifies: on `val_mini`, episode
+`TEEsavR23oF:75` reaches the goal (min distance ~0.00 m, a success) when run
+alone and fails (min distance 3.3–3.7 m) when run after another episode — in
+*both* this system and the reference harness, which share the simulator.
+
+Consequences, none of which are specific to this harness:
+
+* **Aggregate metrics are stable; per-episode ones are not.** Compare runs at the
+  aggregate level, and hold shard composition fixed when comparing checkpoints.
+* Worker shards resolve their episode list against the **selected** (canonical,
+  sorted) order rather than file order, so a parallel run and a single-process
+  run execute the same episodes in the same order.
+* For a per-episode number you intend to quote, re-run that episode with
+  `--episode-ids <uid>` or use `--fresh-sim-per-episode`.
+
+### 7. Sharding by scene idles workers
 
 Scene load dominates a short episode, so episodes of one scene are kept
 together — but only up to a point. `val_mini` has two scenes; splitting purely

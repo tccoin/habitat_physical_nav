@@ -116,7 +116,10 @@ def main() -> None:
     # setpoint is fed to the PID at the wrong rate. Read it off the shard.
     metadata_path = Path(args.metadata)
     resolved = resolve_corpus_params(
-        metadata_path.parent, assumed_native_fps=args.fps, shard_paths=[metadata_path]
+        metadata_path.parent,
+        assumed_native_fps=args.fps,
+        shard_paths=[metadata_path],
+        flag_name="--fps",
     )
     print(resolved.banner())
     fps = resolved.params.native_fps

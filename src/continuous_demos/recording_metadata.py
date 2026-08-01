@@ -415,13 +415,15 @@ def resolve_corpus_params(
     assumed_native_fps: Optional[float] = None,
     *,
     shard_paths: Optional[Sequence[Path]] = None,
+    flag_name: str = "--native-fps",
 ) -> ResolvedRecording:
     """Establish, once, how a corpus was recorded. See the module docstring.
 
-    ``assumed_native_fps`` is the consumer's ``--native-fps``. It is *only* a
-    fallback for a corpus that does not record its own rate; if the corpus
-    does record one and the two disagree, that is an error rather than an
-    override.
+    ``assumed_native_fps`` is the consumer's ``--native-fps`` (``flag_name``
+    names it in error messages, since not every consumer spells it that way).
+    It is *only* a fallback for a corpus that does not record its own rate; if
+    the corpus does record one and the two disagree, that is an error rather
+    than an override.
     """
     paths = list(shard_paths) if shard_paths is not None else _shard_paths(Path(metadata_dir))
     if not paths:
@@ -458,7 +460,7 @@ def resolve_corpus_params(
                 )
         if assumed_native_fps is not None and abs(float(assumed_native_fps) - head.native_fps) > _FLOAT_TOL:
             raise InconsistentRecordingParams(
-                f"--native-fps {assumed_native_fps:g} was passed, but this corpus records "
+                f"{flag_name} {assumed_native_fps:g} was passed, but this corpus records "
                 f"native_fps={head.native_fps:g} (schema_version={head.schema_version}). "
                 "The recorded value is authoritative; drop the flag. If you genuinely "
                 "believe the recorded value is wrong, fix the corpus rather than "
@@ -476,7 +478,7 @@ def resolve_corpus_params(
             f"(no '{RECORDING_KEY}' key), so this corpus predates schema_version "
             f"{SCHEMA_VERSION} and its frame rate is not stored anywhere. Refusing to "
             f"guess. Every pre-schema corpus in this repo was recorded at "
-            f"{LEGACY_NATIVE_FPS:g} Hz -- pass --native-fps {LEGACY_NATIVE_FPS:g} to say so "
+            f"{LEGACY_NATIVE_FPS:g} Hz -- pass {flag_name} {LEGACY_NATIVE_FPS:g} to say so "
             "explicitly, or regenerate with the current generator, which records it."
         )
 

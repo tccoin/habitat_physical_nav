@@ -143,46 +143,49 @@ def main() -> None:
     episodes = load_objectnav_episodes(args.dataset)
     grouped = episodes_by_scene(episodes)
     print(f"Loaded {len(episodes)} episodes across {len(grouped)} scene(s).")
+    selected = list(episodes)[: args.num_episodes]
 
     config = ObjectNavConfig(
-        success_distance=args.success_distance, distance_to=args.distance_to
+        success_distance=args.success_distance,
+        distance_to=args.distance_to,
+        scene_root=args.scene_root,
     )
 
+    # One simulator for the whole run: the task loads each episode's scene on
+    # reset. Two live simulators in one process abort at teardown, so building
+    # one per scene is both slower and less safe.
+    first_scene = selected[0].scene_id
+    scene_path = resolve_scene_path(first_scene, args.scene_root)
+    scene_dataset_config = find_scene_dataset_config(scene_path, args.scene_root)
+    robot_sim = build_robot_sim(
+        scene_path, scene_dataset_config, args.width, args.height, str(DEFAULT_URDF_PATH)
+    )
+    task = ObjectNavTask(robot_sim, config, scene_id=first_scene)
+
     all_metrics: List[Dict[str, Any]] = []
-    remaining = args.num_episodes
-    for scene_id, scene_episodes in grouped.items():
-        if remaining <= 0:
-            break
-        selected = scene_episodes[:remaining]
-        remaining -= len(selected)
-
-        scene_path = resolve_scene_path(scene_id, args.scene_root)
-        scene_dataset_config = find_scene_dataset_config(scene_path, args.scene_root)
-        robot_sim = build_robot_sim(
-            scene_path, scene_dataset_config, args.width, args.height, str(DEFAULT_URDF_PATH)
+    current_scene = None
+    for episode in selected:
+        if episode.scene_id != current_scene:
+            current_scene = episode.scene_id
+            print(f"\nScene {current_scene}")
+        metrics = run_episode(
+            task, episode, args.fps, args.timeout, args.evaluate_every
         )
-        task = ObjectNavTask(robot_sim, config, scene_id=scene_id)
-        print(f"\nScene {scene_id}: evaluating {len(selected)} episode(s)")
+        all_metrics.append(metrics)
+        d0_error = metrics["start_distance_error"]
+        d0_error_str = "n/a" if d0_error is None else f"{d0_error:.3f}m"
+        print(
+            f"  [{metrics['episode_id']}] goal={metrics['object_category']} "
+            f"success={metrics['success']:.0f} spl={metrics['spl']:.3f} "
+            f"oracle_success={metrics['oracle_success']:.0f} "
+            f"oracle_spl={metrics['oracle_spl']:.3f} "
+            f"d_goal={metrics['distance_to_goal']:.3f}m "
+            f"path={metrics['path_length']:.2f}m "
+            f"d0_err={d0_error_str}"
+            + (" [replay truncated]" if metrics["replay_truncated"] else "")
+        )
 
-        for episode in selected:
-            metrics = run_episode(
-                task, episode, args.fps, args.timeout, args.evaluate_every
-            )
-            all_metrics.append(metrics)
-            d0_error = metrics["start_distance_error"]
-            d0_error_str = "n/a" if d0_error is None else f"{d0_error:.3f}m"
-            print(
-                f"  [{metrics['episode_id']}] goal={metrics['object_category']} "
-                f"success={metrics['success']:.0f} spl={metrics['spl']:.3f} "
-                f"oracle_success={metrics['oracle_success']:.0f} "
-                f"oracle_spl={metrics['oracle_spl']:.3f} "
-                f"d_goal={metrics['distance_to_goal']:.3f}m "
-                f"path={metrics['path_length']:.2f}m "
-                f"d0_err={d0_error_str}"
-                + (" [replay truncated]" if metrics["replay_truncated"] else "")
-            )
-
-        robot_sim.sim.close()
+    robot_sim.sim.close()
 
     summary = {
         "config": {

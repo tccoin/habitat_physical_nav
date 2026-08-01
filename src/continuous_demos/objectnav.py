@@ -53,6 +53,7 @@ from habitat.core.embodied_task import Measure, Measurements
 from habitat.core.simulator import AgentState
 from habitat.tasks.nav.nav import SPL, DistanceToGoal, SoftSPL, Success
 
+from continuous_demos.episode_io import find_scene_dataset_config, resolve_scene_path
 from continuous_demos.sim import HabitatRobotSim
 
 
@@ -71,6 +72,12 @@ class ObjectNavConfig:
     snap_agent_position: bool = True
     include_soft_spl: bool = True
     include_oracle: bool = True
+    # Load the episode's scene into the simulator when it differs from the one
+    # currently loaded. With this off, a mismatched episode raises instead.
+    auto_switch_scene: bool = True
+    # Scene-root override handed to episode_io.resolve_scene_path when
+    # switching (None = the usual HABITAT_SCENE_ROOT / ./data lookup chain).
+    scene_root: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -101,8 +108,12 @@ class _NavAdapterBase:
     """Shared implementation of the three methods the nav measures touch."""
 
     def __init__(self, pathfinder, snap_agent_position: bool = True):
-        self.pathfinder = pathfinder
+        self._pathfinder = pathfinder
         self.snap_agent_position = snap_agent_position
+
+    @property
+    def pathfinder(self):
+        return self._pathfinder
 
     # -- to be provided by subclasses -------------------------------------
     def _planar_pose(self) -> np.ndarray:
@@ -159,8 +170,15 @@ class NavSimAdapter(_NavAdapterBase):
     """Live adapter reading the robot's pose out of a ``HabitatRobotSim``."""
 
     def __init__(self, robot_sim: HabitatRobotSim, snap_agent_position: bool = True):
-        super().__init__(robot_sim.sim.pathfinder, snap_agent_position)
+        super().__init__(None, snap_agent_position)
         self.robot_sim = robot_sim
+
+    @property
+    def pathfinder(self):
+        # Resolved live, never cached: a scene switch installs a new pathfinder
+        # (and a fresh navmesh), and a stale handle would silently answer
+        # geodesic queries against the previous scene.
+        return self.robot_sim.sim.pathfinder
 
     def _planar_pose(self) -> np.ndarray:
         return self.robot_sim.get_2d_pose()
@@ -398,11 +416,14 @@ class ObjectNavTask:
     Also *is* the ``task`` object habitat's measures expect: it exposes
     ``measurements``, ``is_stop_called`` and a no-op ``add_perf_timing``.
 
-    The sim's scene is fixed at construction time (``HabitatRobotSim.reset``
-    does not rebuild the robot when the scene changes), so one task/sim pair
-    serves one scene; use
-    :func:`continuous_demos.objectnav_dataset.episodes_by_scene` to drive the
-    outer loop.
+    One task/sim pair handles any number of scenes: :meth:`reset` loads the
+    episode's scene when it differs from the one currently in the simulator, so
+    episodes can be iterated in dataset order. Set
+    ``ObjectNavConfig.auto_switch_scene = False`` to get the old strict
+    behaviour (mismatched episode raises) and drive the outer loop with
+    :func:`continuous_demos.objectnav_dataset.episodes_by_scene` instead.
+    Switching is much cheaper than building a second simulator -- and avoids
+    the process abort habitat-sim hits when two simulators are alive at once.
     """
 
     def __init__(
@@ -431,10 +452,13 @@ class ObjectNavTask:
     def reset(self, episode, snap_to_navmesh: bool = True) -> Dict[str, float]:
         """Spawn the robot for ``episode`` and reset all measures.
 
+        Loads the episode's scene first if it is not the one currently in the
+        simulator (see :attr:`ObjectNavConfig.auto_switch_scene`).
+
         Returns the metrics at t=0 (notably ``distance_to_goal``, which should
         match the episode's recorded ``info["geodesic_distance"]``).
         """
-        self._check_scene(episode)
+        scene_switch = self._prepare_scene(episode)
         if not getattr(episode, "goals", None):
             raise ValueError(
                 f"Episode {episode.episode_id} has no goals; ObjectNav metrics "
@@ -449,6 +473,7 @@ class ObjectNavTask:
             robot_translation=np.array(episode.start_position, dtype=float),
             robot_rotation=list(episode.start_rotation),
             snap_to_navmesh=snap_to_navmesh,
+            **scene_switch,
         )
 
         self.episode = episode
@@ -457,13 +482,31 @@ class ObjectNavTask:
         self.measurements.reset_measures(episode=episode, task=self)
         return self.get_metrics()
 
-    def _check_scene(self, episode) -> None:
-        if os.path.basename(episode.scene_id) != os.path.basename(self.scene_id):
+    def _prepare_scene(self, episode) -> Dict[str, str]:
+        """Return the ``robot_sim.reset`` kwargs that load the episode's scene.
+
+        Empty when the scene is already loaded. Resolving the dataset's
+        ``scene_id`` ("mp3d/<x>/<x>.glb") to a file on disk is
+        ``episode_io``'s job, since it knows this repo's scene layouts.
+        """
+        if os.path.basename(episode.scene_id) == os.path.basename(self.scene_id):
+            return {}
+        if not self.config.auto_switch_scene:
             raise ValueError(
                 f"Episode {episode.episode_id} is in scene '{episode.scene_id}' "
-                f"but this task's simulator was built for '{self.scene_id}'. "
-                "Build one HabitatRobotSim (and task) per scene."
+                f"but the simulator has '{self.scene_id}' loaded, and "
+                "auto_switch_scene is off."
             )
+
+        scene_path = resolve_scene_path(episode.scene_id, self.config.scene_root)
+        scene_dataset_config = find_scene_dataset_config(
+            scene_path, self.config.scene_root
+        )
+        self.scene_id = episode.scene_id
+        kwargs = {"scene_id": str(scene_path)}
+        if scene_dataset_config is not None:
+            kwargs["scene_dataset_config"] = scene_dataset_config
+        return kwargs
 
     # -- pull-based hooks --------------------------------------------------
     def observe_pose(self, pose2d: Optional[Sequence[float]] = None) -> float:

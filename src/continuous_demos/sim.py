@@ -65,26 +65,74 @@ class HabitatRobotSim:
         self.max_substep_dt = max_substep_dt
         self.robot = None
         self.joint_name_to_motor_id = {}
-        
+        # Kept so a scene switch can rebuild an equivalent Configuration from
+        # scratch -- see _build_cfg / _reconfigure_scene.
+        self.sim_settings = dict(sim_settings)
+        self.agent_id = self.sim_settings.get("default_agent", 0)
+        # Set by navmesh_config_and_recompute(); a scene switch reloads the
+        # stock navmesh, so we re-run the recompute only if the caller asked
+        # for one in the first place.
+        self._navmesh_recomputed = False
+
         # 1. Flatten sensor_setup and assign to a dummy agent configuration
-        self.cfg = habitat_sim.utils.settings.make_cfg(sim_settings)
-        agent_id = sim_settings.get("default_agent", 0)
-        self.cfg.agents[agent_id].radius=0.28
-        self.cfg.agents[agent_id].height=1.0
-        all_sensor_specs = []
-        for specs in self.sensor_setup.values():
-            all_sensor_specs.extend(specs)
-            
-        self.cfg.agents[agent_id].sensor_specifications = all_sensor_specs
+        self.cfg = self._build_cfg()
 
         # 2. Initialize simulator
         self.sim = habitat_sim.Simulator(self.cfg)
-        self.agent_id = agent_id
-        # self.sim.reconfigure(self.cfg)
 
         # 3. Setup the robot and attach sensors
         self._setup_robot_and_sensors()
+
+    def _build_cfg(self, scene_id: Optional[str] = None):
+        """Build a habitat_sim ``Configuration`` from the stored sim settings.
+
+        Always returns a FRESH object. That matters for scene switching:
+        ``habitat_sim.Simulator.reconfigure`` is a no-op unless
+        ``self.config != config``, and the Simulator stores the very object we
+        hand it -- so mutating ``self.cfg.sim_cfg.scene_id`` in place mutates
+        the thing being compared against and can never trigger a scene reload.
+        """
+        settings = dict(self.sim_settings)
+        if scene_id is not None:
+            settings["scene"] = scene_id
+        cfg = habitat_sim.utils.settings.make_cfg(settings)
+        cfg.agents[self.agent_id].radius = 0.28
+        cfg.agents[self.agent_id].height = 1.0
+        all_sensor_specs = []
+        for specs in self.sensor_setup.values():
+            all_sensor_specs.extend(specs)
+        cfg.agents[self.agent_id].sensor_specifications = all_sensor_specs
+        return cfg
+
+    def _reconfigure_scene(
+        self, scene_id: str, scene_dataset_config: Optional[str] = None
+    ) -> None:
+        """Load a different scene into this simulator.
+
+        Everything scene-scoped dies with the old scene graph and physics
+        world, so all three of these have to be rebuilt afterwards:
+
+          * the articulated robot and its joint motors (the old handle is
+            dangling -- ``self.robot`` is dropped before re-adding);
+          * the sensor -> robot-link parenting (``_config_agents`` re-creates
+            the sensor nodes under the agent);
+          * the navmesh, because ``_config_pathfinder`` reloads the scene's
+            stock (point-agent) navmesh over any robot-sized one.
+        """
+        if scene_dataset_config is not None:
+            self.sim_settings["scene_dataset_config_file"] = scene_dataset_config
+        cfg = self._build_cfg(scene_id)
+        self.sim.reconfigure(cfg)
+        self.cfg = cfg
+        self.sim_settings["scene"] = scene_id
+
         self.robot = None
+        self.joint_name_to_motor_id = {}
+        self._setup_robot_and_sensors()
+
+        if self._navmesh_recomputed:
+            self.navmesh_config_and_recompute()
+
     def _setup_robot_and_sensors(self):
         # Load the URDF
         aom = self.sim.get_articulated_object_manager()
@@ -214,19 +262,19 @@ class HabitatRobotSim:
         return self.sim.get_sensor_observations(self.agent_id)
     
     def reset(
-        self, 
-        scene_id: Optional[str] = None, 
+        self,
+        scene_id: Optional[str] = None,
         robot_translation: Optional[np.ndarray] = None,
         robot_rotation: Optional[Any] = None,  # Accepts mn.Quaternion or [x, y, z, w] array
         snap_to_navmesh: bool = True,
         vertical_offset: Optional[float] = None, # Manual override if AABB is weird
-        home_joint_positions: Optional[Dict[str, float]] = None
+        home_joint_positions: Optional[Dict[str, float]] = None,
+        scene_dataset_config: Optional[str] = None,
     ) -> dict:
-        
+
         # 1. Handle Scene Changes and Graph Rebuild
         if scene_id is not None and scene_id != self.cfg.sim_cfg.scene_id:
-            self.cfg.sim_cfg.scene_id = scene_id
-            self.sim.reconfigure(self.cfg)
+            self._reconfigure_scene(scene_id, scene_dataset_config)
         else:
             self.sim.reset()
             self._setup_robot_and_sensors()
@@ -391,6 +439,10 @@ class HabitatRobotSim:
             self.sim.pathfinder,
             self.navmesh_settings,
         )
+        # Remembered so a later scene switch re-applies it: reconfigure() loads
+        # the scene's stock navmesh, which is cut for a point agent, not for
+        # this robot's radius/height.
+        self._navmesh_recomputed = True
         
     def draw_axes(self, translation, axis_len=1.0):
         lr = self.sim.get_debug_line_render()

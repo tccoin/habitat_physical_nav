@@ -238,5 +238,69 @@ def test_rotation_controller():
     print("Done!")
 
 
+def check_scene_switch(scene_a: str, scene_b: str):
+    """Empirical proof that ``HabitatRobotSim.reset(scene_id=...)`` really
+    switches scenes -- the check that catches the failure mode it used to have,
+    where ``reconfigure`` silently no-ops and every later query answers for the
+    old scene while ``cfg.sim_cfg.scene_id`` reports the new one.
+
+    Compares a sim that switched A -> B against a sim built directly on B: same
+    navmesh bounds, same spawn pose, and a pixel-identical render. Then switches
+    back to A and checks it reproduces A's original frame.
+
+    Usage (paths are .glb files, e.g. from data/scene_datasets/habitat-test-scenes)::
+
+        python -c "from scripts.sim_debug_drive import check_scene_switch; \\
+                   check_scene_switch('a.glb', 'b.glb')"
+    """
+    import imageio  # noqa: F401  (kept consistent with the other entry points)
+
+    def build(scene):
+        sim_settings = default_sim_settings.copy()
+        sim_settings.update(
+            scene=scene, default_agent=0, enable_physics=True,
+            window_width=160, window_height=120,
+        )
+        spec = habitat_sim.sensor.CameraSensorSpec()
+        spec.uuid = "color_sensor"
+        spec.sensor_type = habitat_sim.sensor.SensorType.COLOR
+        spec.resolution = [120, 160]
+        spec.hfov = 79
+        robot_sim = HabitatRobotSim(
+            sim_settings=sim_settings,
+            urdf_path=str(DEFAULT_URDF_PATH),
+            sensor_setup={"base_camera_link": [spec]},
+            fixed_base=True,
+        )
+        robot_sim.navmesh_config_and_recompute()
+        return robot_sim
+
+    def frame(robot_sim):
+        return robot_sim.get_obs()["color_sensor"][..., :3].astype(float)
+
+    reference = build(scene_b)
+    reference.reset(robot_translation=np.zeros(3))
+    reference_frame, reference_pose = frame(reference), reference.get_2d_pose()
+    reference.sim.close()
+
+    robot_sim = build(scene_a)
+    robot_sim.reset(robot_translation=np.zeros(3))
+    frame_a = frame(robot_sim)
+    bounds_a = np.round(robot_sim.sim.pathfinder.get_bounds()[0], 3)
+
+    robot_sim.reset(scene_id=scene_b, robot_translation=np.zeros(3))
+    switched_frame = frame(robot_sim)
+    aom = robot_sim.sim.get_articulated_object_manager()
+    print(f"articulated objects after switch: {aom.get_num_objects()} (must be 1)")
+    print(f"bounds  A={bounds_a}  after switch={np.round(robot_sim.sim.pathfinder.get_bounds()[0], 3)}")
+    print(f"pose    reference={np.round(reference_pose, 3)}  switched={np.round(robot_sim.get_2d_pose(), 3)}")
+    print(f"render  |switched - reference_on_B| = {np.abs(switched_frame - reference_frame).mean():.3f} (must be 0)")
+    print(f"render  |switched - own_frame_on_A| = {np.abs(switched_frame - frame_a).mean():.3f} (must be > 0)")
+
+    robot_sim.reset(scene_id=scene_a, robot_translation=np.zeros(3))
+    print(f"render  |back_on_A - original_A|    = {np.abs(frame(robot_sim) - frame_a).mean():.3f} (must be 0)")
+    robot_sim.sim.close()
+
+
 if __name__ == "__main__":
     test_rotation_controller()

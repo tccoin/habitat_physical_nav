@@ -294,6 +294,57 @@ class TestMeasures:
         assert OracleSPL.cls_uuid == "oracle_spl"
 
 
+class TestSceneSwitching:
+    """`_prepare_scene` decides whether reset() must load a different scene.
+
+    Whether the *simulator* really switches is empirical -- see
+    `scripts/sim_debug_drive.py::check_scene_switch`.
+    """
+
+    class _StubRobotSim:
+        def __init__(self, scene_id):
+            self.cfg = type(
+                "Cfg", (), {"sim_cfg": type("S", (), {"scene_id": scene_id})()}
+            )()
+            # pathfinder is resolved lazily by NavSimAdapter, so a stub sim
+            # never needs one until a geodesic query happens.
+            self.sim = None
+
+    @staticmethod
+    def _episode(scene_id):
+        episode = FakeEpisode([1.0, 0.0, 0.0])
+        episode.scene_id = scene_id
+        return episode
+
+    def _task(self, scene_id, **config_kwargs):
+        from continuous_demos.objectnav import ObjectNavTask
+
+        return ObjectNavTask(
+            self._StubRobotSim(scene_id),
+            ObjectNavConfig(**config_kwargs),
+            scene_id=scene_id,
+        )
+
+    def test_same_scene_needs_no_switch(self):
+        task = self._task("mp3d/a/a.glb")
+        assert task._prepare_scene(self._episode("mp3d/a/a.glb")) == {}
+
+    def test_switch_resolves_scene_path(self, tmp_path):
+        scene = tmp_path / "mp3d" / "b" / "b.glb"
+        scene.parent.mkdir(parents=True)
+        scene.write_bytes(b"")
+        task = self._task("mp3d/a/a.glb", scene_root=str(tmp_path))
+
+        kwargs = task._prepare_scene(self._episode("mp3d/b/b.glb"))
+        assert kwargs["scene_id"] == str(scene)
+        assert task.scene_id == "mp3d/b/b.glb"
+
+    def test_strict_mode_raises_on_mismatch(self):
+        task = self._task("mp3d/a/a.glb", auto_switch_scene=False)
+        with pytest.raises(ValueError, match="auto_switch_scene is off"):
+            task._prepare_scene(self._episode("mp3d/b/b.glb"))
+
+
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------

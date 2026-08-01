@@ -180,6 +180,42 @@ Frames 2 and 3 share the same axis convention; frame 2 is frame 3 carried by
 and yawed with the base (`joint_x`, `joint_y`, `joint_th` all zero ⇒ they
 coincide).
 
+### Scene switching and the single-robot invariant
+
+`reset(scene_id=...)` loads a different scene into the same simulator. Two
+things about it are easy to get wrong again, so they are worth stating:
+
+- The config object must be **rebuilt, not mutated**. `habitat_sim`'s
+  `Simulator.reconfigure` is a no-op unless `self.config != config`, and the
+  Simulator stores the very object `HabitatRobotSim` holds as `self.cfg` — so
+  the old `self.cfg.sim_cfg.scene_id = scene_id` + `reconfigure(self.cfg)` could
+  never trigger a reload. It failed *silently*: the render, the navmesh and the
+  spawn snap all kept answering for the previous scene while
+  `cfg.sim_cfg.scene_id` reported the new one. Hence `_build_cfg()`, which
+  rebuilds from the stored `sim_settings`, and why `__init__` keeps them.
+- A scene switch destroys everything scene-scoped, so `_reconfigure_scene`
+  re-adds the robot (dropping the dangling handle first), re-attaches the
+  sensors to their links, and re-runs `navmesh_config_and_recompute()` if the
+  caller ever asked for one — otherwise the pathfinder silently reverts to the
+  scene's stock point-agent navmesh and every geodesic/snap answer changes
+  meaning.
+
+`scripts/sim_debug_drive.py::check_scene_switch(a, b)` is the empirical proof:
+it compares a switched sim against one built directly on the target scene
+(identical navmesh bounds, spawn pose and rendered frame) and switches back.
+Run it after touching any of this.
+
+Relatedly, there is exactly **one** robot in the scene. `__init__` used to end
+with `self.robot = None` right after `_setup_robot_and_sensors()`, so the first
+`reset()` added a *second* URDF instance and left the first as an orphan physics
+object sitting at the origin — present during `build_robot_sim`'s navmesh
+recompute. Measured effect of removing it, over the 5-episode `eval_objectnav.py`
+sample: navmesh unchanged (start geodesic distances identical to 4 dp),
+success/oracle metrics unchanged, SPL within 0.005, path length within 0.16 m —
+but one episode's replay converged 557 ticks earlier, so per-step trajectories
+are not bit-identical. If an old artifact fails to reproduce exactly, this is a
+candidate cause.
+
 `sim.py` itself now contains only `HabitatRobotSim` — the simulator: it owns
 the Habitat-Sim instance, the URDF-loaded robot, sensors, and
 stepping/kinematic integration. Everything that drives the simulator but
@@ -287,9 +323,13 @@ Two things to know before reading the numbers:
   `info["geodesic_distance"]` by ~0.2 m typically and several metres in narrow
   spaces. That is a real difference in what is traversable, not a bug — the
   eval script prints it per episode.
-- A `HabitatRobotSim` is pinned to one scene (`reset(scene_id=...)` does not
-  rebuild the robot), so build one sim + task per scene and drive the outer loop
-  with `episodes_by_scene`. `ObjectNavTask.reset` raises on a scene mismatch.
+- `ObjectNavTask.reset` loads the episode's scene when it differs from the one
+  in the simulator, so one sim + task handles a whole multi-scene dataset in
+  dataset order. Set `ObjectNavConfig.auto_switch_scene = False` for the strict
+  behaviour (raise on mismatch) and drive the outer loop with
+  `episodes_by_scene`. Prefer switching over building a second simulator:
+  habitat-sim aborts the process at teardown when two `Simulator`s are alive
+  (reproducible with two plain `build_robot_sim` calls, unrelated to this code).
 
 Validation: `python scripts/eval_objectnav.py examples/17DRP5sb8fy.json.gz
 --scene-root <...> --num-episodes 5` replays human demos through the pure-pursuit

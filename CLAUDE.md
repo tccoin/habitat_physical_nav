@@ -54,6 +54,11 @@ episode, which looks like tracking error if you don't spawn from the
 recorded trajectory's own first pose. Relevant to anyone building further
 RL/VLA-eval work in this simulator, not just PID tracking.
 
+Also separate from the replay pipeline: `scripts/eval_objectnav.py` +
+`src/continuous_demos/objectnav.py` port the **ObjectNav task** onto this
+simulator (episode loading, spawn, success/SPL/soft-SPL/oracle-success/
+oracle-SPL). See "ObjectNav task layer" below.
+
 `batch_gen.bash` fans step 2 out across every `.json.gz` shard in a dataset
 directory (`xargs -P` workers, one `generate_pose2d_dataset.py` process per
 scene file). Its `PYTHON_BIN`/`INPUT_DIR`/`OUTPUT_DIR` are hardcoded paths —
@@ -107,6 +112,9 @@ python scripts/verify_replay_format.py examples/17DRP5sb8fy.json.gz
 # Batch-generate the pose2d dataset, then spot-check via video
 python scripts/generate_pose2d_dataset.py examples/17DRP5sb8fy.json.gz --output-dir data
 python scripts/render_pose2d_videos.py --output-dir data --episode-index 4
+
+# Score human demos as ObjectNav episodes (success/SPL/oracle metrics)
+python scripts/eval_objectnav.py examples/17DRP5sb8fy.json.gz --num-episodes 5
 ```
 
 `replay_human_demo.py` resolves relative scene paths (if `--scene-root` is
@@ -197,6 +205,11 @@ isn't the simulator lives in sibling modules under `src/continuous_demos/`:
   import target.
 - `pid_pose_controller.py` — the PID global-pose/trajectory tracker (see
   `docs/PID_TRACKING_REPORT.md`), independent of the pure-pursuit stack above.
+- `objectnav.py` / `objectnav_dataset.py` — the ObjectNav task layer (below).
+  These are the **only** modules allowed to import `habitat.*` (habitat-lab).
+  The "keep this folder standalone" rule targets the parent repo's loose Python
+  files; habitat-lab is an installed package and is a deliberate dependency
+  here.
 
 `scripts/sim_debug_drive.py` holds `sim.py`'s former manual/debug entry points
 (`main()`/`test_rotation_controller()`) — ad hoc driving scripts, not part of
@@ -206,3 +219,81 @@ the documented pipeline, and not imported by anything.
 Window Pure Pursuit variants (ported from
 https://github.com/decwest/dwpp) behind one `PurePursuitController` class
 selected via `method_name`.
+
+## ObjectNav task layer (`objectnav.py`, `objectnav_dataset.py`)
+
+Ports the classic ObjectNav benchmark onto `HabitatRobotSim` **without
+modifying `sim.py`** and without buying into habitat-lab's hydra/`Env` stack.
+
+It is deliberately *between* a sim and an RL env: it makes **no assumption about
+the action space** and never wraps stepping or rendering. Continuous control here
+means action chunking, real-time trajectory mixing, and simulated inference lag,
+none of which fit `env.step(action)`. The caller keeps calling
+`robot_sim.step(...)` / `robot_sim.get_obs()` itself and pulls from the task:
+
+```python
+task = ObjectNavTask(robot_sim, ObjectNavConfig(), scene_id=scene_id)
+task.reset(episode)      # spawn + reset measures; returns t=0 metrics
+task.observe_pose(pose)  # O(1) path-length sample -- call per physics tick
+task.call_stop()         # agent declares termination (what Success gates on)
+task.evaluate()          # navmesh queries + measure update -- only when asked
+task.evaluate_trajectory(episode, poses)  # offline scoring, no stepping
+```
+
+Physics stepping therefore never triggers a geodesic query or a render. Path
+length — the one quantity needing integration over time — is tracked by the
+cheap `PathTracker` instead of inside SPL (upstream accumulates it inside
+`update_metric`, which would tie path length to evaluation cadence); hence
+`ContinuousSPL` / `ContinuousSoftSPL`, which keep habitat's formulas but read
+`task.path_tracker.length`. Verified: `success`/`spl`/`soft_spl` are identical at
+`evaluate_every=1` and `25`; only the oracle metrics (which see just the
+evaluated samples, and are therefore lower bounds at the chosen cadence) move.
+
+What is reused vs. written here:
+
+- **Reused from habitat-lab**: `DistanceToGoal`, `Success`, `SPL`, `SoftSPL`,
+  `Measure`/`Measurements` — they instantiate fine with a plain config object
+  and a duck-typed sim, so numbers match published ObjectNav results.
+  `NavSimAdapter` supplies the only three sim methods they touch
+  (`geodesic_distance`, copied verbatim from `HabitatSim`; `get_agent_state`;
+  `previous_step_collided`, a stub — `HabitatRobotSim` has no collision flag).
+- **Written here**: `OracleSuccess` / `OracleSPL` (habitat-lab has none) — an
+  imaginary oracle terminates the episode the moment the agent is close enough,
+  so oracle success ignores `STOP` and oracle SPL freezes path length at that
+  first success.
+- `get_agent_state` is the *one* place the planar↔habitat inversion happens
+  (`position = [X, base_y, -Y]`, and `base_y` subtracts the same
+  `-cumulative_bb.min.y` URDF lift that `reset()` adds). Get this wrong and
+  every metric is silently garbage — `tests/test_objectnav.py` pins it.
+
+Episode loading (`objectnav_dataset.py`): these `.json.gz` shards **are** stock
+ObjectNav-v1 datasets; the *only* reason `ObjectNavDatasetV1.from_json` rejects
+them is four extra episode keys (`reference_replay`, `is_thda`, `scene_dataset`,
+`scene_state`). So `ObjectNavReplayDataset` subclasses it with an adapted
+`from_json` (unknown keys → `episode.extra`, so future shards degrade instead of
+failing) and we get the whole `Dataset` abstraction — `scene_ids`,
+`get_scene_episodes`, `filter_episodes` — plus real `ObjectGoal`/
+`ObjectViewLocation` objects. **habitat's `from_json` overwrites `episode_id`
+with `str(index)`; ours preserves the real id** (the pipeline resumes by it) and
+records the index as `episode_index`. `load_objectnav_episodes()` falls back to
+`episode_io.load_demo_objectnav` + light dataclasses with the same attribute
+surface if habitat-lab is missing or a shard trips the parser.
+
+Two things to know before reading the numbers:
+
+- Distances are computed on the navmesh `build_robot_sim` recomputes for the
+  *robot* (radius 0.28 m, height 1.0 m), not the point agent the dataset was
+  authored with. Start distance therefore differs from the episode's recorded
+  `info["geodesic_distance"]` by ~0.2 m typically and several metres in narrow
+  spaces. That is a real difference in what is traversable, not a bug — the
+  eval script prints it per episode.
+- A `HabitatRobotSim` is pinned to one scene (`reset(scene_id=...)` does not
+  rebuild the robot), so build one sim + task per scene and drive the outer loop
+  with `episodes_by_scene`. `ObjectNavTask.reset` raises on a scene mismatch.
+
+Validation: `python scripts/eval_objectnav.py examples/17DRP5sb8fy.json.gz
+--scene-root <...> --num-episodes 5` replays human demos through the pure-pursuit
+stack and scores them. These demos are successful human trajectories, so success
+should be 1.0 — it is (5/5, mean SPL 0.59, oracle SPL 1.0). Note long demos need
+a generous `--timeout`; truncated replays are flagged `replay_truncated` rather
+than silently counted as navigation failures.

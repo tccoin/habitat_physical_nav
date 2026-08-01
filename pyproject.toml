@@ -17,6 +17,12 @@ dependencies = [
 # and most scripts/ entry points, but they are not pip-installable packages -- they
 # must come from a conda environment (see this repo's docs; the "habitat" conda env).
 # They are intentionally not listed as dependencies here.
+#
+# Likewise habitat-lab: continuous_demos/objectnav.py (ObjectNav task + metrics) and
+# objectnav_dataset.py (episode loading) import `habitat.*`. habitat-lab is not on PyPI
+# in a usable form -- install it from a source checkout (`pip install -e habitat-lab/`)
+# in the same conda env. Everything else in the package runs without it, and
+# objectnav_dataset falls back to the handcrafted parser when it is missing.
 
 [project.optional-dependencies]
 build = ["datasets"]

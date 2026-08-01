@@ -198,9 +198,12 @@ def find_looking_slices(actions: list[str]) -> list[tuple[int, int]]:
     return slices
 
 def extract_demo(
-    episode: Dict[str, Any], max_steps: Optional[int] = None
+    episode: Any, max_steps: Optional[int] = None
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
     """Build mutually-aligned ``(path_3d, path_headings, actions)`` for a demo.
+
+    ``episode`` may be a raw dict (``load_demo_objectnav``) or an episode object
+    with a ``reference_replay`` attribute (``objectnav_dataset``).
 
     Returns:
       * ``path_3d[m]``       -- world position at path point ``m`` (Nx3 float32)
@@ -232,7 +235,10 @@ def extract_demo(
     off-by-one-free segment<->action correspondence. The first (lost) action and
     both ``STOP`` seeds are dropped; at most one demo transition is discarded.
     """
-    replay = episode.get("reference_replay", [])
+    if isinstance(episode, dict):
+        replay = episode.get("reference_replay", [])
+    else:
+        replay = getattr(episode, "reference_replay", None) or []
     if len(replay) < 2:
         raise ValueError("Selected episode has no reference_replay data.")
 

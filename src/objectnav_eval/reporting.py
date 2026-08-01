@@ -504,7 +504,13 @@ def print_behaviour(summary: Dict[str, Any]) -> None:
             f"{value(contact, 'collisions_per_m'):.2f} per metre travelled  "
             f"longest {value(contact, 'longest_obstructed_run_ticks'):.0f} ticks"
         )
-    if coherence:
+    if coherence and not is_finite(coherence.get("flip_rate_within_chunk")):
+        # A policy that never commands a rotation above the deadband -- the
+        # `forward` control, say -- has no direction to reverse. Saying so beats
+        # printing "nan%", which reads as a bug.
+        print("  coherence        no rotating ticks: the sign-flip rate is undefined "
+              "for this policy")
+    elif coherence:
         print(
             f"  coherence        rotation sign-flip {value(coherence, 'flip_rate_within_chunk') * 100:.1f}% "
             f"within chunk ({value(coherence, 'flip_rate_all_adjacent') * 100:.1f}% all adjacent)   "

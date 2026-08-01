@@ -292,20 +292,38 @@ class HeadingRotationConfig:
             another name -- ``w_min`` floors the velocity, this bounds its
             derivative, and only the latter puts mass in the intermediate rates.
 
-            The default of 12 comes from a sweep over 192 held-out episodes
-            (``dump/rotation_segmentation/FINDINGS.md``). It is cheap: episode
-            duration goes from 0.671 to 0.705 of the pre-tuning baseline, i.e.
-            the softening costs 4.8% and keeps 95% of the speed win, because only
-            the EDGES of the turn are ramped and ``w_max`` is untouched. What it
-            buys is the shape of the angular-velocity distribution, which is the
-            actual point: saturation falls 0.978 -> 0.738 and the share of
-            turning ticks at an intermediate rate rises 0.021 -> 0.210. That
-            matters because this project's central finding is that a
-            conditional-mean regression head cannot represent a bimodal
-            stop-or-drive action distribution; a bang-bang rotation law makes the
-            yaw channel bimodal in exactly the same way, and regenerating the
-            corpus with it would transplant the disease into a new channel.
-            Delivered scan sweep also improves (7.5 -> 3.4 degrees lost).
+            The default of 5 comes from a sweep over alpha_max in
+            {50, 30, 20, 12, 8, 5, 3, 2} on 192 held-out episodes across 24
+            scenes never used for tuning (``dump/rotation_segmentation/``).
+
+            What it buys is the shape of the angular-velocity distribution, and
+            that is the point rather than a side benefit: this project's central
+            finding is that a conditional-mean regression head cannot represent a
+            bimodal stop-or-drive action distribution, which is why a
+            normalizing-flow head is being built. A bang-bang rotation law makes
+            the yaw channel bimodal in exactly the same way, so regenerating the
+            corpus with it would deliberately bake the same pathology into a
+            second channel. Share of turning ticks sitting AT the cap: 73%
+            unbounded, 58% at alpha_max 20, 44% at 8, **35% at 5**, against 44%
+            for the old gain-3 law. So alpha_max = 5 is more graded than anything
+            this pipeline has ever recorded, and alpha_max = 8 merely matches the
+            old law. Restricted to look-phase ticks, saturation is 0.973
+            unbounded and 0.318 at alpha_max 5, against 0.316 for the old law.
+
+            What it costs is duration: 0.672 of the pre-tuning baseline unbounded,
+            0.825 at alpha_max 5 -- so roughly half of the rotation speed-up is
+            given back, and a 17.5% net win over doing nothing remains. Below 5
+            the trade turns bad fast: 0.911 at alpha_max 3 and 0.994 at 2, i.e.
+            the entire win is gone, and the goal-check pass rate starts falling
+            (0.849 / 0.844 / 0.833 / 0.823 at 8 / 5 / 3 / 2).
+
+            Fidelity is otherwise flat and slightly better than the untouched
+            baseline: goal-check pass 0.844 against 0.802, reference miss 0.480
+            against 0.551, path length +14.5%, zero goal regressions. The one
+            small cost is the delivered scan sweep, 7.56 -> 8.58 degrees lost per
+            look phase, because the profile accepts a waypoint at the deadband
+            edge with the rate already near zero rather than landing exactly on
+            it.
         gain: proportional gain (1/s). At ``gain == 1/dt`` (25.0 at the 25 Hz
             recording rate) the law is deadbeat: full ``w_max`` until the target
             is one tick away, then land exactly on it. A larger gain is also
@@ -328,7 +346,7 @@ class HeadingRotationConfig:
 
     w_max: float = 2.0
     w_min: float = 0.0
-    alpha_max: Optional[float] = 12.0
+    alpha_max: Optional[float] = 5.0
     gain: float = DEFAULT_ROTATION_FPS
     heading_tolerance: float = 0.03
     handoff_tolerance: Optional[float] = 0.09

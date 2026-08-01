@@ -105,10 +105,15 @@ class TestNoOvershoot:
         assert signs <= {np.sign(target), 0.0}, f"overshot: {sorted(signs)}"
 
     def test_high_gain_without_the_clamp_does_overshoot(self):
-        """Negative control: the clamp is what makes an aggressive gain safe."""
+        """Negative control: the clamp is what makes an aggressive gain safe.
+
+        Pinned to the unbounded law, because the acceleration bound independently
+        prevents this: its arrival rate is derived from the remaining angle, so it
+        cannot be told to overshoot by raising a gain it does not read.
+        """
         target = math.radians(90)
         controller, base = make([target], gain=100.0, no_overshoot_clamp=False,
-                                heading_tolerance=0.01)
+                                heading_tolerance=0.01, **UNBOUNDED)
         log = run(controller, base)
         signs = {np.sign(round(wrap(target - h), 12)) for _, h in log}
         assert -np.sign(target) in signs
@@ -178,8 +183,8 @@ class TestCapAndDeadband:
         assert at_cap >= len(log) - 2
 
     # The discrete demo turn primitives cluster at these sizes.
-    @pytest.mark.parametrize("deg,min_speedup", [(15, 2.15), (30, 2.1), (60, 1.65),
-                                                 (90, 1.4), (180, 1.2)])
+    @pytest.mark.parametrize("deg,min_speedup", [(15, 1.4), (30, 1.35), (60, 1.25),
+                                                 (90, 1.15), (180, 1.1)])
     def test_default_is_much_faster_than_the_old_proportional_law(self, deg, min_speedup):
         """Regression guard on the settle tail this controller was retuned to remove.
 
@@ -189,9 +194,12 @@ class TestCapAndDeadband:
         exactly where the demos spend most of their turning.
 
         Measured against the SHIPPED default, which bounds angular acceleration
-        and so gives some of the raw speed back: 2.25x / 2.18x / 1.72x / 1.48x /
-        1.30x at 15 / 30 / 60 / 90 / 180 degrees. The thresholds below sit just
-        under those, so this catches a regression without pinning the profile.
+        at 5 rad/s^2 and so gives about half the raw speed back: 1.50x / 1.41x /
+        1.29x / 1.19x / 1.14x at 15 / 30 / 60 / 90 / 180 degrees. The thresholds
+        below sit just under those. The margin is deliberately thin -- at the
+        shipped alpha_max a single turn is only modestly faster than the old law,
+        and the win is at the episode level (0.825 of baseline duration), where
+        removing the settle tail compounds across every waypoint of every phase.
         """
         target = math.radians(deg)
         new, base_new = make([target])
@@ -219,13 +227,14 @@ class TestCapAndDeadband:
         # The shipped law also spends time below the SETTLE threshold -- it has
         # to, it ramps -- but that time is the two ramps, bounded by
         # 2 * SETTLE_W / alpha_max, and unlike the old law's exponential it does
-        # not grow as the deadband shrinks. At alpha_max = 12 that is 0.10 s,
-        # plus the terminal zero tick this helper records: 4 ticks, 0.16 s,
-        # measured flat across every turn size. That flatness is the point --
-        # the old law's tail is 4-8x longer and buys nothing.
+        # not grow as the deadband shrinks. At the shipped alpha_max = 5 that is
+        # 8 ticks, 0.32 s, measured FLAT across every turn size. Flatness is the
+        # property that matters: the old law's tail is a fixed 0.63 s that buys
+        # nothing, this one is the ramp that the softening is deliberately paying
+        # for, and neither grows with the turn.
         new, base2 = make([math.radians(deg)])
         new_slow = sum(1 for w, _ in run(new, base2) if abs(w) < SETTLE_W)
-        assert new_slow * DT <= 0.18, f"{new_slow} ticks = {new_slow * DT:.2f}s"
+        assert new_slow * DT <= 0.36, f"{new_slow} ticks = {new_slow * DT:.2f}s"
 
         # ...and with acceleration unbounded it is a single landing tick.
         bb, base3 = make([math.radians(deg)], **UNBOUNDED)
@@ -297,7 +306,7 @@ class TestBoundedAcceleration:
     def test_lower_alpha_puts_more_mass_at_intermediate_rates(self):
         """The whole point, stated as a monotone property."""
         fracs = []
-        for alpha in (None, 30.0, 20.0, 12.0, 8.0):
+        for alpha in (None, 30.0, 20.0, 12.0, 8.0, 5.0):
             rates = []
             for deg in (30, 60, 90, 180):
                 controller, base = make([math.radians(deg)], alpha_max=alpha)
@@ -347,19 +356,24 @@ class TestBoundedAcceleration:
         b, bb = make([math.radians(90)], alpha_max=1e9)
         assert [w for w, _ in run(a, ba)] == pytest.approx([w for w, _ in run(b, bb)])
 
-    def test_bounded_is_slower_than_bang_bang_but_not_by_much(self):
-        """Honest cost guard: the softening must stay cheap per turn.
+    @pytest.mark.parametrize("alpha,ceilings", [
+        (12.0, {30: 1.5, 60: 1.35, 90: 1.25, 180: 1.15}),
+        (5.0, {30: 2.2, 60: 1.8, 90: 1.55, 180: 1.3}),
+    ])
+    def test_per_turn_cost_of_the_bound_is_characterised(self, alpha, ceilings):
+        """Honest cost guard, pinning what the softening costs per turn.
 
-        Measured 1.43x / 1.31x / 1.20x / 1.10x at 30 / 60 / 90 / 180 degrees --
-        the ramp is a fixed overhead, so it is proportionally cheapest on the
-        long turns. Episode duration rises only 4.8% because turning is a
-        minority of ticks.
+        The ramp is a fixed overhead, so it is proportionally cheapest on long
+        turns: at the shipped alpha_max = 5 a 30-degree turn takes 2.1x the
+        bang-bang tick count but a 180-degree turn only 1.25x. Episode duration
+        rises less than either (0.672 -> 0.825 of baseline) because turning is a
+        minority of ticks and the long turns dominate the turning time.
         """
-        for deg, max_ratio in ((30, 1.5), (60, 1.35), (90, 1.25), (180, 1.15)):
-            slow, b1 = make([math.radians(deg)], alpha_max=12.0)
+        for deg, max_ratio in ceilings.items():
+            slow, b1 = make([math.radians(deg)], alpha_max=alpha)
             fast, b2 = make([math.radians(deg)], alpha_max=None)
             n_slow, n_fast = len(run(slow, b1)), len(run(fast, b2))
-            assert n_slow <= max_ratio * n_fast, f"{deg}deg: {n_slow} vs {n_fast}"
+            assert n_slow <= max_ratio * n_fast, f"{deg}deg a={alpha}: {n_slow} vs {n_fast}"
 
     def test_w_min_is_ignored_when_acceleration_is_bounded(self):
         """A floor and a ramp through that floor are contradictory; documented."""

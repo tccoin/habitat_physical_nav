@@ -1,4 +1,5 @@
 import math
+import warnings
 import numpy as np
 import habitat_sim
 from typing import Dict, List, Any, Optional
@@ -57,7 +58,11 @@ class HabitatRobotSim:
         urdf_path: str, 
         sensor_setup: Dict[str, List[habitat_sim.sensor.SensorSpec]], 
         fixed_base: bool = False,
-        max_substep_dt: float = 1.0 / 120.0  # high frequency for accurate kinematic integration
+        # Must be a whole multiple/divisor of habitat's fixed Bullet timestep
+        # (0.008 s) or each step_world() call spans a variable number of physics
+        # steps -- see step() for the full aliasing story. 0.008 makes one
+        # substep == exactly one physics step.
+        max_substep_dt: float = 0.008
     ):
         self.urdf_path = urdf_path
         self.sensor_setup = sensor_setup
@@ -169,11 +174,59 @@ class HabitatRobotSim:
         goes straight to joint_th. twist_frame="world" applies [v_x, v_y]
         directly in that planar world frame; a (theta0, w) tuple integrates the
         heading across substeps (used by the pure-pursuit virtual heading).
+
+        TIMESTEP QUANTIZATION -- read before changing ``dt``.
+        Habitat/Bullet advances world time only in whole multiples of a fixed
+        internal physics timestep (``sim.get_physics_time_step()``, 0.008 s
+        here), carrying the sub-step remainder in an internal accumulator. So a
+        control tick of duration ``dt`` delivers ``floor(dt/0.008)`` physics
+        steps on most ticks and one more whenever the accumulator rolls over.
+        Unless ``dt`` is an exact integer multiple of 0.008, the physics time
+        actually delivered per tick therefore ALTERNATES between two values,
+        and a constant commanded velocity produces a rippling per-tick
+        displacement even though the mean is correct.
+
+        Measured: ``dt = 1/30`` (0.03333 s = 4.1667 steps) delivered 0.032 s on
+        50/60 ticks and 0.040 s on 10/60 -- a 24% peak-to-peak ripple, which at
+        the controller's v_max = 2.0 m/s and max_vw = 2.0 rad/s quantized every
+        saturated tick to exactly 0.064 or 0.080 (m and rad alike). Subdividing
+        more finely does NOT help: the ripple is a property of ``dt`` vs the
+        physics grid, not of ``max_substep_dt`` (measured identical 24.01%
+        ripple for max_substep_dt of 1/120, 0.008 and 0.004).
+
+        The only fix is an on-grid ``dt``. Integer frame rates whose period is a
+        whole multiple of 0.008 s are 1/(n*0.008) for n = 1, 5, 25, 125, i.e.
+        125, 25, 5 and 1 Hz -- so 25 Hz (dt = 0.04 s = 5 physics steps) is the
+        only usable recording rate that is exactly on the grid. Hence the 25 Hz
+        default in ``generate_pose2d_dataset.py``. A ``dt`` off the grid still
+        runs, but warns once.
         """
+        # Align substepping to the simulator's fixed physics timestep so that
+        # one substep == one physics step and the velocity command written
+        # before each substep is integrated for exactly the duration intended.
+        fixed_dt = self.sim.get_physics_time_step()
+        if not getattr(self, "_warned_off_grid_dt", False):
+            n_phys = dt / fixed_dt
+            if abs(n_phys - round(n_phys)) > 1e-6:
+                self._warned_off_grid_dt = True
+                warnings.warn(
+                    f"HabitatRobotSim.step(dt={dt!r}) is not an integer multiple "
+                    f"of the fixed physics timestep ({fixed_dt}); physics time "
+                    f"delivered per tick will alternate between "
+                    f"{math.floor(n_phys) * fixed_dt:.4f}s and "
+                    f"{math.ceil(n_phys) * fixed_dt:.4f}s, so a constant "
+                    f"commanded velocity will show a "
+                    f"{100.0 * (math.ceil(n_phys) - math.floor(n_phys)) / n_phys:.0f}% "
+                    "per-tick ripple. Use an on-grid rate (e.g. 25 Hz -> "
+                    "dt=0.04) to record uniform motion.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
         # Determine substepping
         num_steps = max(1, math.ceil(dt / self.max_substep_dt))
         substep_dt = dt / num_steps
-        
+
         v_x_cmd, v_y_cmd, omega_cmd = chassis_twist
         
         for step_idx in range(num_steps):

@@ -5,7 +5,11 @@
 # ==========================================
 MAX_CONCURRENT_JOBS=24  # Adjust based on your CPU cores
 MAX_LENGTH=300
-FPS=30
+# 25 Hz -> dt = 0.04s = exactly 5 of habitat's fixed 0.008s Bullet steps. Off-grid
+# rates (the old FPS=30 -> dt=0.03333s = 4.1667 steps) make the physics time
+# delivered per tick alternate between 0.032s and 0.040s, i.e. a 24% per-tick
+# velocity ripple baked into every recorded pose. See HabitatRobotSim.step.
+FPS=25
 IMAGE_EXT="jpeg"
 
 # ==========================================

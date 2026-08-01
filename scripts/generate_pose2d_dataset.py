@@ -211,7 +211,7 @@ def generate(
     scene_root: Optional[str] = None,
     width: int = 640,
     height: int = 480,
-    fps: int = 30,
+    fps: int = 25,
     max_length: Optional[int] = None,
     max_steps: Optional[int] = None,
     goal_threshold: float = 1.0,
@@ -390,7 +390,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--width", type=int, default=640, help="Render width.")
     parser.add_argument("--height", type=int, default=480, help="Render height.")
-    parser.add_argument("--fps", type=int, default=30, help="Replay/record FPS.")
+    parser.add_argument(
+        "--fps", type=int, default=25,
+        help="Replay/record FPS. MUST sit on habitat's fixed 0.008s Bullet "
+             "physics grid, or every saturated tick's displacement alternates "
+             "between two values (see HabitatRobotSim.step). The only integer "
+             "rates whose period is a whole multiple of 0.008s are 125, 25, 5 "
+             "and 1 Hz -- 25 Hz (dt=0.04s = 5 physics steps) is the only "
+             "usable one. The previous 30 Hz default was off-grid and produced "
+             "a 24%% per-tick velocity ripple.",
+    )
     parser.add_argument(
         "--max-length", type=int, default=None,
         help="Skip episodes whose reference_replay is longer than this (pre-filter).",

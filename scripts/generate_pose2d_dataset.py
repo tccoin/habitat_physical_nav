@@ -94,6 +94,7 @@ from continuous_demos.recording_metadata import (
     params_for_generation,
     shard_params,
 )
+from continuous_demos.rotation_canonicalize import maybe_canonicalize
 from continuous_demos.episode_io import (
     DEFAULT_URDF_PATH,
     build_robot_sim,
@@ -224,7 +225,8 @@ def replay_one_episode(
     fps: int,
     max_steps: Optional[int],
     failure_config: Optional[DriveFailureConfig] = None,
-) -> Tuple[List[np.ndarray], List[np.ndarray], np.ndarray, EpisodeHealth]:
+    canonicalize_rotation: bool = False,
+) -> Tuple[List[np.ndarray], List[np.ndarray], np.ndarray, EpisodeHealth, Optional[dict]]:
     """Replay a single episode and return ``(frames, poses, path_3d, health)``.
 
     ``frames[i]`` and ``poses[i]`` are aligned 1:1 (one planar pose per RGB
@@ -234,6 +236,15 @@ def replay_one_episode(
     whether the robot fell out of the world, which no planar quantity can show.
     """
     path_3d, path_headings, actions = extract_demo(episode, max_steps=max_steps)
+    # OFF by default. When on, every maximal run of pure TURN_LEFT/TURN_RIGHT is
+    # replaced by the shortest run with the same covered heading range, start
+    # heading and end heading -- redundant re-glancing at a scene the robot has
+    # not moved through. Editing the ACTION sequence rather than the recorded
+    # frames is what keeps this seam-free; see rotation_canonicalize and
+    # dump/rotation_blunders/FINDINGS.md. A no-op on 99.17% of runs.
+    path_3d, path_headings, actions, canon = maybe_canonicalize(
+        path_3d, path_headings, actions, canonicalize_rotation
+    )
     looking_slices = find_looking_slices(actions)
 
     robot_sim.reset(
@@ -255,7 +266,13 @@ def replay_one_episode(
         debug_draw=False,
         health_monitor=monitor,
     )
-    return frames, poses, path_3d, monitor.finish(poses)
+    return (
+        frames,
+        poses,
+        path_3d,
+        monitor.finish(poses),
+        canon.as_dict() if canon is not None else None,
+    )
 
 
 def save_episode_frames(
@@ -294,6 +311,7 @@ def generate(
     log_file: Optional[Path] = None,
     max_episodes: Optional[int] = None,
     failure_config: Optional[DriveFailureConfig] = None,
+    canonicalize_rotation: bool = False,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     if image_root is None:
@@ -399,9 +417,10 @@ def generate(
                         ep_dir_name = sanitize(ep_id)
 
                         try:
-                            frames, poses, path_3d, health = replay_one_episode(
+                            frames, poses, path_3d, health, canon = replay_one_episode(
                                 robot_sim, episode, fps=fps, max_steps=max_steps,
                                 failure_config=failure_config,
+                                canonicalize_rotation=canonicalize_rotation,
                             )
                         except Exception as exc:
                             print(f"  [ep {idx} / {ep_id}] replay error: {exc}")
@@ -472,6 +491,10 @@ def generate(
                             "recording": recording_blob,
                             QUALITY_KEY: health.as_dict(),
                         }
+                        # Only written when the flag is on, so records produced
+                        # with it off are byte-identical to what they were.
+                        if canon is not None:
+                            record["rotation_canonicalized"] = canon
                         jf.write(json.dumps(record) + "\n")
                         jf.flush()
                         n_ok += 1
@@ -574,6 +597,19 @@ def parse_args() -> argparse.Namespace:
              "the measured distribution.",
     )
     parser.add_argument(
+        "--canonicalize-rotation", action="store_true",
+        help="Replace every maximal run of pure TURN_LEFT/TURN_RIGHT with the "
+             "shortest run covering the same heading range and ending on the "
+             "same heading, BEFORE replay. Removes human re-glancing -- rotation "
+             "that collected no new view, because the robot had not moved -- "
+             "without touching monotone scans, single out-and-back glances, or "
+             "any non-turn action. OFF by default. Measured over all 56 train "
+             "scenes: 99.17%% of rotation runs are already minimal and are "
+             "returned untouched; 78.7%% of episodes are unaffected entirely; "
+             "it removes 0.42%% of actions and 1.28%% of all rotation. See "
+             "dump/rotation_blunders/FINDINGS.md.",
+    )
+    parser.add_argument(
         "--ref-miss-flag-m", type=float, default=DriveFailureConfig.ref_miss_flag_m,
         help="Reference-path miss counted as 'not following the path' when "
              "reporting (and optionally acting on) sustained tracking error.",
@@ -598,6 +634,7 @@ def main() -> None:
         image_ext=args.image_ext,
         log_file=args.log_file,
         max_episodes=args.max_episodes,
+        canonicalize_rotation=args.canonicalize_rotation,
         failure_config=DriveFailureConfig(
             escape_unsupported_s=args.escape_unsupported_s,
             ref_miss_flag_m=args.ref_miss_flag_m,

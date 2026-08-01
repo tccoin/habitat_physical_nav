@@ -38,7 +38,8 @@ Each JSONL line (one episode) has:
       "goal_text":     "chair",            # object_category
       "rgb_paths":     ["<scene>/<ep>/frame_00000.png", ...],  # relative to image_root
       "pose2d":        [[x, y, theta], ...],                   # aligned with rgb_paths
-      "recording":     {"schema_version": 1, "native_fps": 25.0, ...}
+      "recording":     {"schema_version": 1, "native_fps": 25.0, ...},
+      "quality":       {"schema_version": 1, "success": true, "final_dist_m": ...}
     }
 
 ``recording`` is the block described in ``continuous_demos.recording_metadata``:
@@ -51,9 +52,22 @@ than silently mixed. Consumers read it via
 ``recording_metadata.resolve_corpus_params``; corpora written before the schema
 existed carry no such key and were all recorded at 30 Hz.
 
-Only demonstrations whose *final* replayed pose lands within a distance threshold
-(default 1 m) of the demonstration's reference final position are kept; the rest
-are logged and skipped.
+``quality`` is the block described in ``continuous_demos.drive_failure``: how
+this episode actually went. It carries the outcome, the final-pose distance the
+goal check used (previously computed and thrown away, so a shipped corpus could
+not be audited at all), the escape/support signals, the reference-path tracking
+error, and the episode's motion composition.
+
+Two rejection rules run per episode, and both are recorded rather than just
+acted on:
+
+  * the **goal check** -- final replayed pose within ``--goal-threshold`` metres
+    of the demonstration's reference final position;
+  * the **escape check** -- the robot must not leave the world. This cannot be
+    a tighter goal threshold: the base is a virtual gantry, so a robot that has
+    fallen out of the scene keeps tracking the demonstration *perfectly* in
+    ``pose2d`` and lands well inside the goal threshold with a normal path
+    length. See ``continuous_demos.drive_failure``.
 """
 
 import argparse
@@ -68,6 +82,12 @@ import imageio.v2 as imageio
 import numpy as np
 
 from continuous_demos.replay import record_segmented_demo
+from continuous_demos.drive_failure import (
+    QUALITY_KEY,
+    DriveFailureConfig,
+    EpisodeHealth,
+    EpisodeHealthMonitor,
+)
 from continuous_demos.recording_metadata import (
     RecordingParams,
     format_grid_note,
@@ -203,11 +223,15 @@ def replay_one_episode(
     episode: Dict[str, Any],
     fps: int,
     max_steps: Optional[int],
-) -> Tuple[List[np.ndarray], List[np.ndarray], np.ndarray]:
-    """Replay a single episode and return ``(frames, poses, path_3d)``.
+    failure_config: Optional[DriveFailureConfig] = None,
+) -> Tuple[List[np.ndarray], List[np.ndarray], np.ndarray, EpisodeHealth]:
+    """Replay a single episode and return ``(frames, poses, path_3d, health)``.
 
     ``frames[i]`` and ``poses[i]`` are aligned 1:1 (one planar pose per RGB
     frame). ``path_3d`` is the reference demo path, used for the goal check.
+    ``health`` is the per-episode quality record built by
+    :class:`~continuous_demos.drive_failure.EpisodeHealthMonitor` -- including
+    whether the robot fell out of the world, which no planar quantity can show.
     """
     path_3d, path_headings, actions = extract_demo(episode, max_steps=max_steps)
     looking_slices = find_looking_slices(actions)
@@ -218,6 +242,9 @@ def replay_one_episode(
         snap_to_navmesh=False,
         vertical_offset=None,
     )
+    # Constructed after reset() so its spawn-height baseline is the episode's
+    # own spawn, not wherever the previous episode left the robot.
+    monitor = EpisodeHealthMonitor(robot_sim, fps=fps, config=failure_config)
     frames, poses = record_segmented_demo(
         robot_sim,
         path_3d,
@@ -226,8 +253,9 @@ def replay_one_episode(
         timeout=60,
         fps=fps,
         debug_draw=False,
+        health_monitor=monitor,
     )
-    return frames, poses, path_3d
+    return frames, poses, path_3d, monitor.finish(poses)
 
 
 def save_episode_frames(
@@ -265,6 +293,7 @@ def generate(
     image_ext: str = "png",
     log_file: Optional[Path] = None,
     max_episodes: Optional[int] = None,
+    failure_config: Optional[DriveFailureConfig] = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     if image_root is None:
@@ -283,6 +312,7 @@ def generate(
     n_failed = 0
     n_resumed = 0  # episodes skipped because a prior run already handled them
     processed = 0
+    n_rejected: Dict[str, int] = defaultdict(int)  # rejections, by rule
 
     # Resume support: episodes already completed (per-scene JSONL shards, read
     # lazily below) or previously failed (the log) are skipped. Load the failed
@@ -369,8 +399,9 @@ def generate(
                         ep_dir_name = sanitize(ep_id)
 
                         try:
-                            frames, poses, path_3d = replay_one_episode(
-                                robot_sim, episode, fps=fps, max_steps=max_steps
+                            frames, poses, path_3d, health = replay_one_episode(
+                                robot_sim, episode, fps=fps, max_steps=max_steps,
+                                failure_config=failure_config,
                             )
                         except Exception as exc:
                             print(f"  [ep {idx} / {ep_id}] replay error: {exc}")
@@ -386,20 +417,42 @@ def generate(
                             continue
 
                         # Goal check: final replayed pose vs reference final position.
+                        # Note this passes for a robot that fell out of the world --
+                        # the gantry keeps tracking the demo perfectly once nothing
+                        # touches it -- which is exactly why the health monitor's
+                        # escape check below is a separate, non-planar test and not a
+                        # tighter threshold on this one.
                         final_xy = np.asarray(poses[-1][:2], dtype=float)
                         target_xy = reference_final_xy(path_3d)
                         dist = float(np.linalg.norm(final_xy - target_xy))
+                        health.final_dist_m = dist
+                        health.goal_threshold_m = float(goal_threshold)
                         if dist > goal_threshold:
-                            print(
-                                f"  [ep {idx} / {ep_id}] FAIL final-pose dist "
-                                f"{dist:.2f}m > {goal_threshold:.2f}m -- skipping"
-                            )
-                            log.write(
-                                f"{idx}\t{ep_id}\t{scene}\t"
-                                f"final pose {dist:.3f}m from goal (> {goal_threshold}m)\n"
-                            )
+                            health.success = False
+                            health.outcome = "goal"
+
+                        if not health.success:
+                            reason = {
+                                "goal": (f"final pose {dist:.3f}m from goal "
+                                         f"(> {goal_threshold}m)"),
+                                "escaped": (
+                                    f"left the world: unsupported for "
+                                    f"{health.unsupported_run_s:.2f}s "
+                                    f"({health.unsupported_run_ticks} ticks), fell "
+                                    f"{health.max_drop_m:.2f}m"
+                                ),
+                                "ref_miss": (
+                                    f"off its reference path by > "
+                                    f"{health.ref_miss_flag_m:g}m for "
+                                    f"{health.ref_miss_worst_run_s:.2f}s"
+                                ),
+                            }.get(health.outcome, health.outcome)
+                            print(f"  [ep {idx} / {ep_id}] FAIL ({health.outcome}) {reason}"
+                                  " -- skipping")
+                            log.write(f"{idx}\t{ep_id}\t{scene}\t{reason}\n")
                             log.flush()
                             n_failed += 1
+                            n_rejected[health.outcome] += 1
                             continue
 
                         rgb_paths = save_episode_frames(
@@ -417,21 +470,26 @@ def generate(
                             "rgb_paths": rgb_paths,
                             "pose2d": pose2d,
                             "recording": recording_blob,
+                            QUALITY_KEY: health.as_dict(),
                         }
                         jf.write(json.dumps(record) + "\n")
                         jf.flush()
                         n_ok += 1
                         print(
                             f"  [ep {idx} / {ep_id}] OK  {len(frames)} frames, "
-                            f"final-pose dist {dist:.2f}m"
+                            f"final-pose dist {dist:.2f}m, ref-miss p95 "
+                            f"{(health.ref_miss_p95_m or 0.0):.2f}m, "
+                            f"drive/turn {(health.frac_drive or 0):.0%}/"
+                            f"{(health.frac_turn or 0):.0%}"
                         )
             finally:
                 robot_sim.sim.close(destroy=True)
 
+    breakdown = ", ".join(f"{k}={v}" for k, v in sorted(n_rejected.items())) or "none"
     print(
         f"\nDone. {n_ok} episode(s) written, {n_failed} skipped/failed, "
         f"{n_resumed} skipped (already done/failed on a prior run). "
-        f"Log: {log_file}"
+        f"Rejections by rule: {breakdown}. Log: {log_file}"
     )
 
 
@@ -496,6 +554,30 @@ def parse_args() -> argparse.Namespace:
         "--max-episodes", type=int, default=None,
         help="Optional cap on total episodes processed (for quick testing).",
     )
+    parser.add_argument(
+        "--escape-unsupported-s", type=float,
+        default=DriveFailureConfig.escape_unsupported_s,
+        help="Reject an episode in which the robot has no contact with the scene "
+             "for this many consecutive seconds -- the signature of it leaving the "
+             "world, which no planar quantity can see. The longest contact-free "
+             "run measured in a healthy episode is 1.0s; the shortest in an "
+             "escaped one is 3.0s.",
+    )
+    parser.add_argument(
+        "--reject-ref-miss-s", type=float, default=None,
+        help="Additionally reject an episode that stays more than "
+             "--ref-miss-flag-m off its reference path for this long. OFF by "
+             "default: sustained tracking error measures demonstration QUALITY, "
+             "not validity, and it cannot see an escape at all (an escaped robot "
+             "tracks its path better than a healthy one). The statistic is "
+             "recorded on every episode either way, so a cut can be chosen from "
+             "the measured distribution.",
+    )
+    parser.add_argument(
+        "--ref-miss-flag-m", type=float, default=DriveFailureConfig.ref_miss_flag_m,
+        help="Reference-path miss counted as 'not following the path' when "
+             "reporting (and optionally acting on) sustained tracking error.",
+    )
     return parser.parse_args()
 
 
@@ -516,6 +598,11 @@ def main() -> None:
         image_ext=args.image_ext,
         log_file=args.log_file,
         max_episodes=args.max_episodes,
+        failure_config=DriveFailureConfig(
+            escape_unsupported_s=args.escape_unsupported_s,
+            ref_miss_flag_m=args.ref_miss_flag_m,
+            reject_ref_miss_s=args.reject_ref_miss_s,
+        ),
     )
 
 

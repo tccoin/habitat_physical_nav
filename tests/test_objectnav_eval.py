@@ -439,3 +439,136 @@ def test_episode_line_is_strict_json_for_an_off_navmesh_episode():
     text = json.dumps(line)
     assert "Infinity" not in text
     assert json.loads(text)["final_m"] is None
+
+
+# ---------------------------------------------------------------------------
+# comparing two runs
+# ---------------------------------------------------------------------------
+
+
+def write_run(tmp_path, name, rows):
+    """A run directory containing only the JSONL, which is what compare reads."""
+    directory = tmp_path / name
+    directory.mkdir()
+    path = directory / "objectnav_eval_results.jsonl"
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    return directory
+
+
+def line(uid, success=0, oracle_success=0, spl=0.0, start_m=5.0, min_m=5.0,
+         status="evaluated", **extra):
+    row = {
+        "uid": uid, "scene": uid.split(":")[0], "episode_id": uid.split(":")[-1],
+        "category": "chair", "status": status, "success": success,
+        "oracle_success": oracle_success, "spl": spl, "start_m": start_m,
+        "min_m": min_m,
+    }
+    row.update(extra)
+    return row
+
+
+def test_mcnemar_uses_only_the_discordant_pairs():
+    from objectnav_eval.compare import mcnemar_exact
+
+    # No disagreement at all: nothing to test, whatever the rates are.
+    assert mcnemar_exact(0, 0) == 1.0
+    # Perfectly split disagreement is the null.
+    assert mcnemar_exact(5, 5) == 1.0
+    # All ten discordant pairs favour one side: 2 * 2^-10.
+    assert mcnemar_exact(10, 0) == pytest.approx(2 * 0.5**10)
+    assert mcnemar_exact(10, 0) == mcnemar_exact(0, 10)
+
+
+def test_mcnemar_is_not_the_chi_square_approximation():
+    """The reason it is exact: at these counts the approximation over-rejects.
+
+    b=8, c=1 gives chi-square (|8-1|-1)^2/9 = 4.0 -> p = 0.0455, i.e. "significant";
+    the exact binomial says 0.039 here, and at b=6,c=1 the two straddle 0.05 in
+    opposite directions. On splits this size the discordant count is routinely
+    single-digit, so the approximation is the wrong tool.
+    """
+    from objectnav_eval.compare import mcnemar_exact
+
+    assert mcnemar_exact(6, 1) == pytest.approx(2 * (1 + 7) / 2**7)
+    assert mcnemar_exact(6, 1) > 0.05
+    assert 0.0 < mcnemar_exact(8, 1) < 0.05
+
+
+def test_wilson_interval_stays_inside_zero_one_near_the_boundary():
+    from objectnav_eval.compare import wilson_interval
+
+    low, high = wilson_interval(0, 14)
+    assert low == pytest.approx(0.0, abs=1e-12) and 0.0 < high < 1.0
+    low, high = wilson_interval(3, 14)
+    assert 0.0 < low < 3 / 14 < high < 1.0
+    low, high = wilson_interval(14, 14)
+    assert high == 1.0 and low > 0.5
+    assert all(math.isnan(v) for v in wilson_interval(0, 0))
+
+
+def test_comparison_is_paired_over_the_shared_episodes_only(tmp_path):
+    from objectnav_eval.compare import common_uids, compare_runs, load_jsonl
+
+    a = load_jsonl(write_run(
+        tmp_path, "a",
+        [line("S:1", success=1), line("S:2"), line("S:3", status="skipped")],
+    ))
+    b = load_jsonl(write_run(
+        tmp_path, "b",
+        [line("S:1"), line("S:2", success=1), line("S:4", success=1)],
+    ))
+    # Skipped episodes are coverage, not comparison; S:4 is not in both runs.
+    assert common_uids([a, b]) == ["S:1", "S:2"]
+    success = next(c for c in compare_runs(a, b) if c.metric == "success")
+    assert success.n == 2
+    assert success.mean_a == pytest.approx(0.5) and success.mean_b == pytest.approx(0.5)
+    assert success.extra["discordant"] == 2
+    assert success.p_value == pytest.approx(1.0)
+
+
+def test_progress_is_derived_and_survives_a_missing_field(tmp_path):
+    from objectnav_eval.compare import load_jsonl
+
+    run = load_jsonl(write_run(
+        tmp_path, "derived",
+        [line("S:1", start_m=6.0, min_m=2.0), dict(line("S:2"), min_m=None)],
+    ))
+    assert run["S:1"]["progress_m"] == pytest.approx(4.0)
+    assert run["S:2"]["progress_m"] is None
+
+
+def test_non_finite_distances_are_dropped_per_metric_not_per_episode(tmp_path):
+    from objectnav_eval.compare import compare_runs, load_jsonl, rate_table
+
+    rows_a = [line("S:1", success=1, final_m=1.0), line("S:2", final_m=None)]
+    rows_b = [line("S:1", final_m=2.0), line("S:2", success=1, final_m=3.0)]
+    a = load_jsonl(write_run(tmp_path, "fa", rows_a))
+    b = load_jsonl(write_run(tmp_path, "fb", rows_b))
+    comparisons = {c.metric: c for c in compare_runs(a, b)}
+    # The off-navmesh episode still counts in success ...
+    assert comparisons["success"].n == 2
+    # ... but cannot be averaged into a distance.
+    assert comparisons["final_m"].n == 1
+    table = rate_table(a)
+    assert table["success"] == pytest.approx(0.5)
+    assert table["final_m_n"] == 1
+
+
+def test_mde_shrinks_with_n_and_is_reported_even_when_nothing_is_significant():
+    from objectnav_eval.compare import mde_paired_rate, mde_unpaired_rate
+
+    assert mde_unpaired_rate(45, 0.2) > mde_unpaired_rate(280, 0.2)
+    assert mde_paired_rate(45, 0.2) > mde_paired_rate(280, 0.2)
+    # Pairing buys power: two policies that disagree on 20% of episodes are
+    # separable at a smaller effect than two independent arms of the same size.
+    assert mde_paired_rate(45, 0.2) < mde_unpaired_rate(45, 0.2)
+    assert math.isnan(mde_unpaired_rate(0, 0.2))
+    assert math.isnan(mde_paired_rate(45, 0.0))
+
+
+def test_load_jsonl_rejects_a_run_with_nothing_evaluated(tmp_path):
+    from objectnav_eval.compare import load_jsonl
+
+    directory = write_run(tmp_path, "empty", [line("S:1", status="skipped")])
+    with pytest.raises(ValueError):
+        load_jsonl(directory)

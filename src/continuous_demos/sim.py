@@ -87,9 +87,16 @@ class HabitatRobotSim:
         self.agent_id = agent_id
         # self.sim.reconfigure(self.cfg)
 
-        # 3. Setup the robot and attach sensors
+        # 3. Setup the robot and attach sensors.
+        # NOTE: do NOT clear self.robot afterwards. _setup_robot_and_sensors()
+        # adds a new articulated object from the URDF whenever self.robot is
+        # None, and reset() calls it on every episode -- so blanking the handle
+        # here made the first reset() instantiate a SECOND robot and leave the
+        # first one in the physics world forever as an orphaned dynamic
+        # multibody at the origin. That orphan was the dominant source of
+        # order-dependence between episodes (see reset()).
         self._setup_robot_and_sensors()
-        self.robot = None
+
     def _setup_robot_and_sensors(self):
         # Load the URDF
         aom = self.sim.get_articulated_object_manager()
@@ -265,7 +272,50 @@ class HabitatRobotSim:
             
     def get_obs(self) -> dict:# Return standard observation dictionary
         return self.sim.get_sensor_observations(self.agent_id)
-    
+
+    # Height (metres) the robot is parked at while its collision caches are
+    # flushed. Habitat's Bullet world uses btDbvtBroadphase (a dynamic AABB
+    # tree, no world bounds), so any coordinate is legal; 10 km up is outside
+    # every habitat scene's AABB, which is what makes the broadphase drop the
+    # robot's overlapping pairs.
+    _PARK_HEIGHT_M = 1.0e4
+
+    def _flush_physics_contact_state(self) -> None:
+        """Drop Bullet's cached collision state for the robot.
+
+        ``habitat_sim.Simulator.reset()`` restores articulated-object
+        *kinematics* -- joint positions, velocities and forces, and the root
+        transform -- but it does not touch Bullet's collision caches. The
+        broadphase overlapping-pair cache and the ``btPersistentManifold`` for
+        each pair (its cached contact points, their slot ordering, and the
+        warm-start impulses on them) survive the teleport into the next
+        episode. Measured on MP3D 17DRP5sb8fy: 6 overlapping pairs / 2 active
+        contact points at the end of an episode, still 6 / 2 immediately after
+        ``sim.reset()``.
+
+        That residue does not move the robot at spawn -- the first ticks of the
+        next episode are bit-identical either way -- but it changes the order
+        and the warm-start seeds of the contact constraints the solver sees,
+        so as soon as the robot touches geometry the Gauss-Seidel solve lands
+        on a slightly different answer (first observed divergence ~1e-7 rad/s
+        in ``joint_th``) and the trajectory then diverges chaotically. That is
+        how a stateless, image-blind policy could run the same episode two
+        different ways depending on what preceded it.
+
+        Bullet exposes no "clear the caches" call through habitat's bindings,
+        but the broadphase drops a pair as soon as the two AABBs stop
+        overlapping. So: park the robot far outside the scene, run one
+        collision pass (pairs go to 0), and put it back. The pairs are then
+        rebuilt from scratch on the next ``step_world``, exactly as they are in
+        a freshly constructed simulator. Costs ~1 ms.
+        """
+        if self.robot is None:
+            return
+        parked = self.robot.translation
+        self.robot.translation = mn.Vector3(0.0, self._PARK_HEIGHT_M, 0.0)
+        self.sim.perform_discrete_collision_detection()
+        self.robot.translation = parked
+
     def reset(
         self, 
         scene_id: Optional[str] = None, 
@@ -275,7 +325,24 @@ class HabitatRobotSim:
         vertical_offset: Optional[float] = None, # Manual override if AABB is weird
         home_joint_positions: Optional[Dict[str, float]] = None
     ) -> dict:
-        
+        """Return the simulator to a start-of-episode state.
+
+        CONTRACT: after reset(), the outcome of an episode must not depend on
+        what ran before it in this simulator. That is what makes it legitimate
+        to reuse one simulator across every episode of a scene, as
+        ``generate_pose2d_dataset.py`` and the evaluation harnesses do. It was
+        previously violated, in two independent ways, and the violation was
+        measurable: replaying one demonstration after three other episodes
+        moved its recorded path by up to 0.040 m relative to replaying it
+        alone. Steps 0 and 1b below are what restore the contract; do not drop
+        either of them for speed. They cost ~1 ms per episode, against ~2 s to
+        rebuild the simulator instead.
+        """
+        # 0. Purge the physics residue of the previous episode. Both halves are
+        # load-bearing for making an episode's outcome independent of what ran
+        # before it in this simulator; see _flush_physics_contact_state().
+        self._flush_physics_contact_state()
+
         # 1. Handle Scene Changes and Graph Rebuild
         if scene_id is not None and scene_id != self.cfg.sim_cfg.scene_id:
             self.cfg.sim_cfg.scene_id = scene_id
@@ -283,6 +350,19 @@ class HabitatRobotSim:
         else:
             self.sim.reset()
             self._setup_robot_and_sensors()
+
+        # 1b. Re-home the robot's own dynamic state explicitly. sim.reset()
+        # already zeroes joint positions/velocities/forces -- but only via
+        # resetStateFromSceneInstanceAttr(), which silently no-ops for an
+        # articulated object that has no scene-instance attributes. Doing it
+        # here makes reset() self-sufficient, and clear_joint_states() also
+        # clears the multibody's constraint forces and link velocities (which
+        # nothing else does) and handles spherical joints correctly. This is
+        # what re-homes the passive suspension joints joint_z/pitch/roll.
+        if self.robot is not None:
+            self.robot.clear_joint_states()
+            self.robot.root_linear_velocity = mn.Vector3(0.0, 0.0, 0.0)
+            self.robot.root_angular_velocity = mn.Vector3(0.0, 0.0, 0.0)
 
         # 2. Seed the base yaw (joint_th) from the requested orientation.
         # Goal: joint_th = the requested facing as a heading in the planar control
@@ -340,8 +420,6 @@ class HabitatRobotSim:
                     # Instantly update the kinematic state
                     l_id = self.robot.existing_joint_motor_ids[m_id]
                     pos_offset = self.robot.get_link_joint_pos_offset(l_id)
-                    # joint_name = self.robot.get_link_joint_name(l_id)
-                    print(f"homing joint '{j_name}' to {pos_target} (motor_id={m_id}, link_id={l_id}, pos_offset={pos_offset})")
                     joint_positions[pos_offset] = pos_target
             self.robot.joint_positions = joint_positions
                     

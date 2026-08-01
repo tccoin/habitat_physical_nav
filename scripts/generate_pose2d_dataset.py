@@ -37,8 +37,19 @@ Each JSONL line (one episode) has:
       "scene_id":      "mp3d/....glb",
       "goal_text":     "chair",            # object_category
       "rgb_paths":     ["<scene>/<ep>/frame_00000.png", ...],  # relative to image_root
-      "pose2d":        [[x, y, theta], ...]                    # aligned with rgb_paths
+      "pose2d":        [[x, y, theta], ...],                   # aligned with rgb_paths
+      "recording":     {"schema_version": 1, "native_fps": 25.0, ...}
     }
+
+``recording`` is the block described in ``continuous_demos.recording_metadata``:
+how this corpus was recorded -- tick rate, the physics timestep that rate does
+or does not divide, the velocity caps in force while driving, and provenance.
+It is repeated on every record (cheap next to ``pose2d``) so a consumer never
+has to be *told* the frame rate, a shard survives being copied or concatenated,
+and a shard that was appended to across a parameter change is detectable rather
+than silently mixed. Consumers read it via
+``recording_metadata.resolve_corpus_params``; corpora written before the schema
+existed carry no such key and were all recorded at 30 Hz.
 
 Only demonstrations whose *final* replayed pose lands within a distance threshold
 (default 1 m) of the demonstration's reference final position are kept; the rest
@@ -57,6 +68,12 @@ import imageio.v2 as imageio
 import numpy as np
 
 from continuous_demos.replay import record_segmented_demo
+from continuous_demos.recording_metadata import (
+    RecordingParams,
+    format_grid_note,
+    params_for_generation,
+    shard_params,
+)
 from continuous_demos.episode_io import (
     DEFAULT_URDF_PATH,
     build_robot_sim,
@@ -102,6 +119,35 @@ def load_done_episode_ids(metadata_dir: Path, scene: str) -> set:
             if ep is not None:
                 done.add(ep)
     return done
+
+
+def assert_shard_is_appendable(jsonl_path: Path, params: RecordingParams) -> None:
+    """Refuse to append records to a shard that was recorded differently.
+
+    Generation is resumable and appends, so without this check a rerun after a
+    parameter change (the 30 Hz -> 25 Hz move being exactly the case that
+    motivated all of this) would leave one shard holding two time bases with
+    nothing to mark the boundary. Aborting is deliberate: it is an operator
+    error about the whole ``--output-dir``, not a per-episode failure, and the
+    fix is a fresh output dir rather than anything this script can do.
+    """
+    existing = shard_params(jsonl_path) if jsonl_path.exists() else None
+    if existing is None:
+        if jsonl_path.exists() and jsonl_path.stat().st_size > 0:
+            raise RuntimeError(
+                f"{jsonl_path} already holds records with no 'recording' block, i.e. from a "
+                f"generation that predates the schema (those were all recorded at 30 Hz). "
+                f"Appending {params.native_fps:g} Hz records to it would produce a shard with "
+                "two time bases and no way to tell which record is which. Write to a fresh "
+                "--output-dir."
+            )
+        return
+    if not existing.agrees_with(params):
+        raise RuntimeError(
+            f"{jsonl_path} was recorded with {existing.consistency_view()} but this run is "
+            f"{params.consistency_view()}. Resuming would mix two generations in one shard. "
+            "Write to a fresh --output-dir."
+        )
 
 
 def load_failed_episode_ids(log_file: Path) -> set:
@@ -291,6 +337,24 @@ def generate(
 
             jsonl_path = metadata_dir / f"{scene}.jsonl"
             try:
+                # Probe the recording parameters off the live simulator (the
+                # physics timestep in particular is asked, not assumed) and
+                # stamp them onto every record this scene writes. Inside the
+                # try so the appendability check below cannot leak the sim.
+                recording = params_for_generation(
+                    fps,
+                    robot_sim,
+                    image_width=width,
+                    image_height=height,
+                    image_ext=image_ext,
+                    goal_threshold_m=goal_threshold,
+                    urdf=urdf_path,
+                    generator="generate_pose2d_dataset.py",
+                )
+                print(f"  recording: {format_grid_note(recording)}")
+                recording_blob = recording.as_dict()
+                assert_shard_is_appendable(jsonl_path, recording)
+
                 # Append so records from prior runs are preserved (resume).
                 with open(jsonl_path, "a", encoding="utf-8") as jf:
                     for idx, episode in scene_episodes:
@@ -352,6 +416,7 @@ def generate(
                             "goal_text": episode.get("object_category", ""),
                             "rgb_paths": rgb_paths,
                             "pose2d": pose2d,
+                            "recording": recording_blob,
                         }
                         jf.write(json.dumps(record) + "\n")
                         jf.flush()
@@ -398,7 +463,9 @@ def parse_args() -> argparse.Namespace:
              "rates whose period is a whole multiple of 0.008s are 125, 25, 5 "
              "and 1 Hz -- 25 Hz (dt=0.04s = 5 physics steps) is the only "
              "usable one. The previous 30 Hz default was off-grid and produced "
-             "a 24%% per-tick velocity ripple.",
+             "a 24%% per-tick velocity ripple. Whatever is passed here is "
+             "written into every metadata record's 'recording' block, so "
+             "consumers never have to be told it again.",
     )
     parser.add_argument(
         "--max-length", type=int, default=None,

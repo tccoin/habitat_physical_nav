@@ -9,7 +9,12 @@ MAX_LENGTH=300
 # rates (the old FPS=30 -> dt=0.03333s = 4.1667 steps) make the physics time
 # delivered per tick alternate between 0.032s and 0.040s, i.e. a 24% per-tick
 # velocity ripple baked into every recorded pose. See HabitatRobotSim.step.
-FPS=25
+#
+# Whatever this is set to is now written into every metadata record (the
+# "recording" block -- see continuous_demos.recording_metadata), so consumers
+# read the rate instead of being told it. Overridable from the environment for
+# a deliberate off-grid comparison run; the corpus will say so.
+FPS="${FPS:-25}"
 IMAGE_EXT="jpeg"
 
 # ==========================================
@@ -18,7 +23,12 @@ IMAGE_EXT="jpeg"
 export PYTHON_BIN="/workspace/conda/envs/vln/bin/python3"
 export TARGET_SCRIPT="generate_pose2d_dataset.py"
 export INPUT_DIR="/Projects/continuous_demos/habitat-web/objectnav/objectnav_mp3d_thda_70k/train/content"
-export OUTPUT_DIR="output"
+# The 30 Hz pre-schema corpus lives in output/. Generation appends, and the
+# generator now refuses to append records to a shard recorded at a different
+# rate (or to a pre-schema shard, which carries no rate at all), so a
+# regeneration must write somewhere fresh -- hence the new default. Set
+# OUTPUT_DIR in the environment to resume a run in progress.
+export OUTPUT_DIR="${OUTPUT_DIR:-output_25hz}"
 export LOGS_DIR="$OUTPUT_DIR/logs"
 
 # Export variables needed by the xargs subshell

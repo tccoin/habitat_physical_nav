@@ -37,6 +37,12 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max-context-tokens", type=int, default=0)
     parser.add_argument("--placeholder", default=None)
+    parser.add_argument("--decode", default=None,
+                        help="decode rule for a distributional head (bin_rollout "
+                             "backend); unset means the backend's own default")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="base seed for a backend's per-episode seeded sampling "
+                             "(bin_rollout with --decode sample)")
     parser.add_argument("--sys-path", default=None,
                         help="colon-separated paths to prepend to sys.path before "
                              "loading the backend -- the checkout the checkpoint's code "
@@ -51,13 +57,19 @@ def main() -> None:
             sys.path.insert(0, entry)
 
     print(f"loading {args.ckpt} on {args.device} (backend {args.backend})...", flush=True)
-    backend = build_backend(
-        args.backend,
+    kwargs = dict(
         ckpt=args.ckpt,
         device=args.device,
         max_context_tokens=args.max_context_tokens,
         placeholder=args.placeholder,
     )
+    # Only forwarded when set: backends that don't accept `decode`/`seed`
+    # (vector_rollout) must see no change at all when these flags are absent.
+    if args.decode is not None:
+        kwargs["decode"] = args.decode
+    if args.seed is not None:
+        kwargs["seed"] = args.seed
+    backend = build_backend(args.backend, **kwargs)
     print(backend.describe(), flush=True)
     serve(args.socket, backend)
 

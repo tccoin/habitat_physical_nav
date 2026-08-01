@@ -131,6 +131,65 @@ class VectorRolloutBackend(PolicyBackend):
 register_backend("vector_rollout", VectorRolloutBackend)
 
 
+class BinRolloutBackend(PolicyBackend):
+    """The discrete-bin control head (``longnav.utils.bin_rollout``), decode configurable.
+
+    Reuses ``VectorRolloutPolicy`` unmodified -- see ``bin_rollout.load_bin_policy``: a
+    ``TurnBinClassifier``'s ``normalizer`` slot is a ``BinCodec``, whose ``denormalize``
+    already turns logits into a real ``(T, 3)`` chunk under whichever decode rule
+    (``argmax`` / ``sample`` / ``mean``) it is set to. The only thing this backend adds is
+    fixed-per-episode seeding for ``sample``: ``reset()`` reseeds the codec's fallback
+    generator from ``seed + <episode count>``, so repeat runs of the same episode sequence
+    under ``decode="sample"`` are reproducible, and successive episodes in one process do
+    not share one continuously-mutating RNG stream.
+    """
+
+    def __init__(
+        self,
+        ckpt: str,
+        device: str = "cuda",
+        merge_lora: bool = True,
+        max_context_tokens: int = 0,
+        placeholder: Optional[str] = None,
+        decode: str = "argmax",
+        seed: int = 0,
+    ):
+        from longnav.utils.bin_rollout import load_bin_policy, seed_sampling
+        from longnav.utils.vector_rollout import RolloutConfig
+
+        self._seed_sampling = seed_sampling
+        config = RolloutConfig(
+            device=device, merge_lora=merge_lora, max_context_tokens=max_context_tokens
+        )
+        if placeholder:
+            config.placeholder = placeholder
+        self.decode = decode
+        self.seed = int(seed)
+        self._episode_count = 0
+        self.policy = load_bin_policy(ckpt, config, decode=decode)
+
+    def reset(self, goal_text: Optional[str]) -> None:
+        self.policy.reset(goal_text=goal_text)
+        if self.decode == "sample":
+            self._seed_sampling(self.policy, self.seed + self._episode_count)
+        self._episode_count += 1
+
+    def act(self, rgb: np.ndarray) -> np.ndarray:
+        from PIL import Image
+
+        return np.asarray(self.policy.step(Image.fromarray(rgb)).numpy(), dtype=np.float32)
+
+    @property
+    def last_stats(self) -> Dict[str, Any]:
+        return dict(self.policy.last_stats)
+
+    def describe(self) -> str:
+        return f"{self.policy.describe()} [bin decode={self.decode} seed_base={self.seed}]"
+
+
+register_backend("bin_rollout", BinRolloutBackend)
+
+
 def serve(socket_path: str, backend: PolicyBackend) -> None:
     """Answer reset/act over ``socket_path`` until told to stop.
 

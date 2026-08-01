@@ -232,6 +232,10 @@ def build_policy(config: Any, server_script: str, log_path: Optional[str] = None
         backend_args["placeholder"] = config.placeholder
     if config.policy_sys_path:
         backend_args["sys_path"] = config.policy_sys_path
+    if config.policy_decode is not None:
+        backend_args["decode"] = config.policy_decode
+    if config.policy_seed is not None:
+        backend_args["seed"] = config.policy_seed
 
     if config.policy_python:
         from objectnav_eval.bridge import PolicyBridge
@@ -242,11 +246,15 @@ def build_policy(config: Any, server_script: str, log_path: Optional[str] = None
 
     from objectnav_eval.bridge import build_backend
 
-    backend = build_backend(
-        config.policy_backend,
+    in_process_kwargs = dict(
         ckpt=config.ckpt,
         device=config.device,
         max_context_tokens=config.max_context_tokens,
         placeholder=config.placeholder,
     )
+    if config.policy_decode is not None:
+        in_process_kwargs["decode"] = config.policy_decode
+    if config.policy_seed is not None:
+        in_process_kwargs["seed"] = config.policy_seed
+    backend = build_backend(config.policy_backend, **in_process_kwargs)
     return InProcessPolicy(backend)

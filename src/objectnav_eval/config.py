@@ -79,6 +79,10 @@ class EvalConfig:
     policy_sys_path: Optional[str] = None
     control_chunk_len: int = 10
     control_speed: float = 1.0
+    # Distributional-head knobs (e.g. --policy-backend bin_rollout). None means "don't
+    # forward this flag" so backends that don't accept it (vector_rollout) are unaffected.
+    policy_decode: Optional[str] = None
+    policy_seed: Optional[int] = None
 
     # -- diagnostics --------------------------------------------------------
     keep_tracking_series: bool = False
@@ -222,6 +226,14 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     mdl.add_argument("--control-chunk-len", type=int, default=10)
     mdl.add_argument("--control-speed", type=float, default=1.0,
                      help="m/s for the 'forward' control")
+    mdl.add_argument("--policy-decode", default=None,
+                     choices=["argmax", "sample", "mean", "logits"],
+                     help="decode rule for a distributional policy head (bin_rollout "
+                          "backend); ignored by backends that don't accept it")
+    mdl.add_argument("--policy-seed", type=int, default=None,
+                     help="base seed for a backend's per-episode seeded sampling "
+                          "(bin_rollout with --policy-decode sample); combined with an "
+                          "episode counter so each episode gets its own fixed seed")
 
     diag = parser.add_argument_group("diagnostics")
     diag.add_argument("--keep-tracking-series", action="store_true",

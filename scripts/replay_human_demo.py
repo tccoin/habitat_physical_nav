@@ -156,10 +156,13 @@ def main() -> None:
     )
     parser.add_argument("--debug-draw", action="store_true", help="Render path and axes overlays during replay.")
     parser.add_argument(
-        "--canonicalize-rotation", action="store_true",
-        help="Replace every maximal run of pure TURN_LEFT/TURN_RIGHT with the "
-             "shortest run covering the same heading range and ending on the "
-             "same heading, before replay. OFF by default. See "
+        "--no-canonicalize-rotation", dest="canonicalize_rotation",
+        action="store_false", default=True,
+        help="Disable rotation canonicalisation, which is ON by default so that "
+             "what you debug here matches what the generator produces. "
+             "Canonicalisation replaces every maximal run of pure "
+             "TURN_LEFT/TURN_RIGHT with the shortest run covering the same "
+             "heading range and ending on the same heading, before replay. See "
              "continuous_demos.rotation_canonicalize.",
     )
     args = parser.parse_args()

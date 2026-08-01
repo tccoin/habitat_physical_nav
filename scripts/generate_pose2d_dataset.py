@@ -604,17 +604,23 @@ def parse_args() -> argparse.Namespace:
              "the measured distribution.",
     )
     parser.add_argument(
-        "--canonicalize-rotation", action="store_true",
-        help="Replace every maximal run of pure TURN_LEFT/TURN_RIGHT with the "
-             "shortest run covering the same heading range and ending on the "
-             "same heading, BEFORE replay. Removes human re-glancing -- rotation "
-             "that collected no new view, because the robot had not moved -- "
-             "without touching monotone scans, single out-and-back glances, or "
-             "any non-turn action. OFF by default. Measured over all 56 train "
-             "scenes: 99.17%% of rotation runs are already minimal and are "
-             "returned untouched; 78.7%% of episodes are unaffected entirely; "
-             "it removes 0.42%% of actions and 1.28%% of all rotation. See "
-             "dump/rotation_blunders/FINDINGS.md.",
+        "--no-canonicalize-rotation", dest="canonicalize_rotation",
+        action="store_false", default=True,
+        help="Disable rotation canonicalisation, which is ON by default. "
+             "Canonicalisation replaces every maximal run of pure "
+             "TURN_LEFT/TURN_RIGHT with the shortest run covering the same "
+             "heading range and ending on the same heading, BEFORE replay. It "
+             "removes human re-glancing -- rotation that collected no new view, "
+             "because the robot had not moved -- without touching monotone "
+             "scans, single out-and-back glances, or any non-turn action. "
+             "Measured over all 56 train scenes: 99.17%% of rotation runs are "
+             "already minimal and returned untouched, 78.7%% of episodes are "
+             "unaffected entirely, and it removes 0.42%% of actions and 1.28%% "
+             "of all rotation. The mean is small but the tail is not: the worst "
+             "10%% of affected episodes carry 73.5%% of the waste, and those are "
+             "exactly the demonstrations that teach dithering. Optimality is "
+             "proved by exhaustive search and the corpus-wide checks found 0 "
+             "violations in 2,353,082 runs. See dump/rotation_blunders/FINDINGS.md.",
     )
     parser.add_argument(
         "--ref-miss-flag-m", type=float, default=DriveFailureConfig.ref_miss_flag_m,

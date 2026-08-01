@@ -92,7 +92,12 @@ def main() -> None:
     parser.add_argument("--metadata", required=True, help="Path to data/metadata/<scene>.jsonl.")
     parser.add_argument("--scene-root", default=None)
     parser.add_argument("--num-episodes", type=int, default=4)
-    parser.add_argument("--fps", type=int, default=30, help="Must match the fps the pose2d data was recorded at.")
+    parser.add_argument(
+        "--fps", type=int, default=25,
+        help="Must match the fps the pose2d data was recorded at. Tracks "
+             "generate_pose2d_dataset.py's 25 Hz default; pass 30 for shards "
+             "generated before the on-grid physics fix.",
+    )
     parser.add_argument("--output-dir", default="data/pid_eval")
     parser.add_argument("--width", type=int, default=160)
     parser.add_argument("--height", type=int, default=120)

@@ -185,10 +185,13 @@ def parse_args() -> argparse.Namespace:
         help="Number of future (native-fps) poses per action chunk.",
     )
     parser.add_argument(
-        "--native-fps", type=float, default=20.0,
+        "--native-fps", type=float, default=25.0,
         help="fps the pose2d/rgb_paths in metadata/*.jsonl were recorded at "
              "(the --fps passed to generate_pose2d_dataset.py -- not stored in the "
-             "metadata, so this MUST be supplied correctly by the caller).",
+             "metadata, so this MUST be supplied correctly by the caller). "
+             "Default tracks generate_pose2d_dataset.py's 25 Hz. Data generated "
+             "before the on-grid fix was recorded at 30 Hz, NOT the 20 Hz this "
+             "default used to claim -- pass --native-fps 30 for those shards.",
     )
     parser.add_argument(
         "--val-scene-count", type=int, default=5,

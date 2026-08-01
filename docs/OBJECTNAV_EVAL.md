@@ -323,3 +323,25 @@ numbers.
 | `--snap-start` | Off by default: the start is navigable on the dataset's mesh, and snapping onto the robot's smaller mesh would silently move the agent away from the pose the episode specifies. |
 | `--auto-stop` | Ends the episode on arrival, making `success == oracle_success` by construction. Off by default so both numbers stay informative. |
 | `--max-scenes` / `--sample-per-scene` | Stratified subsetting for big splits (MP3D val is 2195 episodes over 11 scenes). Seeded, so the same flags name the same episodes. Sampling per scene, not a head slice — the files are grouped by scene, so a head slice would evaluate one scene and call it a split. |
+
+---
+
+## What this cost the numbers, measured
+
+`--fresh-sim-per-episode` is not a theoretical concern. Full 14-episode run of
+`checkpoint-2500` on `val_mini`, identical in every respect except that flag:
+
+| metric | shared simulator | fresh simulator |
+| --- | --- | --- |
+| success | 0.214 | **0.357** |
+| oracle_success | 0.214 | **0.357** |
+| spl | 0.095 | **0.166** |
+| oracle_spl | 0.168 | **0.299** |
+
+Two episodes flip from failure to success. The reference harness shares the same
+simulator and the same defect, so its published numbers are depressed the same
+way. Quote numbers produced with `--fresh-sim-per-episode`, or state that shard
+composition was held fixed.
+
+Full write-up, including the bisection that established this:
+`/Projects/spatial_training/dump/eval_system/FINDINGS.md`.

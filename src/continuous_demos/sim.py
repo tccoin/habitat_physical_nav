@@ -345,9 +345,14 @@ class HabitatRobotSim:
         previously violated, in two independent ways, and the violation was
         measurable: replaying one demonstration after three other episodes
         moved its recorded path by up to 0.040 m relative to replaying it
-        alone. Steps 0 and 1b below are what restore the contract; do not drop
+        alone. Steps 1b and 5 below are what restore the contract; do not drop
         either of them for speed. They cost ~1 ms per episode, against ~2 s to
         rebuild the simulator instead.
+
+        It is not a complete guarantee. What survives is the order in which
+        Bullet's broadphase reports the robot's contacts, which no habitat
+        binding can reset -- see dump/sim_reset_fix/FINDINGS.md and
+        tests/test_sim_reset_isolation.py.
         """
         # 1. Handle Scene Changes and Graph Rebuild
         if scene_id is not None and scene_id != self.cfg.sim_cfg.scene_id:

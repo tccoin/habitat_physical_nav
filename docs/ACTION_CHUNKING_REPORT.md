@@ -27,29 +27,43 @@ place that can get the off-by-one wrong.
 
 ## Vocabulary and the three configurable knobs
 
-| term | meaning |
-|---|---|
-| `native_fps` | fps the `pose2d`/`rgb_paths` were recorded at (the `--fps` originally passed to `generate_pose2d_dataset.py`). **Not stored in the metadata JSONL** — every script here takes it as an explicit arg the caller must get right. |
-| `obs_hz` | how often an observation (image + pose) is sampled from the native trajectory. Lower than `native_fps`. |
-| `action_chunk_len` | number of future native-fps poses attached to each observation, as relative actions. |
+| term | read or chosen? | meaning |
+|---|---|---|
+| `native_fps` | **read** | fps the `pose2d`/`rgb_paths` were recorded at (the `--fps` passed to `generate_pose2d_dataset.py`). Stored in the metadata JSONL's `recording` block and read from there — see "Recording parameters live in the metadata" below. It is a property of the corpus, never a build choice. |
+| `obs_stride_frames` | chosen | how many native frames apart consecutive observations land. The exact form of the observation-spacing knob, and the one to sweep: it means the same thing at every `native_fps`. |
+| `obs_hz` | chosen | the same knob expressed as a rate, quantized to a whole number of native frames. Mutually exclusive with `--obs-stride-frames`; the realized rate can differ from the request. |
+| `action_chunk_len` | chosen | number of future native-fps poses attached to each observation, as relative actions. |
 
-Derived: `dt_native = 1/native_fps`, `obs_stride_frames = round(native_fps /
-obs_hz)`, `obs_interval = obs_stride_frames * dt_native`, `chunk_duration =
-action_chunk_len * dt_native`.
+Derived, all computed from the *recorded* rate: `dt_native = 1/native_fps`,
+`obs_interval = obs_stride_frames * dt_native`, `effective_obs_hz =
+1/obs_interval`, `chunk_duration = action_chunk_len * dt_native`,
+`overlap_fraction = 1 - obs_interval/chunk_duration`. All five are stamped
+in-band onto every row, which is why changing any of them means a rebuild
+rather than a relabel.
 
-Default config (per your instruction): `obs_hz=4`, `action_chunk_len=10`,
-`native_fps=20` → `obs_stride_frames=5`, `chunk_duration=0.5s`,
-`obs_interval=0.25s` → chunks are 2x the observation interval, i.e. **50%
-overlap** between consecutive chunks.
+**What the shipped corpus was actually built at** (this table previously
+claimed `native_fps=20` → a 0.5 s horizon at 4 Hz; both figures were wrong,
+and the row counts below were produced with the settings in the first column):
+
+| | `action_chunk_len` | `obs_stride_frames` | `dt_native` | `chunk_duration` | `effective_obs_hz` | `overlap_fraction` |
+|---|---|---|---|---|---|---|
+| shipped corpus (30 Hz) | 10 | 5 | 0.0333 s | **0.333 s** | **6.0 Hz** | 0.50 |
+| as previously documented | 10 | 5 | 0.05 s | 0.5 s | 4.0 Hz | 0.50 |
+| under consideration (25 Hz) | 10–15 | 5 | 0.04 s | 0.40–0.60 s | **5.0 Hz** (exact) | 0.50–0.67 |
+
+The observation *count* depends only on `action_chunk_len` and
+`obs_stride_frames`, not on `native_fps` — so the row counts quoted later in
+this report are still the counts for a stride-5 / chunk-10 build. Only their
+*timing* labels were wrong.
 
 ---
 
 ## Q1: Is the observation frequency actually reduced?
 
-Yes. `make_chunk_config` (`action_chunking.py`) computes
-`obs_stride_frames = max(1, round(native_fps / obs_hz))`, and
-`build_observation_records` walks the native trajectory in steps of that
-stride:
+Yes. `obs_stride_frames` is either given directly (`--obs-stride-frames`, the
+exact form) or derived from a requested rate (`make_chunk_config` computes
+`max(1, round(native_fps / obs_hz))`), and `build_observation_records` walks
+the native trajectory in steps of that stride:
 
 ```python
 idx = 0
@@ -59,48 +73,68 @@ while idx + action_chunk_len <= n - 1:
 ```
 
 So an observation is emitted only every `obs_stride_frames` native frames —
-confirmed both by a unit test (`test_build_observation_records_indexing`:
-27 native frames, `obs_hz=4` @ `native_fps=20` → observations land at native
-indices `[0, 5, 10, 15]`, i.e. every 5th frame) and empirically on the real
-dataset: `data/metadata/17DRP5sb8fy.jsonl` (1045 episodes, native fps
-assumed 20) built down to 164,578 observation rows, an average of ~157
-observations per episode against episodes that run several hundred to ~1660
-native frames — consistent with a ~5x reduction.
+confirmed by unit tests (`test_build_observation_records_indexing`, and
+`test_chunk_sweep_settings.py::test_observations_land_on_the_stride` across
+the whole `{10,12,15} x {5,6}` grid at both 25 and 30 Hz) and empirically on
+the real dataset: `metadata/17DRP5sb8fy.jsonl` (1045 episodes) built down to
+164,578 observation rows at stride 5, an average of ~157 observations per
+episode against episodes that run several hundred to ~1660 native frames —
+consistent with a ~5x reduction.
 
-One caveat worth flagging: `obs_stride_frames` is `round()`-ed to the nearest
-integer frame, so if `native_fps / obs_hz` isn't an integer, the *effective*
-observation rate isn't exactly the requested one. `ChunkConfig.effective_obs_hz`
-reports what was actually achieved (`1 / obs_interval`), and the build script
-prints both requested and effective values. At the documented defaults
-(20 / 4 = 5, exact) this doesn't bite, but it will for e.g. `obs_hz=3` on
-20 Hz data (`round(6.67) = 7` → effective ≈2.86 Hz, not 3).
+The reduction *factor* is the stride; the observation *rate* it corresponds to
+is `native_fps / stride`, which is where the old documentation went wrong:
+stride 5 on the 30 Hz corpus is 6 Hz, not the 4 Hz claimed.
+
+One caveat, and the reason to prefer `--obs-stride-frames` for a sweep:
+a requested `obs_hz` is `round()`-ed to the nearest whole frame, so unless
+`native_fps / obs_hz` is an integer the *effective* rate isn't the requested
+one — and it quantizes differently at each native rate, so "the same `obs_hz`"
+is not the same build at 25 and 30 Hz. `ChunkConfig.effective_obs_hz` reports
+what was achieved and the build prints both. Concretely: `--obs-hz 4` on 25 Hz
+data gives `round(6.25) = 6` → 4.167 Hz, not 4.
 
 ## Q2: Does replay run at the exact observation cadence and discard the overlapping tail?
 
-Yes — this is `reconstruct_reference_trajectory` in
-`replay_chunked_actions.py`:
+Yes — this is `reconstruct_reference_trajectory` in `action_chunking.py`
+(it moved there from `replay_chunked_actions.py`, and no longer takes a stride
+parameter — it reads the realized gap off consecutive rows' `frame_index`):
 
 ```python
 for i, row in enumerate(rows):          # rows sorted by obs_index
     anchor = row["obs_pose"]
     chunk = row["action_chunk"]
-    n_ticks = len(chunk) if i == n - 1 else min(obs_stride_frames, len(chunk))
-    for j in range(n_ticks):
+    gap = len(chunk) if i == n - 1 else rows[i + 1]["frame_index"] - row["frame_index"]
+    for j in range(gap):
         targets.append(relative_to_pose(anchor, chunk[j]))
 ```
 
-For every row except the last, only the **first `obs_stride_frames` actions**
-of its chunk are decoded and kept — the remainder of the chunk (the part that
-overlaps with what the *next* observation's chunk will also cover) is
-discarded. The last row, which nothing supersedes, is decoded in full.
+For every row except the last, only the **first `gap` actions** of its chunk
+are decoded and kept — the remainder (the part the *next* observation's chunk
+will also cover) is discarded. The last row, which nothing supersedes, is
+decoded in full.
 
-Why this reproduces the native trajectory exactly with no gap or duplication:
-row `i`'s frame index is `idx_i`, row `i+1`'s is `idx_i + obs_stride_frames`
-by construction. Row `i`'s kept ticks decode native frames
-`idx_i+1 .. idx_i+obs_stride_frames`; row `i+1`'s first kept tick decodes
-`idx_i+obs_stride_frames+1`. The two ranges are contiguous with no overlap and
-no gap — i.e. new chunks are switched in exactly at observation boundaries,
-`obs_interval` seconds apart, which is "replay at the observation rate."
+**The index convention, stated once, because the off-by-one here has bitten
+before.** A chunk covers ticks `+1 .. +L` relative to its observation, not
+`+0 .. +L-1`:
+
+```
+chunk[j] = pose_to_relative(anchor, pose2d[idx + j + 1])
+```
+
+so `chunk[0]` is already the *next* tick, and the next observation — which
+sits `obs_stride_frames` frames later — decodes from **`chunk[obs_stride - 1]`,
+not `chunk[obs_stride]`**. Row `i`'s kept ticks decode native frames
+`idx_i+1 .. idx_i+obs_stride`; row `i+1`'s first kept tick decodes
+`idx_i+obs_stride+1`. Contiguous, no overlap, no gap — new chunks switch in
+exactly at observation boundaries, `obs_interval` seconds apart, which is
+"replay at the observation rate."
+
+This is pinned at every supported setting by
+`tests/test_chunk_sweep_settings.py` (all six `{10,12,15} x {5,6}` points at
+both 25 and 30 Hz, plus the `stride == chunk_len` exact-touch boundary and the
+degenerate `stride > chunk_len` case, which `make_chunk_config` rejects), and
+was re-checked directly against real built datasets — see "Verification across
+the sweep" below.
 
 The individual PID control ticks inside a chunk still run at native `dt`
 (`1/native_fps`) — chunk boundaries change *which* target stream is being
@@ -161,9 +195,12 @@ now import from there. No behavior change to `eval_pid_tracking.py`.
 
 ## Empirical validation
 
-Built the arrow dataset from the real `data/metadata/17DRP5sb8fy.jsonl`
-(1045 episodes, defaults: `obs_hz=4`, `action_chunk_len=10`, `native_fps=20`)
-→ 164,578 observation rows, 0 episodes dropped for being too short.
+Built the arrow dataset from the real `metadata/17DRP5sb8fy.jsonl`
+(1045 episodes, `action_chunk_len=10`, `obs_stride_frames=5`) → 164,578
+observation rows, 0 episodes dropped for being too short. The build was run
+labelling the corpus `native_fps=20`; the corpus is really 30 Hz, so the row
+count stands (it depends only on stride and chunk length) but every duration
+and rate reported from that build was off by 1.5x.
 
 ### First pass (superseded — methodology was too weak)
 
@@ -340,10 +377,16 @@ correctness guarantee as fixed spacing, for that reason.
   build script's summary line); the last few frames of every episode that
   don't fill a stride step are silently dropped rather than padded into a
   short final chunk.
-- **`native_fps` is caller-supplied, not verified** against the data — there
-  is no way to detect a wrong value from the metadata alone; get it wrong and
-  both the chunk timing *and* the replay `dt` will be wrong together (self-
-  consistently, so it won't crash, just silently mistrack real-world timing).
+- ~~**`native_fps` is caller-supplied, not verified** against the data — there
+  is no way to detect a wrong value from the metadata alone.~~ **Both halves of
+  this were wrong, and it is now fixed.** The rate *was* detectable from the
+  data — the physics-aliasing artifact stamped the physics-step count into the
+  per-tick displacements, and that is how the real 30 Hz was recovered (5:1
+  predicted vs 5.08:1 measured ratio of 0.064/0.080 m saturated increments over
+  150 episodes / 104,362 ticks; see `dump/upstream_bugfix/FINDINGS.md`). That
+  fingerprint is *gone* at 25 Hz, where there is a single clean 0.080 m
+  increment — which is precisely why the rate is now recorded rather than
+  inferred. It is no longer caller-supplied at all: see below.
 - **No conversation/`messages` formatting** — this dataset only carries raw
   `image` / `obs_pose` / `action_chunk` columns; turning a row into a
   model-facing training example is left to the training pipeline, as
@@ -356,3 +399,145 @@ correctness guarantee as fixed spacing, for that reason.
   better in practice. No automatic warning is emitted if a configuration's
   realized mean drifts noticeably from the requested `obs_hz`; inspect
   `frame_index` deltas in the built dataset if this matters for a given run.
+
+---
+
+## Recording parameters live in the metadata
+
+`native_fps` used to live nowhere except in the head of whoever launched
+`batch_gen.bash`, and every consumer carried its own default instead. Those
+defaults drifted: both build scripts said `20.0` against a 30 Hz corpus,
+understating every derived velocity by exactly 1.5x, and nothing crashed
+because a wrong `native_fps` is self-consistent all the way down. The move to
+25 Hz removed the physics-aliasing artifact that let the true rate be
+recovered after the fact, so the rate is now recorded at generation time.
+
+`generate_pose2d_dataset.py` writes a `recording` block onto **every** JSONL
+record, alongside `pose2d`/`rgb_paths`:
+
+```json
+"recording": {
+  "schema_version": 1,
+  "native_fps": 25.0,
+  "dt_native": 0.04,
+  "physics_timestep": 0.008,
+  "physics_steps_per_tick": 5.0,
+  "on_physics_grid": true,
+  "v_max_mps": 2.0,
+  "w_max_radps": 2.0,
+  "image_width": 640, "image_height": 480, "image_ext": "jpeg",
+  "goal_threshold_m": 1.0, "urdf": "spot.urdf",
+  "generator": "generate_pose2d_dataset.py", "code_commit": "4e7e30f"
+}
+```
+
+Everything a consumer previously had to *assume* is in there: the tick rate,
+the physics timestep it does or does not divide (`physics_steps_per_tick` /
+`on_physics_grid` — an off-grid corpus carries the 24% per-tick velocity
+ripple and a consumer computing instantaneous speed should know), the velocity
+caps a saturated tick actually hits, and enough provenance to tell two corpora
+apart. `physics_timestep` is *probed from the live simulator* at generation
+time rather than assumed.
+
+**The true caps are 2.0 m/s and 2.0 rad/s (114.6 deg/s.)** Not the 1.28/73 of
+the older findings docs, and not the 1.92/110 that superseded them — both were
+`0.064/dt` for some wrong `dt`, i.e. artifacts of the ripple's *lower* mode
+rather than real caps.
+
+It is per-record rather than a sidecar file because generation is sharded
+across ~24 concurrent processes sharing one output dir, shards get copied and
+concatenated by hand, and generation *appends* on resume — so a shard can
+physically contain records from two runs. Per-record parameters make that
+detectable. The cost is ~250 bytes against a payload of hundreds of frames.
+
+### How each kind of corpus is handled
+
+One policy, in `recording_metadata.resolve_corpus_params`, shared by every
+consumer (`build_action_chunk_dataset.py`,
+`build_action_chunk_episode_dataset.py`, `sweep_chunk_datasets.py`,
+`eval_pid_tracking.py`):
+
+| corpus | what happens |
+|---|---|
+| written by the current generator (`schema_version >= 1`) | true values, **no flag needed**. Passing `--native-fps` that *contradicts* the record is an error, not an override. |
+| pre-schema (no `recording` key) | **fails loudly**, naming the fallback. Nothing is guessed. Pass `--native-fps 30` (`--fps 30` for `eval_pid_tracking.py`) — every pre-schema corpus in this repo was recorded at 30 Hz, and the resulting config is marked `schema_version: 0` / `native_fps_source: "assumed"` everywhere it is reported or stamped. |
+| self-contradictory (some shards with, some without; or two rates) | **always an error.** This is the resumed-across-the-fps-change case; it must never be averaged over. Both build loops also re-check every record, catching a shard whose first line is honest and whose last is not. |
+
+The generator itself refuses to append to a shard recorded at a different rate
+(or to a pre-schema shard), so the mixed case cannot be created going forward.
+`batch_gen.bash` therefore defaults to a fresh `output_25hz/`; the existing
+30 Hz `output/` is left alone and stays readable with an explicit
+`--native-fps 30`.
+
+## Sweeping `action_chunk_len` x `obs_stride_frames`
+
+Both are **build-time parameters of the arrow table**, not properties of the
+raw data: varying them re-slices trajectories that already exist, re-simulates
+nothing and re-renders no frames. What they are *not* is relabelable — all five
+derived values are stamped in-band onto every row, so each grid point is a
+separate build.
+
+```bash
+# the plan and every derived value, without building anything
+python scripts/sweep_chunk_datasets.py --data-dir output_25hz \
+    --output-root output_25hz/sweeps --dry-run
+
+# build the grid (resumable; already-built points are skipped)
+python scripts/sweep_chunk_datasets.py --data-dir output_25hz \
+    --output-root output_25hz/sweeps --val-scene-count 5
+
+# one point on its own, either builder
+python scripts/build_action_chunk_dataset.py --data-dir output_25hz \
+    --output-dir /tmp/clen12_stride5 --action-chunk-len 12 --obs-stride-frames 5
+
+# a pre-schema (30 Hz) corpus, rate stated once
+python scripts/sweep_chunk_datasets.py --data-dir output --output-root /tmp/sweep \
+    --native-fps 30
+```
+
+Each point lands in `<output-root>/clen<L>_stride<S>/` with its own
+`chunk_config.json`; the comparison table is written to
+`sweep_summary.{json,md}` after every point, so an interrupted sweep keeps
+what finished. The native rate is deliberately **not** part of the grid — it
+is read from the corpus, and sweeping it would mean regenerating.
+
+Derived values at the default grid, computed from the recorded rate:
+
+| build | chunk_len | stride | `chunk_duration` | `obs_interval` | `effective_obs_hz` | `overlap_fraction` |
+|---|---|---|---|---|---|---|
+| clen10_stride5 | 10 | 5 | 0.400 s | 0.200 s | 5.000 Hz | 0.500 |
+| clen10_stride6 | 10 | 6 | 0.400 s | 0.240 s | 4.167 Hz | 0.400 |
+| clen12_stride5 | 12 | 5 | 0.480 s | 0.200 s | 5.000 Hz | 0.583 |
+| clen12_stride6 | 12 | 6 | 0.480 s | 0.240 s | 4.167 Hz | 0.500 |
+| clen15_stride5 | 15 | 5 | 0.600 s | 0.200 s | 5.000 Hz | 0.667 |
+| clen15_stride6 | 15 | 6 | 0.600 s | 0.240 s | 4.167 Hz | 0.600 |
+
+(at 25 Hz; the same grid on the 30 Hz corpus gives 0.333/0.400/0.500 s
+horizons at 6.0 or 5.0 Hz.) No winner is picked here — the capability is the
+deliverable.
+
+## Verification across the sweep
+
+Every point of the grid was checked, at both 25 and 30 Hz, in
+`tests/test_chunk_sweep_settings.py` (72 cases, no simulator): derived values
+against closed form, `chunk[j] == pose_to_relative(anchor, pose2d[idx+j+1])`,
+observations landing exactly on the stride, the next observation decoding from
+`chunk[obs_stride - 1]` and *not* `chunk[obs_stride]`, and an exact
+reconstruction round trip. Plus both sides of the boundary: `stride ==
+chunk_len` (chunks abut exactly, zero overlap, still correct) and `stride >
+chunk_len` (rejected — the chunk would run out before the next observation).
+
+The same claims were then re-checked against **real built datasets** rather
+than synthetic trajectories: all six grid points built from a 30-episode slice
+of `17DRP5sb8fy`, every chunk entry re-derived from the raw corpus and every
+consecutive observation pair's handoff decoded. Max absolute error
+1.8e-15 (float64 machine epsilon) across 255k chunk entries and 20k handoffs;
+`chunk[obs_stride - 1]` recovered the next observation's pose exactly at every
+setting.
+
+One real-data nuance worth recording: the "`chunk[obs_stride]` is one tick too
+far" check is only *observable* where the robot moved on that tick. On ~2% of
+handoffs the two poses coincide to float precision — those are look phases and
+stalled ticks, where the base is genuinely stationary. The index arithmetic is
+still verified there by the chunk-entry check; it just isn't distinguishable
+from the handoff check alone.

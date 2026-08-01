@@ -351,6 +351,22 @@ def test_infinite_distances_do_not_poison_the_means():
     # the one number saying how close the policy got.
     assert summary["distance_to_goal_m"] == pytest.approx(1.0)
     assert summary["episodes_off_navmesh"] == 1
+    # ...and the reader must be able to see that the two distance means are over
+    # different subsets, which is how a mean minimum can exceed a mean final.
+    assert summary["distance_means_n"]["distance_to_goal_m"] == 1
+    assert summary["distance_means_n"]["min_distance_to_goal_m"] == 2
+
+
+def test_json_round_trip_of_an_infinite_distance_keeps_the_off_navmesh_count():
+    results = [
+        make_result("A:1", distance_to_goal_m=1.0),
+        make_result("A:2", distance_to_goal_m=float("inf")),
+    ]
+    direct = summarize(results, [], 2)
+    # A parallel run re-aggregates from files, where inf has become null.
+    from_disk = summarize(json.loads(json.dumps(jsonable(results, 6))), [], 2)
+    assert from_disk["episodes_off_navmesh"] == direct["episodes_off_navmesh"] == 1
+    assert from_disk["distance_to_goal_m"] == pytest.approx(direct["distance_to_goal_m"])
 
 
 def test_summary_counts_skipped_by_reason():

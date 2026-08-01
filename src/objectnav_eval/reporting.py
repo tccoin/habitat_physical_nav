@@ -96,8 +96,17 @@ def summarize(
             present = [r[key] for r in results if key in r]
             if present:
                 summary[key] = float(np.mean(present))
+        # Each distance is averaged over the episodes where *it* is finite, and
+        # those subsets differ: an episode that ends off the navmesh has an
+        # infinite final distance but a perfectly good minimum. Without the
+        # per-key counts the summary can show a mean minimum larger than the
+        # mean final distance, which looks like a bug and is not one.
+        counts = {}
         for key in DISTANCE_KEYS:
-            summary[key] = _finite_mean(r.get(key, float("nan")) for r in results)
+            values = [r.get(key) for r in results]
+            summary[key] = _finite_mean(values)
+            counts[key] = sum(1 for v in values if is_finite(v))
+        summary["distance_means_n"] = counts
 
     summary.update(
         episodes_evaluated=len(results),
@@ -280,16 +289,26 @@ def print_summary(
     for key in RATE_KEYS:
         if key in summary:
             print(f"  {key:<16} {summary[key]:.3f}")
+    counts = summary.get("distance_means_n", {})
+    evaluated = summary["episodes_evaluated"]
+
+    def _n(key: str) -> str:
+        count = counts.get(key, evaluated)
+        return "" if count == evaluated else f" [n={count}]"
+
     print(
-        f"  final distance   {summary['distance_to_goal_m']:.2f} m  "
-        f"(min reached {summary['min_distance_to_goal_m']:.2f} m, "
+        f"  final distance   {summary['distance_to_goal_m']:.2f} m"
+        f"{_n('distance_to_goal_m')}  "
+        f"(min reached {summary['min_distance_to_goal_m']:.2f} m"
+        f"{_n('min_distance_to_goal_m')}, "
         f"start {summary['geodesic_start_m']:.2f} m)"
     )
     if summary.get("episodes_off_navmesh"):
         print(
             f"                   {summary['episodes_off_navmesh']} episode(s) ended off "
-            "the navmesh (geodesic inf); scored as failures, excluded from the "
-            "distance means above"
+            "the navmesh (geodesic inf); scored as failures, and excluded from the "
+            "means marked [n=...] above -- so those means are over different "
+            "episode subsets and are not directly comparable to each other"
         )
     print(
         f"  path length      {summary['path_length_m']:.2f} m over "

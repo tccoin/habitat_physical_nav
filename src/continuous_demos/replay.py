@@ -207,6 +207,7 @@ def record_segmented_demo(
     move_stall_ticks: int = MOVE_STALL_TICKS,
     move_stall_eps: float = MOVE_STALL_EPS,
     move_stall_max_speed: Optional[float] = MOVE_STALL_MAX_SPEED,
+    health_monitor=None,
 ):
     """Replay a discrete demonstration as a continuous trajectory, switching
     between a path-following controller (while moving) and an in-place rotation
@@ -258,6 +259,14 @@ def record_segmented_demo(
         already stopped. The move phase that follows overwrites the yaw command
         every tick in any case;
       * the local timeout expires.
+
+    ``health_monitor``, when given, is a
+    :class:`continuous_demos.drive_failure.EpisodeHealthMonitor`; its ``observe``
+    is called once per recorded tick, immediately after the physics step and the
+    pose append, so its signals are 1:1 with ``poses``. It is what lets the
+    generator tell a demonstration that failed catastrophically -- the robot
+    leaving the world -- from one that merely looks unremarkable in ``pose2d``;
+    see that module's docstring for why no planar quantity can.
 
     A look phase that is followed by a move phase is told so
     (``handoff_to_path=True``), which lets it accept its FINAL heading at the
@@ -342,6 +351,10 @@ def record_segmented_demo(
                 frame = rgb_frame
             frames.append(frame)
             poses.append(robot_sim.get_2d_pose())
+            if health_monitor is not None:
+                health_monitor.observe(
+                    move_controller=move_controller if kind == "move" else None
+                )
 
             if kind == "move":
                 phase_done = move_controller.is_goal_reached() and robot_sim.is_stationary(

@@ -3,8 +3,17 @@
 # ==========================================
 # Configuration Constants
 # ==========================================
-MAX_CONCURRENT_JOBS=24  # Adjust based on your CPU cores
+# The box has 256 cores; nproc reports 4 only because OMP_NUM_THREADS=4 is set.
+# The bottleneck is per-file JPEG writes to NFS (80% of wall-clock), not the
+# simulator, so this scales well past any CPU limit -- measured 8.69x at 16 and
+# 13.20x at 32. See dump/regen_readiness/FINDINGS.md.
+MAX_CONCURRENT_JOBS="${MAX_CONCURRENT_JOBS:-32}"
 MAX_LENGTH=300
+# Reject an episode that stays off its reference path this long. Arming this
+# costs 2.64% of otherwise-good episodes; leaving it off ships the ones that
+# grind against geometry. Escape rejection (the joint_z fall detector) is always
+# on and is not this knob -- see dump/drive_failure_detection/FINDINGS.md.
+REJECT_REF_MISS_S="${REJECT_REF_MISS_S:-1.0}"
 # 25 Hz -> dt = 0.04s = exactly 5 of habitat's fixed 0.008s Bullet steps. Off-grid
 # rates (the old FPS=30 -> dt=0.03333s = 4.1667 steps) make the physics time
 # delivered per tick alternate between 0.032s and 0.040s, i.e. a 24% per-tick
@@ -32,7 +41,7 @@ export OUTPUT_DIR="${OUTPUT_DIR:-output_25hz}"
 export LOGS_DIR="$OUTPUT_DIR/logs"
 
 # Export variables needed by the xargs subshell
-export MAX_LENGTH FPS IMAGE_EXT
+export MAX_LENGTH FPS IMAGE_EXT REJECT_REF_MISS_S
 
 # Ensure output and log directories exist before starting
 mkdir -p "$OUTPUT_DIR" "$LOGS_DIR"
@@ -55,6 +64,7 @@ process_scene() {
         --max-length "$MAX_LENGTH" \
         --fps "$FPS" \
         --image-ext "$IMAGE_EXT" \
+        --reject-ref-miss-s "$REJECT_REF_MISS_S" \
         --log-file "$log_file" \
         "$input_file"
 }

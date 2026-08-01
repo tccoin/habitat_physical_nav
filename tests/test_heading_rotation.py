@@ -76,6 +76,13 @@ def wrap(a):
     return (a + math.pi) % (2 * math.pi) - math.pi
 
 
+# The shipped default bounds angular acceleration (HeadingRotationConfig.alpha_max),
+# which changes the shape of the turn. Tests that are specifically about the
+# UNBOUNDED law -- the bang-bang/proportional family, its optimality, and the
+# knobs (gain, w_min) that only that branch reads -- pin it off with this.
+UNBOUNDED = dict(alpha_max=None)
+
+
 class TestNoOvershoot:
     @pytest.mark.parametrize("target_deg", [5, 12, 30, 45, 90, 120, 175, -30, -90, -175])
     @pytest.mark.parametrize(
@@ -118,14 +125,14 @@ class TestNoOvershoot:
         for deg in range(5, 180, 7):
             controller, base = make([math.radians(deg)], gain=3.0, w_min=2.0,
                                     w_max=2.0, heading_tolerance=0.01,
-                                    no_overshoot_clamp=False)
+                                    no_overshoot_clamp=False, **UNBOUNDED)
             if len(run(controller, base, max_ticks=400)) == 400:
                 stuck.append(deg)
         assert len(stuck) > 10, "expected a limit cycle for most targets"
         # ...and the same floor WITH the clamp always converges.
         for deg in range(5, 180, 7):
             controller, base = make([math.radians(deg)], gain=3.0, w_min=2.0,
-                                    w_max=2.0, heading_tolerance=0.01)
+                                    w_max=2.0, heading_tolerance=0.01, **UNBOUNDED)
             run(controller, base, max_ticks=400)
             assert controller.is_trajectory_complete()
 
@@ -153,10 +160,16 @@ class TestCapAndDeadband:
         assert abs(wrap(math.radians(90) - base.heading)) <= tol
 
     def test_saturates_then_lands_in_the_analytic_minimum(self):
-        """Deadbeat + cap == the fastest a w_max-capped turn can possibly be."""
+        """Deadbeat + cap == the fastest a w_max-capped turn can possibly be.
+
+        This is the UNBOUNDED law, which is why it is not the shipped default:
+        the only way to be this fast is to step to the cap and back to zero in
+        one tick each, which no real base can do.
+        """
         w_max, tol = 2.0, 0.05
         target = math.radians(90)
-        controller, base = make([target], w_max=w_max, heading_tolerance=tol)
+        controller, base = make([target], w_max=w_max, heading_tolerance=tol,
+                                **UNBOUNDED)
         log = run(controller, base)
         floor_ticks = math.floor((abs(target) - tol) / (w_max * DT))
         assert floor_ticks <= len(log) <= floor_ticks + 2
@@ -165,8 +178,8 @@ class TestCapAndDeadband:
         assert at_cap >= len(log) - 2
 
     # The discrete demo turn primitives cluster at these sizes.
-    @pytest.mark.parametrize("deg,min_speedup", [(15, 4.0), (30, 3.0), (60, 2.1),
-                                                 (90, 1.7), (180, 1.4)])
+    @pytest.mark.parametrize("deg,min_speedup", [(15, 2.15), (30, 2.1), (60, 1.65),
+                                                 (90, 1.4), (180, 1.2)])
     def test_default_is_much_faster_than_the_old_proportional_law(self, deg, min_speedup):
         """Regression guard on the settle tail this controller was retuned to remove.
 
@@ -174,11 +187,16 @@ class TestCapAndDeadband:
         while |e| > w_max/gain = 0.67 rad and then decayed exponentially into a
         1.7-degree deadband. The speedup is largest for small turns, which is
         exactly where the demos spend most of their turning.
+
+        Measured against the SHIPPED default, which bounds angular acceleration
+        and so gives some of the raw speed back: 2.25x / 2.18x / 1.72x / 1.48x /
+        1.30x at 15 / 30 / 60 / 90 / 180 degrees. The thresholds below sit just
+        under those, so this catches a regression without pinning the profile.
         """
         target = math.radians(deg)
         new, base_new = make([target])
         old, base_old = make([target], gain=3.0, heading_tolerance=0.03,
-                             no_overshoot_clamp=False)
+                             no_overshoot_clamp=False, **UNBOUNDED)
         n_new, n_old = len(run(new, base_new)), len(run(old, base_old))
         assert n_old >= min_speedup * n_new, f"{deg}deg: new={n_new} old={n_old}"
 
@@ -194,24 +212,160 @@ class TestCapAndDeadband:
         change meaning with the recording rate.
         """
         old, base = make([math.radians(deg)], gain=3.0, heading_tolerance=0.03,
-                         no_overshoot_clamp=False)
+                         no_overshoot_clamp=False, **UNBOUNDED)
         old_slow = sum(1 for w, _ in run(old, base) if abs(w) < SETTLE_W)
         assert 0.55 <= old_slow * DT <= 0.75, f"{old_slow} ticks = {old_slow * DT:.2f}s"
 
+        # The shipped law also spends time below the SETTLE threshold -- it has
+        # to, it ramps -- but that time is the two ramps, bounded by
+        # 2 * SETTLE_W / alpha_max, and unlike the old law's exponential it does
+        # not grow as the deadband shrinks. At alpha_max = 12 that is 0.10 s,
+        # plus the terminal zero tick this helper records: 4 ticks, 0.16 s,
+        # measured flat across every turn size. That flatness is the point --
+        # the old law's tail is 4-8x longer and buys nothing.
         new, base2 = make([math.radians(deg)])
         new_slow = sum(1 for w, _ in run(new, base2) if abs(w) < SETTLE_W)
-        assert new_slow <= 1
+        assert new_slow * DT <= 0.18, f"{new_slow} ticks = {new_slow * DT:.2f}s"
+
+        # ...and with acceleration unbounded it is a single landing tick.
+        bb, base3 = make([math.radians(deg)], **UNBOUNDED)
+        assert sum(1 for w, _ in run(bb, base3) if abs(w) < SETTLE_W) <= 1
 
 
 class TestTrapezoidalFloor:
     def test_floor_holds_the_rate_up_until_the_landing_tick(self):
-        controller, base = make([math.radians(90)], gain=3.0, w_min=0.8, w_max=2.0)
+        controller, base = make([math.radians(90)], gain=3.0, w_min=0.8, w_max=2.0,
+                                **UNBOUNDED)
         log = run(controller, base)
         rates = [abs(w) for w, _ in log[:-1]]
         assert min(rates) >= 0.8 - 1e-12
         assert max(rates) == pytest.approx(2.0)
         # the profile is monotonically non-increasing: ramp at the cap, then coast
         assert all(a >= b - 1e-9 for a, b in zip(rates, rates[1:]))
+
+
+class TestBoundedAcceleration:
+    """The shipped profile: |dw/dt| <= alpha_max, both edges.
+
+    The motivation is distributional, not aesthetic. The unbounded law's velocity
+    trace is a rectangle -- 97.8% of its turning ticks sit at w_max -- and this
+    project's central finding is that a conditional-mean regression head cannot
+    represent a bimodal action distribution. Bounding acceleration is what puts
+    mass at intermediate turn rates. See dump/rotation_segmentation/FINDINGS.md.
+    """
+
+    ALPHAS = [30.0, 20.0, 12.0, 8.0, 4.0]
+
+    @pytest.mark.parametrize("alpha", ALPHAS)
+    @pytest.mark.parametrize("target_deg", [5, 15, 30, 60, 90, 120, 175, -30, -90, -175])
+    def test_commanded_acceleration_never_exceeds_alpha(self, alpha, target_deg):
+        """The bound holds over the WHOLE profile, launch and landing included.
+
+        Both edges are asserted by bracketing the commanded trace with the rest
+        state the base is genuinely in before and after a look phase. Getting the
+        landing edge inside the bound is what the deadband-targeted, discrete-time
+        corrected arrival rate in ``_bounded_accel_command`` is for; the naive
+        ``sqrt(2*alpha*|e|)`` fails this test by a factor of two.
+        """
+        controller, base = make([math.radians(target_deg)], alpha_max=alpha)
+        log = [w for w, _ in run(controller, base) if w != 0.0]
+        rates = [0.0] + log + [0.0]                  # rest to rest
+        worst = max(abs(b - a) / DT for a, b in zip(rates, rates[1:]))
+        assert worst <= alpha * (1 + 1e-9), f"|dw/dt| = {worst:.2f} > {alpha}"
+
+    @pytest.mark.parametrize("alpha", ALPHAS)
+    @pytest.mark.parametrize("target_deg", [5, 15, 30, 60, 90, 175, -30, -90, -175])
+    def test_still_never_overshoots(self, alpha, target_deg):
+        target = math.radians(target_deg)
+        controller, base = make([target], alpha_max=alpha)
+        log = run(controller, base)
+        signs = {np.sign(round(wrap(target - h), 12)) for _, h in log}
+        assert signs <= {np.sign(target), 0.0}, f"overshot: {sorted(signs)}"
+        assert controller.is_trajectory_complete()
+
+    @pytest.mark.parametrize("alpha", ALPHAS)
+    def test_profile_is_a_trapezoid_not_a_rectangle(self, alpha):
+        """Rises, holds, falls -- and actually visits intermediate rates."""
+        controller, base = make([math.radians(180)], alpha_max=alpha)
+        rates = [abs(w) for w, _ in run(controller, base)]
+        peak = rates.index(max(rates))
+        assert all(a <= b + 1e-9 for a, b in zip(rates[:peak], rates[1:peak + 1]))
+        assert all(a >= b - 1e-9 for a, b in zip(rates[peak:], rates[peak + 1:]))
+        mid = [r for r in rates if 0.2 < r < 1.8]
+        assert len(mid) >= 2, f"no intermediate rates: {rates}"
+
+    def test_lower_alpha_puts_more_mass_at_intermediate_rates(self):
+        """The whole point, stated as a monotone property."""
+        fracs = []
+        for alpha in (None, 30.0, 20.0, 12.0, 8.0):
+            rates = []
+            for deg in (30, 60, 90, 180):
+                controller, base = make([math.radians(deg)], alpha_max=alpha)
+                rates += [abs(w) for w, _ in run(controller, base)]
+            fracs.append(sum(0.2 < r < 1.8 for r in rates) / len(rates))
+        assert all(a < b for a, b in zip(fracs, fracs[1:])), fracs
+        assert fracs[0] < 0.1 and fracs[-1] > 0.3
+
+    @pytest.mark.parametrize("alpha", ALPHAS)
+    def test_peak_rate_still_reaches_the_cap_on_a_long_turn(self, alpha):
+        """w_max is NOT lowered: softening the ramp must not slow the cruise."""
+        controller, base = make([math.radians(180)], alpha_max=alpha, w_max=2.0)
+        assert max(abs(w) for w, _ in run(controller, base)) == pytest.approx(2.0, abs=1e-6)
+
+    def test_a_direction_reversal_ramps_through_zero(self):
+        """Signed rate limiting: the command may not jump across zero.
+
+        The unbounded law can go from +w_max to -w_max in a single tick, which is
+        2*w_max/dt = 100 rad/s^2 -- the worst acceleration in the whole profile.
+        """
+        base = FakeBase(0.0)
+        controller = HeadingRotationController(base, HeadingRotationConfig(alpha_max=12.0))
+        controller.set_heading_trajectory([math.radians(90), math.radians(-90)])
+        log = run(controller, base)
+        rates = [w for w, _ in log]
+        assert max(abs(b - a) / DT for a, b in zip(rates, rates[1:])) <= 12.0 + 1e-9
+        assert any(abs(r) < 0.5 for r in rates[1:-1]), "never passed through zero"
+
+    @pytest.mark.parametrize("alpha", ALPHAS)
+    def test_a_target_at_exactly_180_degrees_still_terminates(self, alpha):
+        """The one genuinely ambiguous target, asserted rather than avoided.
+
+        At |e| = pi the shortest-path direction is undefined and one tick of
+        motion flips its sign, so "overshoot" is not a meaningful measurement
+        there -- a near-180 waypoint is what produced the single 179-degree
+        overshoot reading in the held-out sweep, on an episode whose final pose,
+        goal check and phase timings were all identical to the other arms. What
+        must hold is that the controller still converges.
+        """
+        controller, base = make([math.pi], alpha_max=alpha)
+        run(controller, base)
+        assert controller.is_trajectory_complete()
+        assert abs(wrap(math.pi - base.heading)) <= 0.03 + 1e-9
+
+    def test_alpha_max_none_restores_the_bang_bang_law(self):
+        a, ba = make([math.radians(90)], alpha_max=None)
+        b, bb = make([math.radians(90)], alpha_max=1e9)
+        assert [w for w, _ in run(a, ba)] == pytest.approx([w for w, _ in run(b, bb)])
+
+    def test_bounded_is_slower_than_bang_bang_but_not_by_much(self):
+        """Honest cost guard: the softening must stay cheap per turn.
+
+        Measured 1.43x / 1.31x / 1.20x / 1.10x at 30 / 60 / 90 / 180 degrees --
+        the ramp is a fixed overhead, so it is proportionally cheapest on the
+        long turns. Episode duration rises only 4.8% because turning is a
+        minority of ticks.
+        """
+        for deg, max_ratio in ((30, 1.5), (60, 1.35), (90, 1.25), (180, 1.15)):
+            slow, b1 = make([math.radians(deg)], alpha_max=12.0)
+            fast, b2 = make([math.radians(deg)], alpha_max=None)
+            n_slow, n_fast = len(run(slow, b1)), len(run(fast, b2))
+            assert n_slow <= max_ratio * n_fast, f"{deg}deg: {n_slow} vs {n_fast}"
+
+    def test_w_min_is_ignored_when_acceleration_is_bounded(self):
+        """A floor and a ramp through that floor are contradictory; documented."""
+        controller, base = make([math.radians(90)], alpha_max=12.0, w_min=1.5)
+        rates = [abs(w) for w, _ in run(controller, base)]
+        assert min(rates) < 1.5
 
 
 class TestHandoffTolerance:
@@ -280,8 +434,10 @@ class TestBackCompat:
         assert controller.w_max == 1.25 and controller.heading_tolerance == 0.4
 
     def test_step_gain_argument_overrides_the_config(self):
+        """``heading_alignment_gain`` is an override for the UNBOUNDED law only;
+        the bounded profile is defined geometrically and has no gain to override."""
         controller, base = make([math.radians(90)], gain=30.0,
-                                no_overshoot_clamp=False, w_max=99.0)
+                                no_overshoot_clamp=False, w_max=99.0, **UNBOUNDED)
         args = controller.step(dt=DT, heading_alignment_gain=1.0)
         assert float(args["chassis_twist"][2]) == pytest.approx(math.radians(90))
 

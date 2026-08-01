@@ -278,11 +278,40 @@ class HeadingRotationConfig:
         w_min: floor on commanded |w| while outside the deadband (rad/s). Non-zero
             gives a trapezoidal profile (ramp, coast, land) instead of a
             proportional decay. Safe only together with ``no_overshoot_clamp``.
+            Ignored when ``alpha_max`` is set -- a floor and a ramp through that
+            floor are contradictory.
+        alpha_max: bound on angular ACCELERATION, |dw/dt| (rad/s^2). ``None``
+            leaves it unbounded, which with the deadbeat ``gain`` makes the
+            commanded profile a rectangle: step to ``w_max``, hold, step to zero
+            -- 50 rad/s^2 (2865 deg/s^2) at each edge, and 100 rad/s^2 across a
+            direction reversal. No real base can do that; it would skid, and a
+            policy trained to imitate it learns something it cannot execute off
+            the simulator. Setting it makes the profile a true trapezoid instead:
+            ramp at ``alpha_max``, cruise at ``w_max``, brake along
+            ``sqrt(2*alpha_max*|e|)`` and land. This is NOT ``w_min`` under
+            another name -- ``w_min`` floors the velocity, this bounds its
+            derivative, and only the latter puts mass in the intermediate rates.
+
+            The default of 12 comes from a sweep over 192 held-out episodes
+            (``dump/rotation_segmentation/FINDINGS.md``). It is cheap: episode
+            duration goes from 0.671 to 0.705 of the pre-tuning baseline, i.e.
+            the softening costs 4.8% and keeps 95% of the speed win, because only
+            the EDGES of the turn are ramped and ``w_max`` is untouched. What it
+            buys is the shape of the angular-velocity distribution, which is the
+            actual point: saturation falls 0.978 -> 0.738 and the share of
+            turning ticks at an intermediate rate rises 0.021 -> 0.210. That
+            matters because this project's central finding is that a
+            conditional-mean regression head cannot represent a bimodal
+            stop-or-drive action distribution; a bang-bang rotation law makes the
+            yaw channel bimodal in exactly the same way, and regenerating the
+            corpus with it would transplant the disease into a new channel.
+            Delivered scan sweep also improves (7.5 -> 3.4 degrees lost).
         gain: proportional gain (1/s). At ``gain == 1/dt`` (25.0 at the 25 Hz
             recording rate) the law is deadbeat: full ``w_max`` until the target
             is one tick away, then land exactly on it. A larger gain is also
             deadbeat because ``no_overshoot_clamp`` binds first; a smaller one
-            degrades gracefully to proportional near the target.
+            degrades gracefully to proportional near the target. Ignored when
+            ``alpha_max`` is set, which defines the profile geometrically.
         heading_tolerance: acceptance deadband for a heading target (rad). Any
             residual below this is snapped to zero rather than chased.
         handoff_tolerance: looser acceptance (rad) applied to the FINAL heading of
@@ -299,6 +328,7 @@ class HeadingRotationConfig:
 
     w_max: float = 2.0
     w_min: float = 0.0
+    alpha_max: Optional[float] = 12.0
     gain: float = DEFAULT_ROTATION_FPS
     heading_tolerance: float = 0.03
     handoff_tolerance: Optional[float] = 0.09
@@ -312,7 +342,15 @@ class HeadingRotationController:
     commands angular velocity: the chassis is driven through a 1D trajectory of yaw
     headings, advancing to the next heading once the current one is reached.
 
-    The control law is a capped, floored, no-overshoot proportional law::
+    There are two control laws, selected by ``config.alpha_max``.
+
+    **Bounded acceleration (the default, ``alpha_max`` set).** A rest-to-rest
+    trapezoidal yaw profile: ramp at ``alpha_max``, cruise at ``w_max``, brake
+    along the arrival parabola ``sqrt(2*alpha_max*|e|)`` and land on the target.
+    See ``_bounded_accel_command``.
+
+    **Unbounded (``alpha_max = None``)** -- a capped, floored, no-overshoot
+    proportional law::
 
         e = shortest-path error to the current target heading
         |e| <= tolerance      ->  accept the target, command 0
@@ -320,13 +358,19 @@ class HeadingRotationController:
                                                     max(w_min, gain*|e|),
                                                     |e|/dt   [if clamped])
 
-    With the default ``gain = 1/dt`` this is a bang-bang / trapezoidal profile:
-    the robot turns at exactly ``w_max`` until it is one control tick away from
-    the target and then lands on it, instead of decaying exponentially into the
-    deadband. The base's yaw joint is a velocity motor that reaches its target
-    within one substep (measured: no lag, no coast), so the ``|e|/dt`` clamp is
-    sufficient to guarantee zero overshoot -- there is no actuator inertia to
-    absorb.
+    With ``gain = 1/dt`` that law is bang-bang: the robot turns at exactly
+    ``w_max`` until it is one control tick away from the target and then lands on
+    it. It is the fastest possible profile and it is retained for A/B work, but
+    it is not what should be recorded into a dataset -- its velocity trace is a
+    rectangle, which is both unrealisable on hardware and maximally bimodal (see
+    ``HeadingRotationConfig.alpha_max``).
+
+    Both laws land exactly, never overshoot, and are safe because the base's yaw
+    joint is a velocity motor that reaches its commanded rate within one substep
+    (measured: no lag, no coast). There is no actuator inertia to absorb an
+    error, which is why the ``|e|/dt`` clamp is sufficient -- and equally why the
+    acceleration bound has to be imposed by the controller rather than inherited
+    from the plant.
 
     ``tolerance`` is ``config.heading_tolerance``, except for the final heading of
     a trajectory flagged ``handoff_to_path=True``, which uses the looser
@@ -366,6 +410,9 @@ class HeadingRotationController:
         self.target_idx = 0
         self.current_pose = None
         self.pose_history: List[np.ndarray] = []
+        # Last commanded angular velocity, needed by the alpha_max rate limit.
+        # Zero is correct at a reset: a look phase always begins from rest.
+        self._w_prev = 0.0
 
     # set the 1D heading trajectory (sequence of target yaw angles in radians)
     def set_heading_trajectory(
@@ -464,6 +511,7 @@ class HeadingRotationController:
             "chassis_twist": np.array([0.0, 0.0, 0.0], dtype=float),
         }
         if self.is_trajectory_complete():
+            self._w_prev = 0.0
             return stop
 
         heading_error = self.get_heading_error()
@@ -472,17 +520,86 @@ class HeadingRotationController:
         while abs(heading_error) < self.tolerance_for_target():
             self.target_idx += 1
             if self.is_trajectory_complete():
+                self._w_prev = 0.0
                 return stop
             heading_error = self.get_heading_error()
 
         cfg = self.config
-        gain = cfg.gain if heading_alignment_gain is None else heading_alignment_gain
-        magnitude = min(cfg.w_max, max(cfg.w_min, gain * abs(heading_error)))
-        if cfg.no_overshoot_clamp and dt > 0.0:
-            # never command more rotation than remains: one tick cannot overshoot.
-            magnitude = min(magnitude, abs(heading_error) / dt)
-        w_cmd = math.copysign(magnitude, heading_error)
+        if cfg.alpha_max is not None and cfg.alpha_max > 0.0 and dt > 0.0:
+            w_cmd = self._bounded_accel_command(heading_error, dt)
+        else:
+            gain = cfg.gain if heading_alignment_gain is None else heading_alignment_gain
+            magnitude = min(cfg.w_max, max(cfg.w_min, gain * abs(heading_error)))
+            if cfg.no_overshoot_clamp:
+                # never command more rotation than remains: one tick cannot overshoot.
+                magnitude = min(magnitude, abs(heading_error) / dt)
+            w_cmd = math.copysign(magnitude, heading_error)
+
+        self._w_prev = float(w_cmd)
         return {
             "twist_frame": "robot",
             "chassis_twist": np.array([0.0, 0.0, float(w_cmd)], dtype=float),
         }
+
+    def _bounded_accel_command(self, heading_error: float, dt: float) -> float:
+        """Trapezoidal yaw profile with |dw/dt| <= ``config.alpha_max``.
+
+        Three bounds, all upper bounds on the magnitude, plus one signed rate
+        limit:
+
+        * ``w_max`` -- the cruise rate, unchanged.
+        * the discrete arrival rate ``sqrt((alpha_max*dt)^2 + 2*alpha_max*d)
+          - alpha_max*dt``, where ``d = |e| - tol`` -- the fastest rate that can
+          be held for one whole tick and still leave room to brake to rest by the
+          ACCEPTANCE DEADBAND. This shapes the TRAILING edge, and it is the whole
+          reason the profile is graded rather than a rectangle: the deadbeat law's
+          trailing edge is a single step from ``w_max`` to zero, 50 rad/s^2
+          (2865 deg/s^2) at 25 Hz.
+
+          Two details, both of which the obvious ``sqrt(2*alpha_max*|e|)`` gets
+          wrong. First, braking towards the deadband edge rather than towards zero
+          error is what makes the bound hold through the *landing*: aiming at zero
+          leaves the controller still commanding ``sqrt(2*alpha_max*tol)`` on the
+          tick it accepts -- 0.85 rad/s at the defaults, an unbounded 21 rad/s^2
+          step to zero. Second, the ``alpha_max*dt`` terms are the discrete-time
+          correction. A tick holds its rate constant, so it overshoots the
+          continuous braking parabola and the next tick would need to decelerate
+          harder than ``alpha_max`` to catch up -- measured at 14.2 against a
+          bound of 12. The corrected form is the root of
+          ``w*dt + w^2/(2*alpha_max) = d``, i.e. "coast one tick, then stop".
+        * a floor of ``alpha_max * dt`` on that arrival rate, which is what stops
+          the previous item from reintroducing a settle tail. Without it the rate
+          goes to zero exactly as ``|e|`` reaches ``tol`` and the last fraction of
+          a degree takes unboundedly many ticks -- the same crawl the deadbeat law
+          was introduced to remove. One tick's worth of acceleration is the
+          smallest floor that still guarantees the deadband is crossed, and it
+          makes the final step to zero exactly ``alpha_max``. So the whole
+          profile, landing included, is bounded by ``alpha_max``.
+        * ``|e| / dt`` (``no_overshoot_clamp``) -- one tick can never carry the
+          robot past the target. It only ever commands LESS motion.
+        * a signed clip to ``w_prev +/- alpha_max * dt``, which shapes the LEADING
+          edge and, because it is signed rather than applied to the magnitude,
+          forces a direction reversal to ramp down through zero instead of
+          jumping across it.
+
+        ``config.w_min`` is deliberately not applied here: a velocity floor and a
+        ramp through that floor are contradictory, and the floor was measured and
+        rejected on its own terms (it is dominated by simply raising the gain).
+        """
+        cfg = self.config
+        alpha = cfg.alpha_max
+        e = heading_error
+        tol = self.tolerance_for_target()
+        # Fastest rate that survives one whole tick and still brakes to rest by
+        # the deadband edge, floored at one tick of acceleration so the deadband
+        # is always crossed.
+        d = max(abs(e) - tol, 0.0)
+        adt = alpha * dt
+        w_arrive = max(math.sqrt(adt * adt + 2.0 * alpha * d) - adt, adt)
+        target = math.copysign(min(cfg.w_max, w_arrive), e)
+        # Leading-edge ramp / reversal, in signed space.
+        lo, hi = self._w_prev - alpha * dt, self._w_prev + alpha * dt
+        w_cmd = min(max(target, lo), hi)
+        if cfg.no_overshoot_clamp:
+            w_cmd = math.copysign(min(abs(w_cmd), abs(e) / dt), w_cmd)
+        return w_cmd

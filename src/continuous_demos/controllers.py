@@ -346,7 +346,7 @@ class HeadingRotationConfig:
 
     w_max: float = 2.0
     w_min: float = 0.0
-    alpha_max: Optional[float] = 5.0
+    alpha_max: Optional[float] = 12.0
     gain: float = DEFAULT_ROTATION_FPS
     heading_tolerance: float = 0.03
     handoff_tolerance: Optional[float] = 0.09

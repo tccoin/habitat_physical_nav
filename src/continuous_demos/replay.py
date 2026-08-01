@@ -33,14 +33,26 @@ from continuous_demos.controllers import (
 # nothing about where the robot goes; it only stops recording the frozen frames,
 # and it frees episode-timeout budget for the phases that follow.
 #
-# The window was re-derived AFTER the DWPP constant-braking-distance fix
+# Re-derived AFTER the DWPP constant-braking-distance fix
 # (pure_pursuit._decide_accel_or_decel). Before that fix, every move phase with a
-# reference path shorter than 0.67 m was commanded v = 0 for its whole life, this
-# rule fired on ~60 of 80 held-out episodes, and 30 ticks was the best window.
-# With the root cause gone it fires on ~15, the phases it catches are genuinely
-# dead, and a longer window is free: at 25 Hz, 45 ticks costs nothing in duration
-# versus 30 (0.684 vs 0.683 of baseline) and takes the goal-check regressions from
-# 1/80 to 0/80. Carrying the old 30 over would have kept that regression.
+# reference path shorter than 0.67 m was commanded v = 0 for its whole life, so
+# this rule was partly compensating for a controller that could not move. With the
+# root cause gone it is a smaller, cleaner effect: over 192 held-out episodes at
+# 25 Hz it fires on 21% of them, and on those it cuts duration to 0.70.
+#
+# The window barely matters and the SPEED GATE does all the work. Measured
+# against the otherwise-identical arm with the rule switched off, so that the
+# rule's own cost is isolated: 30 ticks and 45 ticks are indistinguishable on
+# every metric (duration 0.669 vs 0.673 of baseline, both 0 goal-check
+# regressions, both +1 recovery), while dropping the gate at 30 ticks causes 3
+# regressions and loses 3.4 pp of path length. 45 is kept as the more
+# conservative of two equals.
+#
+# Note this supersedes an earlier claim, made at 30 Hz before the DWPP fix, that
+# the rule cost one goal-check regression in 80 and that widening to 45 removed
+# it. Neither half survives re-measurement: post-fix the gated rule costs no
+# regressions at either window, and the single regression in that earlier sample
+# is attributable to the rotation change, not to this rule.
 MOVE_STALL_TICKS = 45
 MOVE_STALL_EPS = 0.05
 MOVE_STALL_MAX_SPEED = 0.02
@@ -131,11 +143,13 @@ def _is_stalled(path_progress, speeds, stall_ticks: int, stall_eps: float,
 
     Progress is measured along the path rather than as raw displacement so that a
     genuinely slow corner is not mistaken for a stall, and the speed gate is what
-    makes the rule safe: the failure this targets leaves the base at *exactly*
-    zero velocity, whereas a robot merely crawling at the path controller's
-    0.1 m/s minimum approach speed is making real progress and must be left alone.
-    Without the gate this rule cut real motion on 5 of 80 held-out episodes; with
-    it, 1 of 80 (and the overall goal-check pass rate goes up, not down).
+    makes the rule safe: a dead phase leaves the base at *exactly* zero velocity,
+    whereas a robot merely crawling at the path controller's 0.1 m/s minimum
+    approach speed is making real progress and must be left alone. Re-measured at
+    25 Hz with the DWPP braking fix in, over 192 held-out episodes and scored
+    against the otherwise-identical arm with the rule off: with the gate, 0 goal
+    regressions and +1 recovery; without it, 3 regressions and 3.4 pp less path
+    length. The gate is the load-bearing part of this rule, not the window.
 
     ``stall_ticks == 0`` disables the check.
     """

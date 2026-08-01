@@ -120,6 +120,8 @@ def main() -> None:
         return report_only(args.report, args.output_dir)
 
     config = config_from_args(args)
+    if not config.episodes:
+        raise SystemExit("--episodes is required")
     _all, episodes = load_selected(config)
     if not episodes:
         raise SystemExit("no episodes selected")

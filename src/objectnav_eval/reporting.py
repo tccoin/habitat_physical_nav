@@ -63,8 +63,25 @@ TRACKING_KEYS = [
 ]
 
 
+def is_finite(value: Any) -> bool:
+    """Finiteness that survives a JSON round trip.
+
+    ``inf``/``nan`` are written as ``null`` (strict JSON has no literal for
+    them), so a merged shard reports a genuinely infinite distance as ``None``.
+    Treating ``None`` as non-finite keeps the off-navmesh count and the distance
+    means identical whether they are computed in-process or re-aggregated from
+    files.
+    """
+    if value is None:
+        return False
+    try:
+        return bool(np.isfinite(float(value)))
+    except (TypeError, ValueError):
+        return False
+
+
 def _finite_mean(values: Iterable[float]) -> float:
-    finite = [float(v) for v in values if v is not None and np.isfinite(v)]
+    finite = [float(v) for v in values if is_finite(v)]
     return float(np.mean(finite)) if finite else float("nan")
 
 
@@ -87,7 +104,7 @@ def summarize(
         episodes_skipped=len(skipped),
         episodes_total=total,
         episodes_off_navmesh=sum(
-            1 for r in results if not np.isfinite(r.get("distance_to_goal_m", float("nan")))
+            1 for r in results if not is_finite(r.get("distance_to_goal_m"))
         ),
         skipped_by_reason=_counts(skipped, "reason_code"),
         terminated_by_reason=_counts(results, "terminated"),
@@ -119,7 +136,7 @@ def summarize_tracking(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         return {}
     out = {"episodes": len(rows), "ticks": int(sum(row["ticks"] for row in rows))}
     for key in TRACKING_KEYS:
-        values = [row[key] for row in rows if key in row]
+        values = [row[key] for row in rows if is_finite(row.get(key))]
         if values:
             out[key] = _finite_mean(values)
     return out

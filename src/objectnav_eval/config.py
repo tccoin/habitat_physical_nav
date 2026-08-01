@@ -121,7 +121,12 @@ def _split(value: Optional[str]) -> Optional[List[str]]:
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    parser.add_argument("--episodes", required=True,
+    # Not `required=True`: a worker is launched with only --worker-shard and
+    # reads its whole configuration out of the shard file. Requiring it here
+    # would make every worker die at argument parsing, which the launcher
+    # reports as a failed shard rather than as the CLI bug it is. main()
+    # enforces it on the paths that actually need it.
+    parser.add_argument("--episodes", default="",
                         help="ObjectNav split dir (with content/*.json.gz) or a .json.gz")
     parser.add_argument("--episode-source", default="objectnav",
                         help="episode source kind (see objectnav_eval.episodes)")

@@ -144,11 +144,18 @@ def read_shard_spec(path: str) -> Dict[str, Any]:
 def write_shard_output(
     path: str, results: Sequence[Dict[str, Any]], skipped: Sequence[Dict[str, Any]]
 ) -> None:
-    from objectnav_eval.reporting import jsonable
+    """Write a shard's raw results.
 
+    ``allow_nan=True`` deliberately: this file is an *internal* handoff read
+    back by :func:`run_parallel` in the same Python, and a genuinely infinite
+    goal distance must survive it unchanged. Turning ``inf`` into ``null`` here
+    would make a parallel run and a single-process run disagree about the
+    distance means. The user-facing results file and JSONL are strict JSON --
+    that conversion happens once, at the end, in :mod:`objectnav_eval.reporting`.
+    """
     Path(path).write_text(
         json.dumps(
-            {"results": jsonable(list(results), 6), "skipped": jsonable(list(skipped), 6)},
-            indent=2,
+            {"results": list(results), "skipped": list(skipped)},
+            indent=2, default=float, allow_nan=True,
         )
     )

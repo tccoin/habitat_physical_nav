@@ -33,6 +33,9 @@ python scripts/eval_objectnav_policy.py \
 
 # 4. Recover the summary of a partial or crashed run, without re-running it.
 python scripts/eval_objectnav_policy.py --report dump/eval_ckpt2500/shards
+
+# 5. Is the difference between two runs bigger than this episode set can resolve?
+python scripts/compare_policies.py --baseline dump/eval_a --runs dump/eval_b
 ```
 
 Run from the repo root, in the environment that has `habitat_sim` and
@@ -44,7 +47,7 @@ checkpoint (see [Two environments](#two-environments)).
 | File | What it is |
 | --- | --- |
 | `objectnav_eval_results[_<policy>].json` | Summary, every per-episode record in full, every skipped episode, and the exact config the run used. |
-| `objectnav_eval_results[_<policy>].jsonl` | One compact line per episode — **including skipped ones**, with their reason. This is the file to read. |
+| `objectnav_eval_results[_<policy>].jsonl` | One compact line per episode — **including skipped ones**, with their reason. This is the file to read. Carries the outcome (`success`, `spl`, distances), the tracking summary (`undershoot`, `lag_m`) and the behavioural summary (`frozen_frac`, `turn_frac`, `drive_frac`, `obstructed_frac`, `collisions_per_m`, `flip_rate`). The full probe output is in the `.json`. |
 | `videos/<uid>.mp4` | One frame per control tick, so playback at `1/dt` fps is real time. |
 | `shards/shard_N*.{json,log}` | Per-worker spec, raw results and log. `--report` re-aggregates from here. |
 | `logs/policy_shardN.log` | The model-side interpreter's stdout/stderr. |
@@ -63,11 +66,12 @@ metric or diagnostic is an addition rather than an edit.
        │                                    ┌────────┼────────┐
        │                                    ▼        ▼        ▼
        │                              policies.py executor.py probes.py
-       │                                    │      ChunkExecutor  TrackingDiagnostic
+       │                                    │      ChunkExecutor  tracking + behaviour
        │                                    ▼
        │                               bridge.py ──► scripts/policy_server.py
        ▼                                                (other interpreter)
-  parallel.py  shard + fan out over GPUs
+  parallel.py  shard + fan out over GPUs        compare.py ──► scripts/compare_policies.py
+                                                 two runs, paired, with an MDE
 ```
 
 | Module | Responsibility |
@@ -78,7 +82,8 @@ metric or diagnostic is an addition rather than an edit.
 | `policies.py` | `Policy` / `Observation` / `ActionChunk`, the image-blind controls, the registry. |
 | `bridge.py` | The sim↔model socket, and the `PolicyBackend` interface for head types. |
 | `executor.py` | `ActionChunk` → setpoints → PID-tracked motion, emitting `TickRecord`s. |
-| `probes.py` | Per-episode diagnostics, notably `TrackingDiagnostic`. |
+| `probes.py` | Per-episode diagnostics: `TrackingDiagnostic`, and the behavioural probes `MotionTaxonomy` / `CollisionProbe` / `MotionCoherence`. |
+| `compare.py` | Paired comparison of two runs, and what this episode count can resolve. |
 | `task.py` | `RobotObjectNavTask`: the task layer with a live query height + a metric seam. |
 | `runner.py` | One episode: the rollout loop and the result record. |
 | `harness.py` | The scene loop; `--dry-run` lives here too. |
@@ -111,7 +116,14 @@ record automatically. Add its name to `reporting.RATE_KEYS` or
 **A new diagnostic.** Implement `probes.RolloutProbe` — `reset`, `on_tick`,
 `on_chunk`, `summary()` — and add it to `probes.default_probes()`. Probes see
 every control tick and never touch the simulator, so they cost nothing and
-cannot perturb a run.
+cannot perturb a run. A diagnostic that genuinely needs to *query* the simulator
+(the collision probe does) has the executor sample it and hand the result over
+on the `TickRecord`, which keeps that rule intact.
+
+Because every head runs through this one suite — `vector_rollout`, `bin_rollout`
+and whatever registers next — a probe added here is inherited by all of them and
+its numbers are comparable across them by construction. That is the reason to
+put a diagnostic here rather than in the experiment that wanted it.
 
 ---
 
@@ -312,6 +324,133 @@ numbers.
 
 ---
 
+## The behavioural diagnostics
+
+Success, SPL and distance say whether the robot arrived. They say nothing about
+*how it looked getting there* — and that is where policy heads differ. A
+regression head creeps forward without ever committing to motion; a discrete-bin
+head moves confidently but wiggles, crashes into things and freezes. Both can
+score the same SPL. Three probes turn those observations into numbers.
+
+All three are **on by default** and all three are **diagnostics, not gates**.
+
+### 1. Motion taxonomy (`"motion"`)
+
+Every control tick is classified with the tick taxonomy the demonstration corpus
+is characterised with (`dump/data_diagnostics/croppability/segment_decomposition.py`,
+via `dump/regen_readiness/tick_decomposition.py`), so an eval number reads
+straight against the corpus composition table:
+
+| class | body-frame test |
+| --- | --- |
+| `DRIVE` | `|dxy| >= XY_T` — translating |
+| `TURN` | `|dxy| < XY_T` and `|dtheta| >= TH_T` — turning in place |
+| `SETTLE` | `|dxy| < XY_T` and `EPS <= |dtheta| < TH_T` — controller ringing |
+| `FROZEN` | `|dxy| < EPS` and `|dtheta| < EPS` — truly idle |
+
+Two things had to change to make the corpus thresholds mean the same thing here.
+
+* **They are stored as speeds, not per-tick displacements.** `XY_T = 0.01 m` and
+  `TH_T = 0.02 rad` are defined *per tick at 20 Hz*, so at face value they denote
+  0.2 m/s there and something else at any other rate — which would silently
+  change what "frozen" means the moment `--dt` changed. They live in `probes.py`
+  as **0.20 m/s** and **0.40 rad/s** and are multiplied back by the run's `dt`.
+* **`frozen` and `turning in place` are kept apart.** Rotating without
+  translating is not standing still — it is how the robot acquires a new view —
+  and merging them under one "displacement below threshold" test has misled this
+  project before.
+
+The headline "effectively not moving" number is therefore
+`frac_stationary = frac_settle + frac_frozen`, which is identical by
+construction to `frac_stationary` in `analyze_chunk_motion.py`. `frac_turn` sits
+beside it, never inside it.
+
+`FROZEN` itself is near zero in any physics rollout, and that is expected rather
+than a bug: the corpus's `EPS` is "the generator wrote the same pose twice", and
+a Bullet base always jitters at the solver's noise floor. Read `frac_stationary`.
+
+Everything is computed **twice**, on the commanded setpoints and on the achieved
+poses. The gap between them is `blocked_drive_frac` — commanded `DRIVE`, achieved
+not-`DRIVE` — which is the blocked-motion signal `undershoot_ratio` documents
+itself as unable to separate from PID lag.
+
+### 2. Collisions (`"contact"`)
+
+**The robot is always in contact with the floor.** A healthy episode sits at
+roughly 6 broadphase pairs and 2 contact points with nothing whatsoever wrong
+(`dump/drive_failure_detection/FINDINGS.md`), so a raw contact count is not a
+collision signal — the baseline is non-zero. `executor.robot_contacts` splits
+ground from obstruction on the **verticality of the contact normal** (within 45°
+of vertical is something the robot is standing on; anything else is something it
+is pressing into) and drops self-collisions between the gantry's own links.
+
+Collisions are counted as **maximal runs, not ticks**: leaning on one wall for
+200 ticks is one collision, and counting ticks would let a single stuck episode
+dominate every aggregate. `obstructed_while_driving_frac` is the number the
+question usually means — of the ticks where the policy was trying to go
+somewhere, how many were spent against something that was not the floor.
+
+That findings document *rejected* contact-based signals for escape detection,
+because that had to be bulletproof enough to accept or reject episodes. This
+gates nothing, so a contact measure is the right tool here. Its limits, stated
+rather than hidden:
+
+* It is an **instantaneous end-of-tick sample**. A glancing contact entirely
+  inside a tick is invisible.
+* The 45° normal split **misreads a steep ramp or stair tread** as an
+  obstruction, and a low sill the robot rides over as ground.
+* It says the robot is *touching* something, not that the something stopped it.
+  Cross it with `blocked_drive_frac` for that.
+
+`--no-collision-probe` turns it off. It is on by default because the cost was
+measured, not guessed: over four runs of 3,000 control ticks it is inside
+run-to-run noise (6.65 / 6.64 s with, 6.83 / 6.72 s without), and in a model run
+policy latency dominates by two orders of magnitude anyway.
+
+### 3. Motion coherence (`"coherence"`)
+
+The direct quantification of "drunken". A head that models its output slots as
+**fully independent** — the bin head's 30 slots are 10 ticks × 3 channels — has
+no correlation between consecutive ticks, and none between forward speed and
+rotation within a tick, despite the two being strongly anti-correlated in real
+driving. Each individual tick is plausible; the sequence is incoherent.
+
+| field | what it is |
+| --- | --- |
+| `flip_rate_within_chunk` | of adjacent tick pairs where both genuinely rotate, how often commanded rotation **reverses**. The headline. |
+| `flip_rate_all_adjacent` | the same without the within-chunk restriction. |
+| `rotation_directness` | per chunk, `\|Σdθ\| / Σ\|dθ\|`. 1.0 is a committed turn; ~0 is rotation that cancels itself out. |
+| `forward_rotation_corr` | `corr(\|forward\|, \|dθ\|)` over ticks. Negative in real driving; ~0 for independent sampling. |
+
+**Within-chunk is the headline, deliberately.** Across a chunk boundary the
+policy has seen a new image and re-anchored, so reversing there is legitimate
+information. Within a chunk it is one forward pass contradicting itself, which is
+exactly the signature of independent-per-tick sampling.
+
+Rotations below a deadband (a quarter of the `TURN` threshold, 0.1 rad/s) are
+excluded from the pair count: asking which way a 10⁻⁵ rad drift pointed is
+meaningless. `flip_rate_within_chunk_turning` is the same statistic at the full
+`TURN` threshold, which cannot be inflated by near-deadband jitter.
+
+### What "coherent" looks like
+
+None of these numbers mean anything without a reference. Computed on 1,500
+validation demonstrations with the *same estimator*
+(`/Projects/spatial_training/dump/eval_system/reference_behaviour.py`, 1.18 M
+ticks):
+
+| statistic | real demonstrations |
+| --- | --- |
+| `flip_rate_within_chunk` | **0.005** |
+| `rotation_directness` | **0.983** (median 1.000) |
+| `forward_rotation_corr` | **−0.124** |
+| `frac_drive` / `frac_turn` / `frac_stationary` | 0.302 / 0.293 / 0.405 |
+
+A human-driven demonstration essentially never reverses its turn direction
+mid-chunk. That is the bar.
+
+---
+
 ## Reference: the knobs that change what is measured
 
 | Flag | Why it matters |
@@ -322,6 +461,9 @@ numbers.
 | `--evaluate-every` | Ticks between measure updates. `1` (default) matches the reference harness; higher is cheaper but makes the oracle metrics lower bounds. |
 | `--snap-start` | Off by default: the start is navigable on the dataset's mesh, and snapping onto the robot's smaller mesh would silently move the agent away from the pose the episode specifies. |
 | `--auto-stop` | Ends the episode on arrival, making `success == oracle_success` by construction. Off by default so both numbers stay informative. |
+| `--policy-decode` | Decode rule for a distributional head (`bin_rollout`): `argmax` / `sample` / `mean`. Changes the policy as much as changing the checkpoint does — a sampled chunk and a mean chunk from the same weights behave nothing alike. Ignored by backends that do not accept it. |
+| `--policy-seed` | Base seed for a backend's per-episode seeded sampling. Combined with an episode counter, so re-running an episode list reproduces itself and an episode's result does not depend on how many ran before it. |
+| `--no-collision-probe` | Drops the per-tick contact sample. Measured at inside run-to-run noise, so there is rarely a reason. |
 | `--max-scenes` / `--sample-per-scene` | Stratified subsetting for big splits (MP3D val is 2195 episodes over 11 scenes). Seeded, so the same flags name the same episodes. Sampling per scene, not a head slice — the files are grouped by scene, so a head slice would evaluate one scene and call it a split. |
 
 ---

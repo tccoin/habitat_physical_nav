@@ -337,3 +337,62 @@ stack and scores them. These demos are successful human trajectories, so success
 should be 1.0 — it is (5/5, mean SPL 0.59, oracle SPL 1.0). Note long demos need
 a generous `--timeout`; truncated replays are flagged `replay_truncated` rather
 than silently counted as navigation failures.
+
+## Policy evaluation system (`src/objectnav_eval/`)
+
+A second, separate package that *uses* the task layer above to evaluate a
+closed-loop **policy** over a whole ObjectNav split. The task layer answers
+"what are this episode's metrics"; this answers "what happens when you run a
+policy over a split, on several GPUs, and want to believe the number at the
+end" — a different question with its own failure modes, most of them silent.
+Full documentation, including all four extension points, is in
+**`docs/OBJECTNAV_EVAL.md`**; read it before changing anything here.
+
+Entry points: `scripts/eval_objectnav_policy.py` (the harness) and
+`scripts/policy_server.py` (the model-environment half of the policy bridge —
+it imports only `objectnav_eval.bridge`, numpy + stdlib, because it runs in an
+interpreter with no habitat at all).
+
+It is deliberately additive: it does not modify `sim.py`, `objectnav.py` or any
+other `continuous_demos` module. Where it needed different behaviour it
+subclasses — `objectnav_eval.task.LiveHeightNavAdapter` /
+`RobotObjectNavTask` — rather than editing the task layer.
+
+Design in one line per module: `episodes` (registrable `EpisodeSource` →
+`EvalEpisode`), `navmesh`, `screening` (explicit reason codes), `policies`
+(`Observation` → `ActionChunk`), `bridge` (the sim↔model socket + the
+`PolicyBackend` interface new head types implement), `executor`, `probes`
+(`TrackingDiagnostic`), `task`, `runner`, `harness`, `parallel`, `reporting`,
+`config`. `tests/test_objectnav_eval.py` pins the pure logic and needs no
+simulator.
+
+Four things in here exist because getting them wrong produces plausible, wrong
+numbers rather than an error — they are the reason this is a package and not a
+script, and none of them should be "simplified" away:
+
+1. **The robot's position is not `robot.translation`** (the base link is pinned
+   at the spawn; the robot moves on world prismatic joints). Same for the
+   geodesic *query height*: the task layer's `NavSimAdapter._height()` is frozen
+   at the spawn height, so `LiveHeightNavAdapter` adds `joint_z`.
+2. **Episode screening.** The robot navmesh (r=0.28, h=1.0) is strictly smaller
+   and more fragmented than the one episodes were cut on. On HM3D `val_mini`
+   16 of 30 episodes have the goal on a different island. They are screened
+   with a reason code, counted, and reported — never dropped, never counted as
+   failures.
+3. **Per-dataset navmesh filenames.** HM3D `*.basis.navmesh` vs MP3D
+   `*.navmesh`: a `str.replace` no-ops on MP3D and the existence check then
+   passes on the `.glb`.
+4. **Non-finite distances** are legitimate failures but must not enter distance
+   means, and must serialise as `null` so the JSONL stays strict JSON.
+
+Two-environment rule: the simulator (habitat_sim, `vln`) and the policy
+(transformers + flash-attn, `longnav_vlm`) cannot share an environment — the
+dependency sets conflict. `bridge.py` and `scripts/policy_server.py` are the
+*only* two files that know this. Use `--policy-python` and, when the
+checkpoint's own code lives in a checkout the model env has not installed,
+`--policy-sys-path`.
+
+`objectnav_eval/probes.py` carries the PID tracking diagnostic (commanded vs
+achieved displacement, lag, undershoot ratio, controller saturation). It is a
+diagnostic and gates nothing; see
+`/Projects/spatial_training/dump/eval_system/FINDINGS.md` for what it measured.

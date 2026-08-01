@@ -2,84 +2,106 @@
 catastrophically failed demonstrations out of the corpus.
 
 ------------------------------------------------------------------------
-The failure this exists for, and why nothing else can see it
+Why the obvious signals are all blind
 ------------------------------------------------------------------------
 The base is a **virtual gantry**, not a vehicle. ``tidybot_base_stabilized.urdf``
 roots the robot at a ``world`` link, loaded with ``fixed_base=True``, and hangs
-the whole machine off three actuated joints: prismatic ``joint_x``, prismatic
+the machine off three actuated joints: prismatic ``joint_x``, prismatic
 ``joint_y``, revolute ``joint_th``. ``HabitatRobotSim.step`` writes a velocity
-target onto each of those three motors every substep, and each motor has
-``effort=1000`` (``500`` for yaw) against a 34 kg body. Below them sit three
-*passive* joints -- ``joint_z`` (prismatic, ``effort=0``, no damping) and
-``joint_pitch`` / ``joint_roll`` -- which are the only suspension, and the only
-mechanical coupling between the machine and the floor.
+target onto each of those motors every substep, and each carries ``effort=1000``
+(``500`` for yaw) against a 34 kg body. Below them sit three *passive* joints --
+``joint_z`` (prismatic, ``effort=0``, no damping) and ``joint_pitch`` /
+``joint_roll``.
 
-Two consequences follow, and together they are the whole problem:
+So the planar channel is effectively open-loop. Driven into geometry the motors
+can simply win, penetrate, and put the robot on the far side; and once it is
+outside the world there is not even a contact left to perturb it, so it keeps
+executing the commanded SE(2) trajectory *exactly*. Every planar quantity stays
+pristine through a total failure. Measured on ``17DRP5sb8fy`` episode 11:
+``joint_z`` reaches **-100 m**, a third of the recorded frames are pure black,
+and the final pose lands **0.12 m** from the demonstration's endpoint -- inside
+the 1 m goal check -- with a normal path length. That is how comparing endpoints
+between two corpora concluded navigation was healthy while the robot was leaving
+the world.
 
-1. **Planar motion is open-loop.** The X/Y/yaw motors are strong enough to track
-   their velocity targets whatever the scene does, and once the robot is outside
-   the geometry there is not even a contact left to perturb them. A robot that
-   has fallen out of the world therefore keeps executing the commanded SE(2)
-   trajectory *perfectly*.
-2. **The vertical is a free variable.** ``joint_z`` carries no motor, so when the
-   floor stops being there the machine simply falls, all the way to the joint's
-   own -100 m limit, while X/Y carry on.
-
-So every planar quantity stays pristine through a total failure. Measured on the
-known-bad episode (``17DRP5sb8fy`` index 11): ``joint_z`` reaches **-100 m**, a
-third of the recorded frames are pure black -- and the final pose lands **0.12 m**
-from the demonstration's endpoint, well inside the 1 m goal check, with a path
-length within a few percent of a healthy run. Comparing endpoints or path lengths
-between corpora cannot see this; neither can ``pose2d``, which is planar.
-
-Worse, the obvious "is it following its reference path" signal cannot see it
-either, and for the same reason. Over the escaped episodes measured here the mean
-DWPP reference-path miss *while outside the world* is ~0.08 m -- **better** than a
-healthy robot's, because nothing is pushing it off course any more. Reference
-tracking is a good detector of a robot that is stuck or being obstructed; it is
-actively misleading about a robot that has left.
+Reference-path tracking is blind to it too, and the reason is worth stating
+because it is the opposite of what one expects. **The stuck case and the escape
+case have opposite signatures on tracking error.** A robot obstructed by
+geometry falls behind its reference path and the miss grows. A robot that has
+left the world tracks *better than a healthy one* -- measured mean miss while
+outside the world 0.06 m, against 0.07 m for a healthy episode's move ticks --
+because nothing is pushing it off course any more. A detector built only on
+tracking error catches the mild failure and misses the severe one.
 
 ------------------------------------------------------------------------
-What this detector keys on: support, not motion
+Two signals, reported separately, because they fail differently
 ------------------------------------------------------------------------
-The one thing an escaped robot cannot fake is **contact**. Contact is the only
-physical coupling the gantry has to the scene, so:
+**1. Escape / noclip -- the unactuated vertical joint free-falls.**
+``joint_z`` is the vertical suspension prismatic, ``effort=0`` and no damping in
+the URDF. In the world the floor holds it, so its velocity sits at zero; outside
+the world nothing holds it and it accelerates under gravity. That is a direct
+physical consequence of the failure, not a proxy for it.
 
-    a tick is UNSUPPORTED when no contact point involves the robot,
-    and an episode ESCAPED when it is unsupported for a sustained window.
+Validated in isolation rather than inferred from a failing episode -- spawn the
+robot 30 m outside the scene at init and watch (``dump/drive_failure_detection/
+isolation.py``, and ``tests/test_drive_failure_in_sim.py``):
 
-The window is what makes this safe. A robot dropping off a step is briefly
-airborne, and that is normal: over 479 replayed episodes across 12 scenes the
-longest contact-free run in any non-escaped episode was **25 ticks (1.0 s)**,
-while the escaped ones ran 74 / 183 / 232 / 268 ticks. The default 2.0 s window
-sits in that gap with a factor of two on either side, and 2.0 s of free fall is
-19.6 m of descent -- more than any indoor scene has to give.
+| arm | ``joint_z`` velocity over 75 ticks |
+|---|---|
+| spawned on the navmesh, driving | -0.78 .. +0.11 m/s, zero after the spawn settle |
+| spawned 30 m outside the world | -0.39, -1.94, -3.81, -7.14, -11.66 .. -14.5 m/s |
 
-A single guarded second clause covers an escape that happens too close to the end
-of the episode to accumulate 2 s: unsupported for 1.0 s *through the final tick*
-**and** more than 1 m below the lowest height at which the robot was last
-supported. Both halves are required; neither fires on its own.
+The escaped arm ramps at -9.7 m/s^2 through the first half second and holds
+below -2 m/s for 66 consecutive ticks; the healthy arm never reaches -1 m/s at
+all, and settles to exactly zero once the spawn transient is over. (The descent
+does level off around -14.5 m/s rather than accelerating forever -- habitat
+creates a velocity motor for every URDF joint including this one, and the
+commented-out "remove motors for passive joints" block in
+``sim._setup_robot_and_sensors`` is why it is still there. It does not matter:
+the onset is what identifies the failure, and -14.5 m/s is still 18x anything a
+supported robot produces.) Note also that ``robot.translation[1]`` is
+**identical and constant** in both arms to 1e-9: the base link is pinned at
+spawn, so the vertical is only visible through ``joint_z``.
 
-``joint_z`` on its own is deliberately NOT the rule. Legitimate descents are large
-and common -- ``29hnd4uzFmX`` drops 3.13 m down a staircase in 8 of 40 episodes,
-``ULsKaCPVFJR`` 2.90 m -- and those episodes track their reference path to 0.13 m
-and stay in contact throughout. A threshold on descent alone would delete them.
-Height enters only as the guard on the terminal clause, where contact has already
-established that the robot is unsupported.
+The rule is therefore ``joint_z`` velocity at or below ``fall_speed_mps`` for
+``fall_duration_s`` continuously. Legitimate descents cannot reach it: habitat's
+navmesh is built with ``agent_max_climb = 0.2``, so a step down is at most 0.2 m
+and tops out at sqrt(2*g*0.2) = 2.0 m/s *instantaneously*, and descending a ramp
+in contact is bounded by the drive speed times the slope -- 1.4 m/s even at 45
+degrees and the full 2 m/s cap.
 
-------------------------------------------------------------------------
-What is measured but not enforced
-------------------------------------------------------------------------
-Reference-path tracking (``ref_miss_*``) and the per-episode motion composition
-(``frac_drive`` / ``frac_turn`` / ...) are recorded on every episode but do not
-reject by default: they describe *quality*, not *validity*, and a threshold on
-either deletes real demonstrations. ``DriveFailureConfig.reject_ref_miss_s``
-turns the sustained-tracking-error rule on once a cut has been chosen from the
-measured distribution.
+Measured over 2,227 replayed episodes across all 56 scenes, against a ground
+truth (navmesh snap failure plus a >5 m drop) that uses neither of the
+detector's inputs:
+
+| | healthy (2,204 eps) | escaped (23 eps) |
+|---|---|---|
+| peak descent speed | p50 1.17, p99 3.21, **max 6.50** m/s | **min 12.33** m/s |
+| longest run at <= -2 m/s | **max 14 ticks** (0.56 s) | **min 40 ticks** (1.6 s) |
+| total drop | max 6.40 m | min 13.09 m |
+
+Every run length between 15 and 39 ticks is empty, so the 1.0 s default sits in
+the middle of a gap two and a half windows wide: **23/23 true positives and 0
+false positives in 2,227 episodes.** Seventeen of the 23 pass the goal check --
+about 1% of everything the corpus would otherwise ship.
+
+Instantaneous ``joint_z`` *position* is deliberately not the rule: real
+staircases are large and common -- ``29hnd4uzFmX`` drops 3.13 m in 8 of 40
+episodes, ``ULsKaCPVFJR`` 2.90 m -- and those episodes track their reference
+path to 0.13 m throughout. It is the free-fall signature, not the depth, that is
+unambiguous.
+
+**2. Stuck -- sustained reference-path deviation.** Recorded on every episode
+(``ref_miss_*``) but NOT rejecting by default. It has a real precision/recall
+trade-off where the fall rule has none: at the cuts measured it deletes 1.5-5.2%
+of otherwise-good episodes, and its false positives are real demonstrations.
+``DriveFailureConfig.reject_ref_miss_s`` arms it once a cut has been chosen from
+the measured distribution. The per-episode motion composition
+(``frac_drive`` / ``frac_turn`` / ...) is recorded on the same terms.
 """
 
 import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -104,15 +126,18 @@ class DriveFailureConfig:
     """Thresholds for :class:`EpisodeHealthMonitor`.
 
     Attributes:
-        escape_unsupported_s: contact-free duration that condemns an episode
-            outright. 2.0 s; the longest contact-free run measured in a healthy
-            episode is 1.0 s and the shortest in an escaped one is 3.0 s.
-        escape_terminal_unsupported_s: shorter contact-free window accepted when
-            the run reaches the episode's final tick, so an escape in the last
-            couple of seconds is still caught.
-        escape_terminal_drop_m: descent below the last supported height that the
-            terminal clause additionally requires. Guards the shorter window
-            against a robot that merely finishes the episode mid-hop.
+        fall_speed_mps: downward ``joint_z`` velocity (positive number, m/s)
+            that counts as falling. 2.0 is the instantaneous speed reached by a
+            free fall of 0.2 m, which is habitat's ``agent_max_climb`` and
+            therefore the tallest step the navmesh admits.
+        fall_duration_s: how long that must hold continuously before the episode
+            is condemned. Sustaining -2 m/s for a second takes about 5 m of free
+            flight. Measured over 2,227 replayed episodes across all 56 scenes,
+            the longest such run in a healthy episode is 14 ticks (0.56 s, a
+            4.2 m fall down a stairwell that lands) and the shortest in an
+            escaped one is 40 ticks (1.6 s); every value between 15 and 39 is
+            empty. 1.0 s sits in the middle of that gap, and is also the window
+            the owner proposed from first principles.
         ref_miss_flag_m: reference-path miss counted as "not following the path"
             when reporting ``ref_miss_worst_run_s``. Recording-only.
         reject_ref_miss_s: reject an episode whose reference miss stays above
@@ -120,9 +145,8 @@ class DriveFailureConfig:
             statistic without acting on it -- see the module docstring.
     """
 
-    escape_unsupported_s: float = 2.0
-    escape_terminal_unsupported_s: float = 1.0
-    escape_terminal_drop_m: float = 1.0
+    fall_speed_mps: float = 2.0
+    fall_duration_s: float = 1.0
     ref_miss_flag_m: float = 1.0
     reject_ref_miss_s: Optional[float] = None
 
@@ -132,8 +156,10 @@ def robot_height_m(robot_sim) -> float:
 
     NOT ``robot.translation[1]``: the base link is pinned at the spawn point by
     ``fixed_base=True`` and the machine moves through its joints, so that
-    component never changes during an episode. The live vertical is the base
-    translation plus the passive suspension prismatic ``joint_z``. Same recipe as
+    component never changes during an episode -- measured identical to 1e-9 for a
+    robot driving on the navmesh and for one spawned 30 m outside the scene. The
+    live vertical is the base translation plus the passive suspension prismatic
+    ``joint_z``. Same recipe as
     ``data_scripts/eval_objectnav_policy.py::robot_position_3d`` in the
     spatial_training repo; reading ``translation`` alone pins every height -- and
     every goal distance -- to the spawn.
@@ -141,30 +167,23 @@ def robot_height_m(robot_sim) -> float:
     height = float(robot_sim.robot.translation[1])
     try:
         height += float(robot_sim.get_joint_state("joint_z"))
-    except (ValueError, KeyError, AttributeError):
+    except Exception:
         pass  # passive joint without a motor: the base height is what we have
     return height
 
 
-def robot_contact_count(robot_sim) -> int:
-    """Number of live contact points involving the robot.
+def vertical_velocity_mps(robot_sim) -> float:
+    """``joint_z``'s velocity: negative is falling.
 
-    Filtered to the robot's own link object ids rather than counting every
-    contact in the world, so a scene that ever gains another dynamic object
-    cannot make an escaped robot look supported. Any failure to query is
-    reported as ``-1`` ("unknown"), which the monitor treats as supported --
-    a detector that cannot see must never delete data.
+    This is the escape detector's entire input. ``joint_z`` is unactuated
+    (``effort=0``, ``damping=0``), so in the world the floor pins this at zero
+    and outside the world it is gravity. Returns 0.0 if the joint cannot be read,
+    so a query that fails can never delete an episode.
     """
     try:
-        ids = set(robot_sim.robot.link_object_ids.keys())
-        ids.add(robot_sim.robot.object_id)
-        return sum(
-            1
-            for c in robot_sim.sim.get_physics_contact_points()
-            if c.object_id_a in ids or c.object_id_b in ids
-        )
+        return float(robot_sim.get_joint_state("joint_z", is_vel=True))
     except Exception:
-        return -1
+        return 0.0
 
 
 def _longest_run(flags: List[bool]) -> int:
@@ -174,15 +193,6 @@ def _longest_run(flags: List[bool]) -> int:
         if cur > best:
             best = cur
     return best
-
-
-def _terminal_run(flags: List[bool]) -> int:
-    n = 0
-    for v in reversed(flags):
-        if not v:
-            break
-        n += 1
-    return n
 
 
 def _wrap(a):
@@ -226,8 +236,8 @@ class EpisodeHealth:
     """
 
     schema_version: int = QUALITY_SCHEMA_VERSION
-    #: Did the episode survive every rejection rule? Set by the generator, which
-    #: owns the goal check; the monitor fills in everything else.
+    #: Did the episode survive every rejection rule? The generator owns the goal
+    #: check and sets this too; the monitor fills in everything else.
     success: bool = True
     #: ``"ok"``, or the rule that rejected it: ``"escaped"``, ``"goal"``,
     #: ``"ref_miss"``, ``"no_frames"``, ``"replay_error"``.
@@ -235,19 +245,19 @@ class EpisodeHealth:
     # ---- goal check (the number the generator used to compute and discard) ----
     final_dist_m: Optional[float] = None
     goal_threshold_m: Optional[float] = None
-    # ---- escape / support ----
+    # ---- signal 1: the unactuated vertical joint in free fall ----
     escaped: bool = False
-    unsupported_run_ticks: int = 0
-    unsupported_run_s: float = 0.0
-    unsupported_terminal_ticks: int = 0
+    #: Longest continuous run of ticks falling at or beyond ``fall_speed_mps``.
+    fall_run_ticks: int = 0
+    fall_run_s: float = 0.0
+    #: Fastest descent seen, m/s, as a positive number. A supported robot never
+    #: exceeds ~0.8 m/s; free fall passes 14 m/s inside three seconds.
+    max_fall_speed_mps: float = 0.0
     #: Metres below the spawn height the robot ever reached (positive = below).
     max_drop_m: float = 0.0
-    #: Metres below the last *supported* height at the final tick.
-    final_drop_below_support_m: float = 0.0
-    #: Ticks on which habitat's pathfinder could not snap the robot to the
-    #: navmesh at all. Diagnostic; not part of any rejection rule.
-    navmesh_snap_failures: int = 0
-    # ---- reference-path tracking, over move-phase ticks only ----
+    fall_speed_mps: Optional[float] = None
+    fall_duration_s: Optional[float] = None
+    # ---- signal 2: reference-path tracking, over move-phase ticks only ----
     ref_miss_mean_m: Optional[float] = None
     ref_miss_p95_m: Optional[float] = None
     ref_miss_max_m: Optional[float] = None
@@ -279,87 +289,59 @@ class EpisodeHealthMonitor:
         health = monitor.finish(poses)
 
     ``observe`` must be called *after* the physics step and once per frame
-    appended, so the signals line up 1:1 with ``pose2d``. Cost is ~10 us/tick,
-    against ~9.8 ms/frame for writing the image.
+    appended, so the signals line up 1:1 with ``pose2d``. It reads three joint
+    values and one array index; cost is under 10 us/tick, against ~9.8 ms/frame
+    for writing the image.
     """
 
     def __init__(self, robot_sim, fps: float,
-                 config: Optional[DriveFailureConfig] = None,
-                 track_navmesh: bool = True):
+                 config: Optional[DriveFailureConfig] = None):
         self.robot_sim = robot_sim
         self.fps = float(fps)
         self.config = config or DriveFailureConfig()
-        self.track_navmesh = track_navmesh
-        self._unsupported: List[bool] = []
+        self._falling: List[bool] = []
         self._ref_miss: List[float] = []
+        self._max_fall_speed = 0.0
         self._spawn_height = robot_height_m(robot_sim)
         self._min_height = self._spawn_height
-        self._last_height = self._spawn_height
-        #: Lowest height at which the robot was last known to be supported.
-        self._last_supported_height = self._spawn_height
-        self._navmesh_failures = 0
 
     # -- per tick ----------------------------------------------------------
     def observe(self, move_controller=None) -> None:
         """Record one tick. Pass the active :class:`HolonomicRobotController`
         during a move phase, ``None`` during a look phase (looks do not
         translate, so they have no reference-path error to speak of)."""
-        n_contacts = robot_contact_count(self.robot_sim)
-        # -1 means the query failed; treat as supported so a broken query can
-        # never delete an episode.
-        unsupported = n_contacts == 0
-        self._unsupported.append(unsupported)
+        v_z = vertical_velocity_mps(self.robot_sim)
+        self._falling.append(v_z <= -self.config.fall_speed_mps)
+        if -v_z > self._max_fall_speed:
+            self._max_fall_speed = -v_z
 
         height = robot_height_m(self.robot_sim)
-        self._last_height = height
         if height < self._min_height:
             self._min_height = height
-        if not unsupported:
-            self._last_supported_height = height
 
         if move_controller is not None:
             miss = _reference_miss(move_controller, self.robot_sim.get_2d_pose())
             if miss == miss:  # drop NaN rather than poisoning the statistics
                 self._ref_miss.append(miss)
 
-        if self.track_navmesh and unsupported:
-            # Only asked when the robot is already unsupported, so the cost is
-            # paid on the ticks where it might mean something. Purely
-            # diagnostic: navmesh membership is legitimately false near walls,
-            # because the mesh is eroded by the agent radius.
-            try:
-                pf = self.robot_sim.sim.pathfinder
-                if pf.is_loaded:
-                    x, y, _th = self.robot_sim.get_2d_pose()
-                    snapped = pf.snap_point(np.array([x, height, -y], dtype=np.float32))
-                    if not (snapped[0] == snapped[0]):  # NaN
-                        self._navmesh_failures += 1
-            except Exception:
-                pass
-
     # -- end of episode ----------------------------------------------------
     def finish(self, poses=None) -> EpisodeHealth:
         cfg = self.config
         fps = self.fps
-        run = _longest_run(self._unsupported)
-        terminal = _terminal_run(self._unsupported)
-        drop_at_end = self._last_supported_height - self._last_height
-
-        escaped = run >= cfg.escape_unsupported_s * fps
-        if not escaped and terminal >= cfg.escape_terminal_unsupported_s * fps:
-            escaped = drop_at_end >= cfg.escape_terminal_drop_m
+        run = _longest_run(self._falling)
+        escaped = run >= cfg.fall_duration_s * fps
 
         health = EpisodeHealth(
             escaped=bool(escaped),
-            unsupported_run_ticks=int(run),
-            unsupported_run_s=float(run / fps),
-            unsupported_terminal_ticks=int(terminal),
+            fall_run_ticks=int(run),
+            fall_run_s=float(run / fps),
+            max_fall_speed_mps=float(self._max_fall_speed),
             max_drop_m=float(self._spawn_height - self._min_height),
-            final_drop_below_support_m=float(drop_at_end),
-            navmesh_snap_failures=int(self._navmesh_failures),
+            fall_speed_mps=float(cfg.fall_speed_mps),
+            fall_duration_s=float(cfg.fall_duration_s),
             ref_miss_flag_m=float(cfg.ref_miss_flag_m),
-            n_ticks=len(self._unsupported),
-            duration_s=float(len(self._unsupported) / fps),
+            n_ticks=len(self._falling),
+            duration_s=float(len(self._falling) / fps),
         )
         if self._ref_miss:
             miss = np.asarray(self._ref_miss, dtype=float)

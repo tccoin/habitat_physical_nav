@@ -63,11 +63,11 @@ acted on:
 
   * the **goal check** -- final replayed pose within ``--goal-threshold`` metres
     of the demonstration's reference final position;
-  * the **escape check** -- the robot must not leave the world. This cannot be
-    a tighter goal threshold: the base is a virtual gantry, so a robot that has
-    fallen out of the scene keeps tracking the demonstration *perfectly* in
-    ``pose2d`` and lands well inside the goal threshold with a normal path
-    length. See ``continuous_demos.drive_failure``.
+  * the **escape check** -- the unactuated vertical joint ``joint_z`` must not
+    free-fall. This cannot be a tighter goal threshold: the base is a virtual
+    gantry, so a robot that has fallen out of the scene keeps tracking the
+    demonstration *perfectly* in ``pose2d`` and lands well inside the goal
+    threshold with a normal path length. See ``continuous_demos.drive_failure``.
 """
 
 import argparse
@@ -438,9 +438,10 @@ def generate(
                         # Goal check: final replayed pose vs reference final position.
                         # Note this passes for a robot that fell out of the world --
                         # the gantry keeps tracking the demo perfectly once nothing
-                        # touches it -- which is exactly why the health monitor's
-                        # escape check below is a separate, non-planar test and not a
-                        # tighter threshold on this one.
+                        # touches it, so 17 of 23 measured escapes land inside this
+                        # threshold. That is why the health monitor's escape check
+                        # below is a separate, non-planar test on joint_z rather than
+                        # a tighter threshold on this one.
                         final_xy = np.asarray(poses[-1][:2], dtype=float)
                         target_xy = reference_final_xy(path_3d)
                         dist = float(np.linalg.norm(final_xy - target_xy))
@@ -455,10 +456,10 @@ def generate(
                                 "goal": (f"final pose {dist:.3f}m from goal "
                                          f"(> {goal_threshold}m)"),
                                 "escaped": (
-                                    f"left the world: unsupported for "
-                                    f"{health.unsupported_run_s:.2f}s "
-                                    f"({health.unsupported_run_ticks} ticks), fell "
-                                    f"{health.max_drop_m:.2f}m"
+                                    f"left the world: joint_z free-falling for "
+                                    f"{health.fall_run_s:.2f}s at up to "
+                                    f"{health.max_fall_speed_mps:.1f}m/s, "
+                                    f"{health.max_drop_m:.2f}m below spawn"
                                 ),
                                 "ref_miss": (
                                     f"off its reference path by > "
@@ -578,13 +579,19 @@ def parse_args() -> argparse.Namespace:
         help="Optional cap on total episodes processed (for quick testing).",
     )
     parser.add_argument(
-        "--escape-unsupported-s", type=float,
-        default=DriveFailureConfig.escape_unsupported_s,
-        help="Reject an episode in which the robot has no contact with the scene "
-             "for this many consecutive seconds -- the signature of it leaving the "
-             "world, which no planar quantity can see. The longest contact-free "
-             "run measured in a healthy episode is 1.0s; the shortest in an "
-             "escaped one is 3.0s.",
+        "--fall-speed-mps", type=float, default=DriveFailureConfig.fall_speed_mps,
+        help="Downward joint_z velocity (m/s) that counts as falling. joint_z is "
+             "the unactuated vertical joint: in the world the floor pins it, "
+             "outside the world it is gravity, so this is a direct measurement "
+             "of the failure rather than a proxy for it.",
+    )
+    parser.add_argument(
+        "--fall-duration-s", type=float, default=DriveFailureConfig.fall_duration_s,
+        help="Reject an episode whose joint_z falls that fast for this long "
+             "continuously. Over 2,227 replayed episodes the longest such run in "
+             "a healthy episode is 0.56s and the shortest in an escaped one is "
+             "1.6s; the 1.0s default sits in the empty gap between them for "
+             "23/23 true positives and 0 false positives.",
     )
     parser.add_argument(
         "--reject-ref-miss-s", type=float, default=None,
@@ -636,7 +643,8 @@ def main() -> None:
         max_episodes=args.max_episodes,
         canonicalize_rotation=args.canonicalize_rotation,
         failure_config=DriveFailureConfig(
-            escape_unsupported_s=args.escape_unsupported_s,
+            fall_speed_mps=args.fall_speed_mps,
+            fall_duration_s=args.fall_duration_s,
             ref_miss_flag_m=args.ref_miss_flag_m,
             reject_ref_miss_s=args.reject_ref_miss_s,
         ),

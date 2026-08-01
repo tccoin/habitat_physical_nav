@@ -311,14 +311,25 @@ class HabitatRobotSim:
         """
         if self.robot is None:
             return
-        parked = self.robot.translation
+        here = self.robot.translation
         self.robot.translation = mn.Vector3(0.0, self._PARK_HEIGHT_M, 0.0)
         self.sim.perform_discrete_collision_detection()
-        self.robot.translation = parked
+        self.robot.translation = here
+        # Rebuild the pairs at the pose the episode actually starts from, so
+        # the collision state the first step_world() sees is a function of the
+        # spawn pose alone.
+        self.sim.perform_discrete_collision_detection()
+
+    # Tried and rejected: destroying and re-creating every joint motor at reset,
+    # to drop the impulse Bullet warm-starts each btMultiBodyJointMotor from.
+    # remove_joint_motor()/create_joint_motor() do not round-trip faithfully --
+    # with them in place the recorded trajectory of a replay differed from tick
+    # ZERO (up to 0.005 m), i.e. the rebuild perturbs the spawn itself, where
+    # the leak it targets only shows up later. Net worse, so not done.
 
     def reset(
-        self, 
-        scene_id: Optional[str] = None, 
+        self,
+        scene_id: Optional[str] = None,
         robot_translation: Optional[np.ndarray] = None,
         robot_rotation: Optional[Any] = None,  # Accepts mn.Quaternion or [x, y, z, w] array
         snap_to_navmesh: bool = True,
@@ -338,11 +349,6 @@ class HabitatRobotSim:
         either of them for speed. They cost ~1 ms per episode, against ~2 s to
         rebuild the simulator instead.
         """
-        # 0. Purge the physics residue of the previous episode. Both halves are
-        # load-bearing for making an episode's outcome independent of what ran
-        # before it in this simulator; see _flush_physics_contact_state().
-        self._flush_physics_contact_state()
-
         # 1. Handle Scene Changes and Graph Rebuild
         if scene_id is not None and scene_id != self.cfg.sim_cfg.scene_id:
             self.cfg.sim_cfg.scene_id = scene_id
@@ -363,6 +369,20 @@ class HabitatRobotSim:
             self.robot.clear_joint_states()
             self.robot.root_linear_velocity = mn.Vector3(0.0, 0.0, 0.0)
             self.robot.root_angular_velocity = mn.Vector3(0.0, 0.0, 0.0)
+            # Bullet's deactivation ("sleep") timers are the other thing that
+            # survives sim.reset(). btMultiBody accumulates m_sleepTimer while
+            # the body is nearly still and sleeps once it passes m_sleepTimeout;
+            # each link collider likewise accumulates m_deactivationTime. An
+            # episode that ends stationary -- which is exactly what a
+            # goal-reached replay does -- therefore hands the next episode a
+            # part-elapsed timer, and the robot falls asleep sooner than it
+            # would in a fresh simulator. Nothing re-arms them: the kinematic
+            # setters above only wake the body when it is ALREADY asleep, so a
+            # merely drowsy body keeps its timer. Assigning awake unconditionally
+            # calls setActive(true), which zeroes both. (Measured as a no-op on
+            # the replay workload -- the demos never idle long enough to bank a
+            # sleep timer -- but it is genuinely leaked state and it is free.)
+            self.robot.awake = True
 
         # 2. Seed the base yaw (joint_th) from the requested orientation.
         # Goal: joint_th = the requested facing as a heading in the planar control
@@ -422,6 +442,12 @@ class HabitatRobotSim:
                     pos_offset = self.robot.get_link_joint_pos_offset(l_id)
                     joint_positions[pos_offset] = pos_target
             self.robot.joint_positions = joint_positions
+
+        # 5. Purge the physics residue of the previous episode. This runs LAST,
+        # once the spawn pose is final, so the collision state handed to the
+        # first step_world() is a function of the spawn pose and nothing else.
+        # See _flush_physics_contact_state().
+        self._flush_physics_contact_state()
                     
                     # # Update the motor target so it doesn't try to snap back
                     # settings = self.robot.get_joint_motor_settings(m_id)

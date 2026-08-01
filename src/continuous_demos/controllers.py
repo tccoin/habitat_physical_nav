@@ -9,7 +9,8 @@ throughout (habitat world / robot body / planar control frame).
 """
 
 import math
-from typing import List
+from dataclasses import dataclass
+from typing import List, Optional
 
 import numpy as np
 import magnum as mn
@@ -31,11 +32,27 @@ class HolonomicRobotController:
             look_ahead_time=0.2,
             v_max=2.0,
             v_min=0.0,
+            # NOTE: w_max/w_min = +/-70 are effectively inert and look like a
+            # degrees value sitting in a rad/s field (70 rad/s = 4010 deg/s).
+            # They bound the dynamic window in
+            # pure_pursuit._calc_optimal_velocity_considering_dynamic_window.
+            # Measured over 7771 recorded drive ticks the w_ref DWPP actually
+            # produces never came within a factor of 6 of 70 rad/s (p99 4.35,
+            # max 10.26), so the cap never binds. Deliberately NOT "corrected"
+            # to 70 deg/s = 1.222 rad/s: that would not be a cosmetic fix, it
+            # would clamp 22% of all driving ticks (probe_wmax.json in
+            # dump/data_diagnostics/rotation_tuning/) and is a change to the path
+            # controller's behaviour. Left as-is pending a separate decision.
             w_max=70.0,
             w_min=-70.0,
             a_max=3.0,
             aw_max=100.0,
-            dt=1.0/30.0,
+            # Must match the recording tick. Habitat's physics grid is a fixed
+            # 0.008 s so the pipeline records at 25 Hz (see sim.py::step and
+            # generate_pose2d_dataset.py). This dt feeds pure_pursuit's
+            # acceleration clamp (a_max * dt) and its dynamic-window bounds, so a
+            # stale 1/30 here silently widened both by 20%.
+            dt=1.0/25.0,
             approach_velocity_scaling_dist=0.5,
             min_approach_linear_velocity=0.1,
             goal_tolerance_dist=0.15,  
@@ -238,25 +255,111 @@ class HolonomicRobotController:
         plt.close(fig)
         return img
 
+# The recording tick rate. Habitat advances physics only in whole 0.008 s steps,
+# so 25 Hz is the on-grid recording rate (see sim.py::step). The rotation gain
+# defaults to 1/dt at this rate, which is what makes the law deadbeat.
+DEFAULT_ROTATION_FPS = 25.0
+
+
+@dataclass
+class HeadingRotationConfig:
+    """Tuning for :class:`HeadingRotationController`.
+
+    Defaults are the values recommended by the rotation-tuning study (see
+    ``dump/data_diagnostics/rotation_tuning/FINDINGS.md`` in the spatial_training
+    repo). The previous behaviour was ``gain=3.0, w_min=0.0,
+    heading_tolerance=0.03, handoff_tolerance=None, no_overshoot_clamp=False``,
+    which spent ~35% of every replay tick decaying exponentially towards a
+    1.7-degree deadband.
+
+    Attributes:
+        w_max: hard cap on commanded |w| (rad/s). The turn is never allowed to be
+            more violent than this regardless of the error.
+        w_min: floor on commanded |w| while outside the deadband (rad/s). Non-zero
+            gives a trapezoidal profile (ramp, coast, land) instead of a
+            proportional decay. Safe only together with ``no_overshoot_clamp``.
+        gain: proportional gain (1/s). At ``gain == 1/dt`` (25.0 at the 25 Hz
+            recording rate) the law is deadbeat: full ``w_max`` until the target
+            is one tick away, then land exactly on it. A larger gain is also
+            deadbeat because ``no_overshoot_clamp`` binds first; a smaller one
+            degrades gracefully to proportional near the target.
+        heading_tolerance: acceptance deadband for a heading target (rad). Any
+            residual below this is snapped to zero rather than chased.
+        handoff_tolerance: looser acceptance (rad) applied to the FINAL heading of
+            a trajectory that hands straight over to the path controller. The
+            path controller re-aligns the heading itself while driving, and its
+            translation is applied in its own virtual-heading frame, so a residual
+            here costs camera pointing for a few ticks and nothing else. ``None``
+            means "use ``heading_tolerance``".
+        no_overshoot_clamp: additionally clamp ``|w| <= |e| / dt`` so a single tick
+            can never carry the robot past its target. This is what makes ``w_min``
+            and a high ``gain`` safe: without it they produce a limit cycle around
+            the deadband.
+    """
+
+    w_max: float = 2.0
+    w_min: float = 0.0
+    gain: float = DEFAULT_ROTATION_FPS
+    heading_tolerance: float = 0.03
+    handoff_tolerance: Optional[float] = 0.09
+    no_overshoot_clamp: bool = True
+
+
 class HeadingRotationController:
-    """Rotates the robot in place through a sequence of target headings smoothly.
+    """Rotates the robot in place through a sequence of target headings.
 
     Unlike HolonomicRobotController (which follows a 2D path), this controller only
     commands angular velocity: the chassis is driven through a 1D trajectory of yaw
     headings, advancing to the next heading once the current one is reached.
+
+    The control law is a capped, floored, no-overshoot proportional law::
+
+        e = shortest-path error to the current target heading
+        |e| <= tolerance      ->  accept the target, command 0
+        otherwise             ->  w = sign(e) * min(w_max,
+                                                    max(w_min, gain*|e|),
+                                                    |e|/dt   [if clamped])
+
+    With the default ``gain = 1/dt`` this is a bang-bang / trapezoidal profile:
+    the robot turns at exactly ``w_max`` until it is one control tick away from
+    the target and then lands on it, instead of decaying exponentially into the
+    deadband. The base's yaw joint is a velocity motor that reaches its target
+    within one substep (measured: no lag, no coast), so the ``|e|/dt`` clamp is
+    sufficient to guarantee zero overshoot -- there is no actuator inertia to
+    absorb.
+
+    ``tolerance`` is ``config.heading_tolerance``, except for the final heading of
+    a trajectory flagged ``handoff_to_path=True``, which uses the looser
+    ``config.handoff_tolerance``.
     """
 
     def __init__(
         self,
         robot_sim: HabitatRobotSim,
-        w_max: float = 2.0,
-        heading_tolerance: float = 0.03,
+        config: Optional[HeadingRotationConfig] = None,
+        w_max: Optional[float] = None,
+        heading_tolerance: Optional[float] = None,
     ):
         self.robot_sim = robot_sim
-        self.w_max = w_max
-        self.heading_tolerance = heading_tolerance
+        self.config = config if config is not None else HeadingRotationConfig()
+        # Back-compat conveniences for the two knobs that used to be constructor
+        # arguments; they override the corresponding config fields.
+        if w_max is not None:
+            self.config.w_max = w_max
+        if heading_tolerance is not None:
+            self.config.heading_tolerance = heading_tolerance
         self.headings = None
+        self.handoff_to_path = False
         self.reset()
+
+    # ``w_max`` was a public attribute before the config existed; keep it working.
+    @property
+    def w_max(self) -> float:
+        return self.config.w_max
+
+    @property
+    def heading_tolerance(self) -> float:
+        return self.config.heading_tolerance
 
     # to be called each simulator reset/episode
     def reset(self):
@@ -265,14 +368,35 @@ class HeadingRotationController:
         self.pose_history: List[np.ndarray] = []
 
     # set the 1D heading trajectory (sequence of target yaw angles in radians)
-    def set_heading_trajectory(self, headings, remove_redundant: bool = False):
+    def set_heading_trajectory(
+        self,
+        headings,
+        remove_redundant: bool = False,
+        handoff_to_path: bool = False,
+    ):
+        """Install a heading trajectory.
+
+        ``handoff_to_path`` marks that this trajectory is followed immediately by
+        a path-following phase, which lets the final heading be accepted at the
+        looser ``config.handoff_tolerance`` (see the class docstring).
+        """
         headings = np.asarray(headings, dtype=float).reshape(-1)
         if len(headings) == 0:
             raise ValueError("headings must contain at least one target heading")
         if remove_redundant:
             headings = self._remove_redundant_headings(headings)
         self.headings = headings
+        self.handoff_to_path = handoff_to_path
         self.target_idx = 0
+
+    def tolerance_for_target(self, idx: Optional[int] = None) -> float:
+        """Acceptance deadband for heading ``idx`` (default: the active target)."""
+        idx = self.target_idx if idx is None else idx
+        cfg = self.config
+        is_last = self.headings is not None and idx == len(self.headings) - 1
+        if is_last and self.handoff_to_path and cfg.handoff_tolerance is not None:
+            return cfg.handoff_tolerance
+        return cfg.heading_tolerance
 
     @staticmethod
     def _remove_redundant_headings(headings):
@@ -323,32 +447,41 @@ class HeadingRotationController:
         error = (target_heading - current_heading + math.pi) % (2 * math.pi) - math.pi
         return error
 
-    def step(self, dt: float = 1.0 / 60.0, heading_alignment_gain: float = 3.0) -> dict:
+    def step(
+        self,
+        dt: float = 1.0 / 60.0,
+        heading_alignment_gain: Optional[float] = None,
+    ) -> dict:
+        """One control tick. ``heading_alignment_gain`` overrides ``config.gain``."""
         if self.headings is None:
             raise RuntimeError("No heading trajectory set. Call set_heading_trajectory() first.")
 
         self.current_pose = self.robot_sim.get_2d_pose()
         self.pose_history.append(self.current_pose[:2].copy())
 
+        stop = {
+            "twist_frame": "robot",
+            "chassis_twist": np.array([0.0, 0.0, 0.0], dtype=float),
+        }
         if self.is_trajectory_complete():
-            return {
-                "twist_frame": "robot",
-                "chassis_twist": np.array([0.0, 0.0, 0.0], dtype=float),
-            }
+            return stop
 
         heading_error = self.get_heading_error()
 
-        # advance to the next heading once the current one is reached
-        while abs(heading_error) < self.heading_tolerance:
+        # advance to the next heading once the current one is inside its deadband
+        while abs(heading_error) < self.tolerance_for_target():
             self.target_idx += 1
             if self.is_trajectory_complete():
-                return {
-                    "twist_frame": "robot",
-                    "chassis_twist": np.array([0.0, 0.0, 0.0], dtype=float),
-                }
+                return stop
             heading_error = self.get_heading_error()
 
-        w_cmd = np.clip(heading_error * heading_alignment_gain, -self.w_max, self.w_max)
+        cfg = self.config
+        gain = cfg.gain if heading_alignment_gain is None else heading_alignment_gain
+        magnitude = min(cfg.w_max, max(cfg.w_min, gain * abs(heading_error)))
+        if cfg.no_overshoot_clamp and dt > 0.0:
+            # never command more rotation than remains: one tick cannot overshoot.
+            magnitude = min(magnitude, abs(heading_error) / dt)
+        w_cmd = math.copysign(magnitude, heading_error)
         return {
             "twist_frame": "robot",
             "chassis_twist": np.array([0.0, 0.0, float(w_cmd)], dtype=float),

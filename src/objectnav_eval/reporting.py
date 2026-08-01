@@ -62,6 +62,33 @@ TRACKING_KEYS = [
     "saturated_aw_frac",
 ]
 
+# The behavioural diagnostics, aggregated the same way: mean over *episodes*,
+# each episode one observation, so a 200-step episode cannot outvote a 20-step
+# one. ``PROBE_KEYS`` maps a probe's record key to the fields worth a summary.
+PROBE_KEYS: Dict[str, List[str]] = {
+    "motion": [
+        "frac_drive", "frac_turn", "frac_settle", "frac_frozen", "frac_stationary",
+        "commanded_frac_drive", "commanded_frac_turn", "commanded_frac_settle",
+        "commanded_frac_frozen", "commanded_frac_stationary",
+        "blocked_drive_frac",
+        "stationary_run_max_s", "stationary_run_median_ticks",
+        "stationary_share_in_runs_ge_10",
+        "median_speed_mps", "p90_speed_mps", "median_turnrate_degps",
+    ],
+    "contact": [
+        "mean_ground_contacts", "mean_obstruction_contacts", "obstructed_frac",
+        "obstructed_while_driving_frac", "collisions", "collisions_per_100_ticks",
+        "collisions_per_m", "longest_obstructed_run_ticks",
+        "peak_obstruction_force_max",
+    ],
+    "coherence": [
+        "flip_rate_within_chunk", "flip_rate_all_adjacent",
+        "flip_rate_within_chunk_turning", "achieved_flip_rate_within_chunk",
+        "rotation_directness", "rotation_directness_median",
+        "forward_rotation_corr", "mean_abs_turnrate_degps",
+    ],
+}
+
 
 def is_finite(value: Any) -> bool:
     """Finiteness that survives a JSON round trip.
@@ -121,6 +148,10 @@ def summarize(
     tracking = summarize_tracking(results)
     if tracking:
         summary["tracking"] = tracking
+    for probe_name, keys in PROBE_KEYS.items():
+        aggregated = summarize_probe(results, probe_name, keys)
+        if aggregated:
+            summary[probe_name] = aggregated
     by_category = defaultdict(list)
     for record in results:
         by_category[record.get("category")].append(record)
@@ -148,6 +179,33 @@ def summarize_tracking(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         values = [row[key] for row in rows if is_finite(row.get(key))]
         if values:
             out[key] = _finite_mean(values)
+    return out
+
+
+def summarize_probe(
+    results: Sequence[Dict[str, Any]], probe_name: str, keys: Sequence[str]
+) -> Dict[str, Any]:
+    """Mean over episodes of one probe's fields.
+
+    An episode that produced no ticks (or a probe that was switched off, and so
+    reported ``ticks: 0``) contributes nothing rather than a zero -- a run with
+    the collision probe disabled must not report a collision rate of 0.0, which
+    would read as "no collisions" instead of "not measured".
+    """
+    rows = [r[probe_name] for r in results if isinstance(r.get(probe_name), dict)]
+    rows = [row for row in rows if row.get("ticks")]
+    if not rows:
+        return {}
+    out: Dict[str, Any] = {
+        "episodes": len(rows),
+        "ticks": int(sum(row["ticks"] for row in rows)),
+    }
+    for key in keys:
+        values = [row[key] for row in rows if is_finite(row.get(key))]
+        if values:
+            out[key] = _finite_mean(values)
+            if len(values) != len(rows):
+                out[f"{key}_n"] = len(values)
     return out
 
 
@@ -198,6 +256,9 @@ def episode_line(record: Dict[str, Any]) -> Dict[str, Any]:
             "start_dataset_m": jsonable(record.get("geodesic_start_dataset_m"), 2),
         }
     tracking = record.get("tracking") or {}
+    motion = record.get("motion") or {}
+    contact = record.get("contact") or {}
+    coherence = record.get("coherence") or {}
     line = {
         "uid": record["uid"], "scene": record["scene"],
         "episode_id": record["episode_id"], "category": record["category"],
@@ -214,6 +275,15 @@ def episode_line(record: Dict[str, Any]) -> Dict[str, Any]:
         "terminated": record.get("terminated"),
         "undershoot": jsonable(tracking.get("undershoot_ratio_moving"), 3),
         "lag_m": jsonable(tracking.get("tracking_lag_mean_m"), 3),
+        # Behaviour, not outcome: how much of the episode went nowhere, how much
+        # of it was spent against something, and how incoherent the commanded
+        # motion was. One field each -- the full probe output is in the .json.
+        "frozen_frac": jsonable(motion.get("frac_stationary"), 3),
+        "turn_frac": jsonable(motion.get("frac_turn"), 3),
+        "drive_frac": jsonable(motion.get("frac_drive"), 3),
+        "obstructed_frac": jsonable(contact.get("obstructed_frac"), 3),
+        "collisions_per_m": jsonable(contact.get("collisions_per_m"), 3),
+        "flip_rate": jsonable(coherence.get("flip_rate_within_chunk"), 3),
         "video": Path(record["video"]).name if record.get("video") else None,
     }
     return line
@@ -322,6 +392,7 @@ def print_summary(
         print(f"  terminated       {reasons}")
 
     print_tracking(summary.get("tracking"))
+    print_behaviour(summary)
 
     if summary.get("by_category"):
         print("  by category:")
@@ -381,6 +452,68 @@ def print_tracking(tracking: Optional[Dict[str, Any]]) -> None:
             "  saturated        "
             + "  ".join(f"{name} {value * 100:.1f}%" for name, value in saturation.items())
             + "   (v/w = velocity limits, a/aw = acceleration limits)"
+        )
+
+
+def print_behaviour(summary: Dict[str, Any]) -> None:
+    """The behavioural diagnostics: frozen time, collisions, motion coherence.
+
+    Like the tracking diagnostic, reported and never gating. These are what
+    separate two policies that score the same SPL but do not look remotely alike
+    in the video.
+    """
+    motion = summary.get("motion") or {}
+    contact = summary.get("contact") or {}
+    coherence = summary.get("coherence") or {}
+    if not (motion or contact or coherence):
+        return
+
+    def value(source: Dict[str, Any], key: str) -> float:
+        return float(source.get(key, float("nan")))
+
+    print(f"\n  --- behaviour ({motion.get('episodes', 0)} episodes, "
+          f"{motion.get('ticks', 0)} control ticks) ---")
+    if motion:
+        print(
+            f"  tick classes     drive {value(motion, 'frac_drive') * 100:.1f}%  "
+            f"turn-in-place {value(motion, 'frac_turn') * 100:.1f}%  "
+            f"settle {value(motion, 'frac_settle') * 100:.1f}%  "
+            f"frozen {value(motion, 'frac_frozen') * 100:.1f}%"
+        )
+        print(
+            f"  not moving       {value(motion, 'frac_stationary') * 100:.1f}% of ticks "
+            f"(commanded {value(motion, 'commanded_frac_stationary') * 100:.1f}%)   "
+            f"longest stall {value(motion, 'stationary_run_max_s'):.1f} s   "
+            f"blocked-drive {value(motion, 'blocked_drive_frac') * 100:.1f}%"
+        )
+        print(
+            f"  speed            median {value(motion, 'median_speed_mps'):.3f} m/s  "
+            f"p90 {value(motion, 'p90_speed_mps'):.3f} m/s  "
+            f"turn {value(motion, 'median_turnrate_degps'):.1f} deg/s"
+        )
+    if contact:
+        print(
+            f"  contact          obstructed {value(contact, 'obstructed_frac') * 100:.1f}% "
+            f"of ticks, {value(contact, 'obstructed_while_driving_frac') * 100:.1f}% "
+            f"of driving ticks   "
+            f"({value(contact, 'mean_ground_contacts'):.1f} ground contact pts, "
+            f"which are not collisions)"
+        )
+        print(
+            f"  collisions       {value(contact, 'collisions'):.1f} per episode  "
+            f"{value(contact, 'collisions_per_m'):.2f} per metre travelled  "
+            f"longest {value(contact, 'longest_obstructed_run_ticks'):.0f} ticks"
+        )
+    if coherence:
+        print(
+            f"  coherence        rotation sign-flip {value(coherence, 'flip_rate_within_chunk') * 100:.1f}% "
+            f"within chunk ({value(coherence, 'flip_rate_all_adjacent') * 100:.1f}% all adjacent)   "
+            f"directness {value(coherence, 'rotation_directness'):.3f}"
+        )
+        print(
+            f"                   corr(|forward|,|rotation|) "
+            f"{value(coherence, 'forward_rotation_corr'):+.3f}   "
+            f"(negative in real driving; ~0 means the two are sampled independently)"
         )
 
 

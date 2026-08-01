@@ -25,10 +25,30 @@ Everything the executor observes about tracking quality is handed out as
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
+
+
+@dataclass
+class ContactSnapshot:
+    """What the robot was touching at the end of one control tick.
+
+    ``ground`` and ``obstruction`` are separated because **the robot is always
+    in contact with the floor** -- a healthy episode sits at roughly 6 broadphase
+    pairs and 2 contact points with nothing wrong (measured in
+    ``dump/drive_failure_detection/FINDINGS.md``), so a raw contact count is not
+    a collision signal at all. The discriminator is the contact normal: standing
+    on a floor produces a near-vertical normal, pressing into a wall or a chair
+    leg produces a near-horizontal one.
+    """
+
+    total: int = 0
+    ground: int = 0
+    obstruction: int = 0
+    max_obstruction_force: float = 0.0
 
 
 @dataclass
@@ -44,6 +64,9 @@ class TickRecord:
     previous_pose: np.ndarray
     sim_time: float
     saturation: Dict[str, int] = field(default_factory=dict)
+    #: Only populated when the executor was built with ``collect_contacts``;
+    #: probes never query the simulator themselves.
+    contacts: Optional[ContactSnapshot] = None
 
     @property
     def commanded_displacement(self) -> float:
@@ -57,6 +80,79 @@ class TickRecord:
     def lag(self) -> float:
         """Distance from where the robot is to where it was told to be."""
         return float(np.linalg.norm(self.pose[:2] - self.setpoint[:2]))
+
+    def commanded_body_delta(self) -> np.ndarray:
+        """Commanded ``[forward, left, dtheta]`` in the robot's own frame.
+
+        Not ``setpoint - previous_setpoint``: that is a displacement expressed in
+        a *shared* frame, and on turn-heavy motion the two diverge badly because
+        the heading rotates within the step. Composing in the previous frame is
+        what ``dump/data_diagnostics/analyze_chunk_motion.py`` does, so the
+        numbers derived from this are directly comparable to the corpus.
+        """
+        return _body_delta(self.previous_setpoint, self.setpoint)
+
+    def achieved_body_delta(self) -> np.ndarray:
+        """Achieved ``[forward, left, dtheta]`` in the robot's own frame."""
+        return _body_delta(self.previous_pose, self.pose)
+
+
+def _body_delta(before: np.ndarray, after: np.ndarray) -> np.ndarray:
+    theta = float(before[2])
+    cos, sin = math.cos(theta), math.sin(theta)
+    dx = float(after[0]) - float(before[0])
+    dy = float(after[1]) - float(before[1])
+    dtheta = float(after[2]) - float(before[2])
+    dtheta = (dtheta + math.pi) % (2 * math.pi) - math.pi
+    return np.array([cos * dx + sin * dy, -sin * dx + cos * dy, dtheta])
+
+
+#: A contact normal within this much of vertical is the robot resting on
+#: something it is standing on rather than pressing into something in its way.
+#: 45 degrees: the floor and a wall are the two cases that matter and they are
+#: 90 degrees apart, so the split is nowhere near either.
+_GROUND_NORMAL_COS = 0.7071067811865476
+
+
+def robot_contacts(robot_sim) -> ContactSnapshot:
+    """Classify this instant's contact points into ground vs obstruction.
+
+    Reads ``sim.get_physics_contact_points()``, keeps the pairs with the robot on
+    exactly one side (self-collision between the gantry's own links is not
+    information about the scene), and splits them on the world-frame verticality
+    of the contact normal.
+
+    Honest limitations, because this is descriptive and not a gate:
+
+    * A ramp or a stair tread steeper than 45 degrees reads as an obstruction,
+      and a low sill the robot rides over reads as ground.
+    * It is an *instantaneous* sample at the end of a tick. A glancing contact
+      entirely inside a tick is invisible.
+    * It says the robot is touching something, not that the something stopped
+      it; pair it with the motion taxonomy's ``commanded_drive`` mask to get
+      "was in contact while trying to move".
+    """
+    snapshot = ContactSnapshot()
+    try:
+        robot_id = int(robot_sim.robot.object_id)
+        points = robot_sim.sim.get_physics_contact_points()
+    except Exception:  # no physics, or a simulator that does not expose it
+        return snapshot
+    for point in points:
+        a, b = int(point.object_id_a), int(point.object_id_b)
+        if (a == robot_id) == (b == robot_id):
+            continue  # neither side is the robot, or both are (self-collision)
+        normal = point.contact_normal_on_b_in_ws
+        vertical = abs(float(normal[1]))
+        snapshot.total += 1
+        if vertical >= _GROUND_NORMAL_COS:
+            snapshot.ground += 1
+        else:
+            snapshot.obstruction += 1
+            force = abs(float(point.normal_force))
+            if force > snapshot.max_obstruction_force:
+                snapshot.max_obstruction_force = force
+    return snapshot
 
 
 @dataclass
@@ -87,11 +183,17 @@ class ChunkExecutor:
     wrong length of time and the policy is evaluated at a speed it never saw.
     """
 
-    def __init__(self, robot_sim, controller, dt: float, gap: int):
+    def __init__(
+        self, robot_sim, controller, dt: float, gap: int, collect_contacts: bool = False
+    ):
         self.robot_sim = robot_sim
         self.controller = controller
         self.dt = float(dt)
         self.gap = int(gap)
+        # Sampling the contact manifold is the one per-tick observation that
+        # costs simulator time rather than arithmetic, so it is opt-in and the
+        # executor -- not a probe -- is what reads it.
+        self.collect_contacts = bool(collect_contacts)
         self.tick = 0
         self.sim_time = 0.0
 
@@ -143,6 +245,9 @@ class ChunkExecutor:
                 previous_pose=previous_pose,
                 sim_time=self.sim_time,
                 saturation=dict(segment["saturation_counts"]),
+                contacts=(
+                    robot_contacts(self.robot_sim) if self.collect_contacts else None
+                ),
             )
             ticks.append(record)
             if on_tick is not None:

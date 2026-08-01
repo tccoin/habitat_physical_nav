@@ -22,6 +22,7 @@ from objectnav_eval.reporting import (
     episode_line,
     jsonable,
     summarize,
+    summarize_probe,
     summarize_tracking,
     write_episode_lines,
 )
@@ -572,3 +573,299 @@ def test_load_jsonl_rejects_a_run_with_nothing_evaluated(tmp_path):
     directory = write_run(tmp_path, "empty", [line("S:1", status="skipped")])
     with pytest.raises(ValueError):
         load_jsonl(directory)
+
+
+# ---------------------------------------------------------------------------
+# behavioural probes: motion taxonomy, collisions, coherence
+# ---------------------------------------------------------------------------
+
+
+def btick(index, tick_in_chunk, commanded, achieved=None, contacts=None, chunk_index=0):
+    """A tick built from *body-frame* deltas, which is how the probes read it.
+
+    ``commanded``/``achieved`` are ``[forward, left, dtheta]`` applied from a
+    zero pose, so the probe's own frame composition is exercised rather than
+    bypassed.
+    """
+    achieved = commanded if achieved is None else achieved
+    zero = np.zeros(3)
+
+    def apply(delta):
+        return np.array([delta[0], delta[1], delta[2]], dtype=float)
+
+    return TickRecord(
+        tick=index, chunk_index=chunk_index, tick_in_chunk=tick_in_chunk,
+        setpoint=apply(commanded), previous_setpoint=zero,
+        pose=apply(achieved), previous_pose=zero,
+        sim_time=0.05 * index, contacts=contacts,
+    )
+
+
+def test_motion_taxonomy_separates_frozen_from_turning_in_place():
+    from objectnav_eval.probes import MotionTaxonomy
+
+    probe = MotionTaxonomy(dt=0.05)
+    probe.reset(None)
+    # 0.20 m/s is exactly the DRIVE threshold at dt=0.05 (1 cm/tick).
+    probe.on_tick(btick(1, 0, [0.02, 0.0, 0.0]))          # drive
+    probe.on_tick(btick(2, 1, [0.0, 0.0, 0.05]))          # turn in place
+    probe.on_tick(btick(3, 2, [0.0, 0.0, 0.005]))         # settle (ringing)
+    probe.on_tick(btick(4, 3, [0.0, 0.0, 0.0]))           # frozen
+    out = probe.summary()
+    assert out["frac_drive"] == pytest.approx(0.25)
+    assert out["frac_turn"] == pytest.approx(0.25)
+    assert out["frac_settle"] == pytest.approx(0.25)
+    assert out["frac_frozen"] == pytest.approx(0.25)
+    # The headline "not moving" number is settle+frozen, and explicitly does NOT
+    # swallow the turn-in-place tick: rotating without translating is a
+    # different behaviour from standing still, and merging them has misled this
+    # project before.
+    assert out["frac_stationary"] == pytest.approx(0.5)
+
+
+def test_motion_thresholds_are_speeds_so_dt_does_not_change_their_meaning():
+    from objectnav_eval.probes import MotionTaxonomy
+
+    # The same physical motion -- 0.3 m/s forward -- at two control rates.
+    for dt, step in ((0.05, 0.015), (0.10, 0.030)):
+        probe = MotionTaxonomy(dt=dt)
+        probe.reset(None)
+        probe.on_tick(btick(1, 0, [step, 0.0, 0.0]))
+        assert probe.summary()["frac_drive"] == 1.0
+        assert probe.summary()["median_speed_mps"] == pytest.approx(0.3)
+    # And 0.1 m/s is below the threshold at either rate.
+    for dt, step in ((0.05, 0.005), (0.10, 0.010)):
+        probe = MotionTaxonomy(dt=dt)
+        probe.reset(None)
+        probe.on_tick(btick(1, 0, [step, 0.0, 0.0]))
+        assert probe.summary()["frac_stationary"] == 1.0
+
+
+def test_motion_taxonomy_flags_a_commanded_drive_that_did_not_happen():
+    from objectnav_eval.probes import MotionTaxonomy
+
+    probe = MotionTaxonomy(dt=0.05)
+    probe.reset(None)
+    # Pressed against a wall: the policy asks for 0.4 m/s and gets nothing.
+    for i in range(4):
+        probe.on_tick(btick(i + 1, i, [0.02, 0.0, 0.0], achieved=[0.0, 0.0, 0.0]))
+    out = probe.summary()
+    assert out["commanded_frac_drive"] == 1.0
+    assert out["frac_drive"] == 0.0
+    assert out["blocked_drive_frac"] == 1.0
+    # A stall the taxonomy sees as one continuous run, not four incidents.
+    assert out["stationary_run_max_ticks"] == 4
+
+
+def test_motion_taxonomy_empty_episode_is_not_an_error():
+    from objectnav_eval.probes import MotionTaxonomy
+
+    probe = MotionTaxonomy()
+    probe.reset(None)
+    assert probe.summary() == {"ticks": 0}
+
+
+def test_collision_probe_does_not_count_the_floor_as_a_collision():
+    from objectnav_eval.executor import ContactSnapshot
+    from objectnav_eval.probes import CollisionProbe
+
+    probe = CollisionProbe(dt=0.05)
+    probe.reset(None)
+    # The robot is always standing on something. Two ground points is what a
+    # healthy episode looks like -- the baseline is non-zero, not zero.
+    for i in range(10):
+        probe.on_tick(btick(i + 1, i, [0.02, 0.0, 0.0],
+                            contacts=ContactSnapshot(total=2, ground=2, obstruction=0)))
+    out = probe.summary()
+    assert out["mean_ground_contacts"] == pytest.approx(2.0)
+    assert out["obstructed_frac"] == 0.0
+    assert out["collisions"] == 0
+    assert out["obstructed_while_driving_frac"] == 0.0
+
+
+def test_collision_probe_counts_runs_not_ticks():
+    from objectnav_eval.executor import ContactSnapshot
+    from objectnav_eval.probes import CollisionProbe
+
+    clear = ContactSnapshot(total=2, ground=2, obstruction=0)
+    wall = ContactSnapshot(total=4, ground=2, obstruction=2, max_obstruction_force=17.0)
+    pattern = [clear, wall, wall, wall, clear, clear, wall, clear]
+    probe = CollisionProbe(dt=0.05)
+    probe.reset(None)
+    for i, contacts in enumerate(pattern):
+        probe.on_tick(btick(i + 1, i, [0.02, 0.0, 0.0], contacts=contacts))
+    out = probe.summary()
+    # Leaning on one wall for three ticks is one collision, not three -- else a
+    # single stuck episode dominates every aggregate.
+    assert out["collisions"] == 2
+    assert out["longest_obstructed_run_ticks"] == 3
+    assert out["obstructed_frac"] == pytest.approx(4 / 8)
+    assert out["peak_obstruction_force_max"] == pytest.approx(17.0)
+
+
+def test_collision_probe_is_inert_without_contact_data():
+    from objectnav_eval.probes import CollisionProbe
+
+    probe = CollisionProbe(dt=0.05)
+    probe.reset(None)
+    for i in range(5):
+        probe.on_tick(btick(i + 1, i, [0.02, 0.0, 0.0], contacts=None))
+    # Not "zero collisions" -- "not measured". Reporting 0.0 here would read as
+    # a clean run in the summary.
+    assert probe.summary() == {"ticks": 0, "enabled": False}
+    assert summarize_probe([{"contact": probe.summary()}], "contact", ["collisions"]) == {}
+
+
+def test_contact_normals_split_the_floor_from_a_wall():
+    from objectnav_eval.executor import robot_contacts
+
+    class Point:
+        def __init__(self, a, b, normal, force=1.0):
+            self.object_id_a, self.object_id_b = a, b
+            self.contact_normal_on_b_in_ws = normal
+            self.normal_force = force
+
+    class Sim:
+        def __init__(self, points):
+            self._points = points
+
+        def get_physics_contact_points(self):
+            return self._points
+
+    class RobotSim:
+        def __init__(self, points):
+            self.sim = Sim(points)
+            self.robot = type("R", (), {"object_id": 7})()
+
+    snapshot = robot_contacts(RobotSim([
+        Point(7, 0, [0.0, 1.0, 0.0]),          # standing on the stage
+        Point(0, 7, [0.05, -0.99, 0.05]),      # also floor-ish, robot on side b
+        Point(7, 3, [1.0, 0.0, 0.0], 42.0),    # driven into a wall
+        Point(7, 7, [1.0, 0.0, 0.0]),          # self-collision: not the scene
+        Point(2, 3, [1.0, 0.0, 0.0]),          # nothing to do with the robot
+    ]))
+    assert (snapshot.total, snapshot.ground, snapshot.obstruction) == (3, 2, 1)
+    assert snapshot.max_obstruction_force == pytest.approx(42.0)
+
+
+def test_coherence_counts_reversals_within_a_chunk_not_across_its_boundary():
+    from objectnav_eval.probes import MotionCoherence
+
+    probe = MotionCoherence(dt=0.05)
+    probe.reset(None)
+    # Two chunks of three ticks. Inside each chunk the rotation is committed;
+    # between them it reverses -- which is legitimate, because the policy saw a
+    # new image and re-anchored in between.
+    rotations = [+0.05, +0.05, +0.05, -0.05, -0.05, -0.05]
+    for i, rotation in enumerate(rotations):
+        probe.on_tick(btick(i + 1, i % 3, [0.0, 0.0, rotation], chunk_index=i // 3))
+    out = probe.summary()
+    assert out["flip_rate_within_chunk"] == 0.0
+    assert out["flip_pairs_within_chunk"] == 4
+    # The unconditioned version does see the boundary reversal.
+    assert out["flip_rate_all_adjacent"] == pytest.approx(1 / 5)
+
+
+def test_coherence_separates_a_committed_turn_from_a_wobble():
+    from objectnav_eval.probes import MotionCoherence
+
+    def run(rotations):
+        probe = MotionCoherence(dt=0.05)
+        probe.reset(None)
+        for i, rotation in enumerate(rotations):
+            probe.on_tick(btick(i + 1, i, [0.0, 0.0, rotation]))
+        return probe.summary()
+
+    committed = run([0.05] * 6)
+    wobble = run([0.05, -0.05] * 3)
+    assert committed["flip_rate_within_chunk"] == 0.0
+    assert wobble["flip_rate_within_chunk"] == 1.0
+    # Directness is computed per chunk, so drive it through on_chunk.
+    assert committed["mean_abs_turnrate_degps"] == pytest.approx(
+        wobble["mean_abs_turnrate_degps"]
+    )
+
+
+def test_coherence_rotation_directness_is_net_over_total():
+    from objectnav_eval.executor import ChunkExecution
+    from objectnav_eval.probes import MotionCoherence
+
+    def directness(rotations):
+        probe = MotionCoherence(dt=0.05)
+        probe.reset(None)
+        ticks = [
+            btick(i + 1, i, [0.0, 0.0, r]) for i, r in enumerate(rotations)
+        ]
+        probe.on_chunk(ChunkExecution(
+            chunk_index=0, anchor=np.zeros(3),
+            setpoints=np.zeros((len(ticks), 3)), poses=np.zeros((len(ticks), 3)),
+            ticks=ticks,
+        ))
+        for t in ticks:
+            probe.on_tick(t)
+        return probe.summary()["rotation_directness"]
+
+    assert directness([0.05] * 4) == pytest.approx(1.0)      # a committed turn
+    assert directness([0.05, -0.05] * 2) == pytest.approx(0.0)  # pure wobble
+    assert directness([0.05, 0.05, -0.05, 0.05]) == pytest.approx(0.5)
+
+
+def test_coherence_ignores_rotation_below_the_deadband():
+    from objectnav_eval.probes import MotionCoherence
+
+    probe = MotionCoherence(dt=0.05)
+    probe.reset(None)
+    # 1e-5 rad/tick alternating: numerical drift, not a decision. Asking which
+    # way it pointed is meaningless, so no pair is counted at all.
+    for i in range(8):
+        probe.on_tick(btick(i + 1, i, [0.02, 0.0, 1e-5 * (-1) ** i]))
+    out = probe.summary()
+    assert out["flip_pairs_within_chunk"] == 0
+    assert math.isnan(out["flip_rate_within_chunk"])
+
+
+def test_forward_rotation_correlation_is_negative_for_phase_separated_motion():
+    from objectnav_eval.probes import MotionCoherence
+
+    probe = MotionCoherence(dt=0.05)
+    probe.reset(None)
+    # Real driving alternates between phases: drive straight, then turn in
+    # place. Forward and rotation are then anti-correlated.
+    for i in range(20):
+        if i % 4 < 2:
+            probe.on_tick(btick(i + 1, i, [0.03, 0.0, 0.001]))
+        else:
+            probe.on_tick(btick(i + 1, i, [0.000, 0.0, 0.06]))
+    assert probe.summary()["forward_rotation_corr"] < -0.9
+
+
+def test_probe_summary_averages_over_episodes_and_skips_the_silent_ones():
+    rows = [
+        {"motion": {"ticks": 100, "frac_stationary": 0.10, "frac_drive": 0.6}},
+        {"motion": {"ticks": 900, "frac_stationary": 0.50, "frac_drive": 0.2}},
+        {"motion": {"ticks": 0}},          # never ran
+        {},                                 # probe absent entirely
+    ]
+    out = summarize_probe(rows, "motion", ["frac_stationary", "frac_drive", "absent"])
+    assert out["episodes"] == 2 and out["ticks"] == 1000
+    # Mean over episodes, not pooled over ticks: the 900-tick episode does not
+    # get nine times the vote.
+    assert out["frac_stationary"] == pytest.approx(0.30)
+    assert "absent" not in out
+
+
+def test_episode_line_carries_the_behavioural_fields():
+    record = make_result("A:1")
+    record["motion"] = {"ticks": 10, "frac_stationary": 0.4, "frac_turn": 0.1,
+                        "frac_drive": 0.5}
+    record["contact"] = {"ticks": 10, "obstructed_frac": 0.2, "collisions_per_m": 0.35}
+    record["coherence"] = {"ticks": 10, "flip_rate_within_chunk": 0.42}
+    line = episode_line(record)
+    assert line["frozen_frac"] == 0.4
+    assert line["turn_frac"] == 0.1
+    assert line["obstructed_frac"] == 0.2
+    assert line["flip_rate"] == 0.42
+    # A run without the probes still produces a valid line.
+    bare = episode_line(make_result("A:2"))
+    assert bare["frozen_frac"] is None and bare["flip_rate"] is None
+    json.dumps(line)

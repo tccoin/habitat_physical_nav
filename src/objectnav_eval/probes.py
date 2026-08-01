@@ -26,6 +26,18 @@ displacement was commanded, what was achieved, and how far behind the robot
 ended up. It is a **diagnostic, not a gate** -- oracle replay accumulates PID
 error over a whole trajectory and would understate the loop regardless, so the
 number is here to be read, not to block anything.
+
+The behavioural probes
+----------------------
+Success, SPL and distance say whether the robot got there. They say nothing
+about *how it looked getting there*, and the failure modes that distinguish
+policy heads live there: one head creeps forward without committing, the next
+moves confidently but wiggles, crashes and freezes. Both can score the same
+SPL. :class:`MotionTaxonomy`, :class:`CollisionProbe` and
+:class:`MotionCoherence` make those three observations -- frozen time,
+obstruction, and incoherent motion -- into numbers, so "it looks drunk in the
+video" becomes a quantity that is comparable across every head that runs
+through this suite.
 """
 
 from __future__ import annotations
@@ -36,7 +48,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-from objectnav_eval.executor import ChunkExecution, TickRecord
+from objectnav_eval.executor import ChunkExecution, ContactSnapshot, TickRecord
 
 # Below this, a commanded displacement is noise and the ratio is meaningless.
 _MOVING_EPS_M = 1e-3
@@ -213,5 +225,388 @@ class GoalDistanceProbe(RolloutProbe):
         }
 
 
-def default_probes(keep_series: bool = False) -> List[RolloutProbe]:
-    return [TrackingDiagnostic(keep_series=keep_series)]
+# ---------------------------------------------------------------------------
+# Behavioural probes: what the motion looks like, not whether it succeeded
+# ---------------------------------------------------------------------------
+#
+# The tick taxonomy and its thresholds are *not* new here. They come from
+# ``dump/data_diagnostics/croppability/segment_decomposition.py`` via
+# ``dump/regen_readiness/tick_decomposition.py``, and are the same ones the
+# demonstration corpus is characterised with:
+#
+#   DRIVE   |dxy| >= XY_T                                    (translating)
+#   TURN    |dxy| <  XY_T and |dtheta| >= TH_T               (turning in place)
+#   SETTLE  |dxy| <  XY_T and EPS <= |dtheta| < TH_T         (controller ringing)
+#   FROZEN  |dxy| <  EPS  and |dtheta| < EPS                 (truly idle)
+#
+# with ``XY_T = 0.01 m`` and ``TH_T = 0.02 rad`` **per tick at 20 Hz**. Reusing
+# them verbatim is the point: eval numbers are then directly comparable to the
+# corpus composition table, instead of being a fresh incompatible taxonomy.
+#
+# But they are per-tick *displacements* at one specific rate, so at face value
+# they denote 0.2 m/s at 20 Hz and 0.4 m/s at 10 Hz -- which would silently
+# change what "frozen" means the moment ``--dt`` changes. They are therefore
+# stored here as **speeds** and multiplied back by the run's ``dt``.
+_DRIVE_SPEED_MPS = 0.01 / 0.05  # 0.20 m/s
+_TURN_RATE_RADPS = 0.02 / 0.05  # 0.40 rad/s ~ 23 deg/s
+# The corpus's EPS is 1e-6 per tick: "the generator wrote the same pose twice".
+# A physics rollout never does that -- the base jitters at the solver's noise
+# floor -- so FROZEN is expected to be ~0 in eval and the honest stationary
+# measure is FROZEN + SETTLE. Both are reported; see the docs.
+_EPS_SPEED_MPS = 1e-6 / 0.05
+_EPS_RATE_RADPS = 1e-6 / 0.05
+
+#: A rotation smaller than this is not a direction the policy chose, it is
+#: numerical drift, and asking which way it pointed is meaningless. A quarter of
+#: the TURN threshold: loose enough to include the small deliberate corrections
+#: that a wiggling policy is made of, far above the noise floor.
+_FLIP_DEADBAND_FRAC = 0.25
+
+DRIVE, TURN, SETTLE, FROZEN = "drive", "turn", "settle", "frozen"
+_CLASSES = (DRIVE, TURN, SETTLE, FROZEN)
+
+
+def classify_tick(translation: float, rotation: float, dt: float) -> str:
+    """One tick's motion class, from body-frame |dxy| and |dtheta| over ``dt``."""
+    if translation >= _DRIVE_SPEED_MPS * dt:
+        return DRIVE
+    if rotation >= _TURN_RATE_RADPS * dt:
+        return TURN
+    if translation < _EPS_SPEED_MPS * dt and rotation < _EPS_RATE_RADPS * dt:
+        return FROZEN
+    return SETTLE
+
+
+def _run_lengths(mask: List[bool]) -> List[int]:
+    """Lengths of the maximal runs of ``True`` in ``mask``."""
+    out: List[int] = []
+    start: Optional[int] = None
+    for index, value in enumerate(mask):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            out.append(index - start)
+            start = None
+    if start is not None:
+        out.append(len(mask) - start)
+    return out
+
+
+@dataclass
+class MotionTaxonomy(RolloutProbe):
+    """How the robot spent its time: driving, turning in place, settling, frozen.
+
+    Answers "what share of control ticks is the robot effectively not moving",
+    and answers it without conflating *frozen* (going nowhere) with *turning in
+    place* (going nowhere while acquiring a new view) -- behaviourally opposite
+    things that a single "displacement below threshold" test merges, which has
+    caused confusion in this project before.
+
+    Everything is computed twice: on the **commanded** setpoints (what the
+    policy asked for) and on the **achieved** poses (what the robot did). The
+    gap between them is the interesting part -- a tick that commanded DRIVE and
+    achieved FROZEN is the robot being blocked, not the policy standing still.
+
+    Free: pure arithmetic on the ``TickRecord`` the executor already emits.
+    """
+
+    name: str = "motion"
+    dt: float = 0.05
+
+    commanded_class: List[str] = field(default_factory=list)
+    achieved_class: List[str] = field(default_factory=list)
+    achieved_speed: List[float] = field(default_factory=list)
+    achieved_rate: List[float] = field(default_factory=list)
+
+    def reset(self, episode: Any = None) -> None:
+        self.commanded_class, self.achieved_class = [], []
+        self.achieved_speed, self.achieved_rate = [], []
+
+    def on_tick(self, record: TickRecord) -> None:
+        commanded = record.commanded_body_delta()
+        achieved = record.achieved_body_delta()
+        commanded_xy = float(math.hypot(commanded[0], commanded[1]))
+        achieved_xy = float(math.hypot(achieved[0], achieved[1]))
+        self.commanded_class.append(
+            classify_tick(commanded_xy, abs(float(commanded[2])), self.dt)
+        )
+        self.achieved_class.append(
+            classify_tick(achieved_xy, abs(float(achieved[2])), self.dt)
+        )
+        self.achieved_speed.append(achieved_xy / self.dt)
+        self.achieved_rate.append(abs(float(achieved[2])) / self.dt)
+
+    def summary(self) -> Dict[str, Any]:
+        ticks = len(self.achieved_class)
+        if ticks == 0:
+            return {"ticks": 0}
+        out: Dict[str, Any] = {
+            "ticks": ticks,
+            "dt_s": self.dt,
+            "drive_threshold_mps": _DRIVE_SPEED_MPS,
+            "turn_threshold_radps": _TURN_RATE_RADPS,
+        }
+        for label, classes in (("", self.achieved_class),
+                               ("commanded_", self.commanded_class)):
+            for name in _CLASSES:
+                out[f"{label}frac_{name}"] = classes.count(name) / ticks
+            # The headline "not moving" number: neither translating nor
+            # rotating enough to count as either. Identical by construction to
+            # ``frac_stationary`` in analyze_chunk_motion.py, so it can be read
+            # straight against the corpus.
+            out[f"{label}frac_stationary"] = (
+                classes.count(SETTLE) + classes.count(FROZEN)
+            ) / ticks
+        stationary = [c in (SETTLE, FROZEN) for c in self.achieved_class]
+        runs = _run_lengths(stationary)
+        if runs:
+            out["stationary_runs"] = len(runs)
+            out["stationary_run_median_ticks"] = float(np.median(runs))
+            out["stationary_run_max_ticks"] = int(max(runs))
+            out["stationary_run_max_s"] = float(max(runs) * self.dt)
+            # Is the stillness spread thinly (a slightly slow policy) or lumped
+            # into long stalls (the "significant frozen time" the videos show)?
+            out["stationary_share_in_runs_ge_10"] = float(
+                sum(r for r in runs if r >= 10) / max(1, sum(runs))
+            )
+        # Commanded a real move and did not get one: the blocked-motion signal
+        # the tracking diagnostic's undershoot cannot separate from PID lag.
+        commanded_drive = [c == DRIVE for c in self.commanded_class]
+        n_commanded_drive = sum(commanded_drive)
+        if n_commanded_drive:
+            out["commanded_drive_ticks"] = n_commanded_drive
+            out["blocked_drive_frac"] = sum(
+                1
+                for commanded, achieved in zip(self.commanded_class, self.achieved_class)
+                if commanded == DRIVE and achieved != DRIVE
+            ) / n_commanded_drive
+        out["median_speed_mps"] = float(np.median(self.achieved_speed))
+        out["p90_speed_mps"] = float(np.percentile(self.achieved_speed, 90))
+        out["median_turnrate_degps"] = float(np.degrees(np.median(self.achieved_rate)))
+        return out
+
+
+@dataclass
+class CollisionProbe(RolloutProbe):
+    """How often the robot is jammed against scene geometry while trying to drive.
+
+    The trap this is built around: **the robot is always in contact with the
+    floor**, so a contact count is not a collision measure.
+    ``executor.robot_contacts`` splits ground from obstruction on the contact
+    normal before this ever sees it, and a healthy episode still has a non-zero
+    ground count (~2 contact points; see
+    ``dump/drive_failure_detection/FINDINGS.md``).
+
+    That findings document *rejected* contact-based signals for escape
+    detection, because that had to be bulletproof enough to accept or reject
+    episodes. This is a descriptive diagnostic that gates nothing, so a
+    reasonable contact measure is the right tool -- with its limits stated:
+    an instantaneous end-of-tick sample, a 45-degree normal split that
+    misreads steep ramps, and no notion of how hard the robot is pushing
+    beyond the peak normal force.
+
+    Inert unless the executor was built with ``collect_contacts=True``.
+    """
+
+    name: str = "contact"
+    dt: float = 0.05
+
+    obstructed: List[bool] = field(default_factory=list)
+    commanded_drive: List[bool] = field(default_factory=list)
+    ground: List[int] = field(default_factory=list)
+    obstruction: List[int] = field(default_factory=list)
+    peak_force: List[float] = field(default_factory=list)
+    distance_m: float = 0.0
+
+    def reset(self, episode: Any = None) -> None:
+        self.obstructed, self.commanded_drive = [], []
+        self.ground, self.obstruction, self.peak_force = [], [], []
+        self.distance_m = 0.0
+
+    def on_tick(self, record: TickRecord) -> None:
+        if record.contacts is None:
+            return
+        commanded = record.commanded_body_delta()
+        self.commanded_drive.append(
+            classify_tick(
+                float(math.hypot(commanded[0], commanded[1])),
+                abs(float(commanded[2])),
+                self.dt,
+            )
+            == DRIVE
+        )
+        self.obstructed.append(record.contacts.obstruction > 0)
+        self.ground.append(record.contacts.ground)
+        self.obstruction.append(record.contacts.obstruction)
+        self.peak_force.append(record.contacts.max_obstruction_force)
+        self.distance_m += record.achieved_displacement
+
+    def summary(self) -> Dict[str, Any]:
+        ticks = len(self.obstructed)
+        if ticks == 0:
+            return {"ticks": 0, "enabled": False}
+        runs = _run_lengths(self.obstructed)
+        out: Dict[str, Any] = {
+            "ticks": ticks,
+            "enabled": True,
+            "mean_ground_contacts": float(np.mean(self.ground)),
+            "mean_obstruction_contacts": float(np.mean(self.obstruction)),
+            "obstructed_frac": sum(self.obstructed) / ticks,
+            # Maximal runs, not ticks: leaning on one wall for 200 ticks is one
+            # collision, and counting ticks would make a single stuck episode
+            # dominate every aggregate.
+            "collisions": len(runs),
+            "collisions_per_100_ticks": 100.0 * len(runs) / ticks,
+            "longest_obstructed_run_ticks": int(max(runs)) if runs else 0,
+            "peak_obstruction_force_max": float(max(self.peak_force)),
+            "distance_m": float(self.distance_m),
+        }
+        if self.distance_m > 1e-6:
+            out["collisions_per_m"] = len(runs) / self.distance_m
+        driving = sum(self.commanded_drive)
+        if driving:
+            # The number the question actually asks for: of the ticks where the
+            # policy was trying to go somewhere, how many were spent in contact
+            # with something other than the floor.
+            out["driving_ticks"] = driving
+            out["obstructed_while_driving_frac"] = sum(
+                1 for o, d in zip(self.obstructed, self.commanded_drive) if o and d
+            ) / driving
+        return out
+
+
+@dataclass
+class MotionCoherence(RolloutProbe):
+    """Is the commanded trajectory a sequence, or a pile of independent samples?
+
+    The bin head models each of its 30 output slots (10 ticks x 3 channels) as
+    fully independent. Every individual tick is then plausible while the
+    *sequence* need not be: consecutive ticks are uncorrelated, and within a
+    tick forward speed and rotation are drawn independently despite being
+    strongly anti-correlated in real driving. "Drunken" is what that looks like
+    from outside, and these are its two measurable signatures.
+
+    **Rotation sign-flip rate.** Of the adjacent tick pairs where both ticks
+    genuinely rotate, how often does the commanded direction reverse. Reported
+    *within chunk* as the headline: across a chunk boundary the policy has seen
+    a new image and re-anchored, so changing its mind there is legitimate --
+    within a chunk it is one forward pass contradicting itself.
+
+    **Rotation directness.** Per chunk, ``|sum dtheta| / sum |dtheta|``. 1.0 is
+    a committed turn; near 0 is rotation that cancels itself out and buys no
+    heading change.
+
+    **Forward/rotation correlation.** ``corr(|forward|, |dtheta|)`` over ticks.
+    Real driving is nearly always in a drive phase or a turn phase, so this is
+    negative; independent per-slot sampling drives it towards zero.
+
+    Free: arithmetic on ``TickRecord``s.
+    """
+
+    name: str = "coherence"
+    dt: float = 0.05
+
+    commanded_rotation: List[float] = field(default_factory=list)
+    achieved_rotation: List[float] = field(default_factory=list)
+    commanded_forward: List[float] = field(default_factory=list)
+    tick_in_chunk: List[int] = field(default_factory=list)
+    chunk_directness: List[float] = field(default_factory=list)
+
+    def reset(self, episode: Any = None) -> None:
+        self.commanded_rotation, self.achieved_rotation = [], []
+        self.commanded_forward = []
+        self.tick_in_chunk = []
+        self.chunk_directness = []
+
+    def on_tick(self, record: TickRecord) -> None:
+        commanded = record.commanded_body_delta()
+        self.commanded_rotation.append(float(commanded[2]))
+        self.commanded_forward.append(abs(float(commanded[0])))
+        self.achieved_rotation.append(float(record.achieved_body_delta()[2]))
+        self.tick_in_chunk.append(int(record.tick_in_chunk))
+
+    def on_chunk(self, execution: ChunkExecution) -> None:
+        rotations = [
+            float(tick.commanded_body_delta()[2]) for tick in execution.ticks
+        ]
+        total = sum(abs(r) for r in rotations)
+        if total > _MOVING_EPS_RAD:
+            self.chunk_directness.append(abs(sum(rotations)) / total)
+
+    # ------------------------------------------------------------------
+    def _flip_rate(
+        self, rotations: List[float], deadband: float, within_chunk: bool
+    ) -> Dict[str, Any]:
+        pairs = flips = 0
+        for index in range(1, len(rotations)):
+            if within_chunk and self.tick_in_chunk[index] == 0:
+                continue  # a chunk boundary: the policy has re-observed
+            before, after = rotations[index - 1], rotations[index]
+            if abs(before) < deadband or abs(after) < deadband:
+                continue
+            pairs += 1
+            if before * after < 0:
+                flips += 1
+        return {"pairs": pairs, "flips": flips,
+                "rate": (flips / pairs) if pairs else float("nan")}
+
+    def summary(self) -> Dict[str, Any]:
+        ticks = len(self.commanded_rotation)
+        if ticks == 0:
+            return {"ticks": 0}
+        loose = _FLIP_DEADBAND_FRAC * _TURN_RATE_RADPS * self.dt
+        strict = _TURN_RATE_RADPS * self.dt
+        out: Dict[str, Any] = {
+            "ticks": ticks,
+            "flip_deadband_radps": _FLIP_DEADBAND_FRAC * _TURN_RATE_RADPS,
+        }
+        for label, rotations in (("", self.commanded_rotation),
+                                 ("achieved_", self.achieved_rotation)):
+            for suffix, within in (("within_chunk", True), ("all_adjacent", False)):
+                stats = self._flip_rate(rotations, loose, within)
+                out[f"{label}flip_rate_{suffix}"] = stats["rate"]
+                out[f"{label}flip_pairs_{suffix}"] = stats["pairs"]
+        # Same statistic restricted to ticks that clear the full TURN threshold:
+        # a stricter read that cannot be inflated by near-deadband jitter.
+        strict_stats = self._flip_rate(self.commanded_rotation, strict, True)
+        out["flip_rate_within_chunk_turning"] = strict_stats["rate"]
+        out["flip_pairs_within_chunk_turning"] = strict_stats["pairs"]
+        if self.chunk_directness:
+            out["rotation_directness"] = float(np.mean(self.chunk_directness))
+            out["rotation_directness_median"] = float(np.median(self.chunk_directness))
+        out["forward_rotation_corr"] = _corr(
+            self.commanded_forward, [abs(r) for r in self.commanded_rotation]
+        )
+        out["mean_abs_turnrate_degps"] = float(
+            np.degrees(np.mean(np.abs(self.commanded_rotation))) / self.dt
+        )
+        return out
+
+
+def _corr(a: List[float], b: List[float]) -> float:
+    """Pearson correlation, ``nan`` when either side is constant."""
+    if len(a) < 2:
+        return float("nan")
+    x, y = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+    if not (np.std(x) > 0 and np.std(y) > 0):
+        return float("nan")
+    return float(np.corrcoef(x, y)[0, 1])
+
+
+def default_probes(
+    keep_series: bool = False, dt: float = 0.05, collect_contacts: bool = False
+) -> List[RolloutProbe]:
+    """The diagnostics every episode carries.
+
+    The motion taxonomy and the coherence probe are on unconditionally: both are
+    a few floating-point operations per tick on data the executor already
+    produced, and measured against a rollout they are indistinguishable from
+    zero (see docs/OBJECTNAV_EVAL.md). The collision probe is the one that costs
+    simulator time, and it is gated on ``collect_contacts``.
+    """
+    return [
+        TrackingDiagnostic(keep_series=keep_series),
+        MotionTaxonomy(dt=dt),
+        CollisionProbe(dt=dt),
+        MotionCoherence(dt=dt),
+    ]

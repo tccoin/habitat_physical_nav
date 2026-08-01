@@ -67,11 +67,16 @@ def _build_runner(robot_sim, scene_id: str, config: Any, policy) -> EpisodeRunne
                 PIDPoseController(robot_sim, PIDPoseControllerConfig()),
                 dt=config.dt,
                 gap=config.gap,
+                collect_contacts=config.collision_probe,
             ),
             policy=policy,
             config=config,
             output_dir=Path(config.output_dir),
-            probes=default_probes(config.keep_tracking_series),
+            probes=default_probes(
+                config.keep_tracking_series,
+                dt=config.dt,
+                collect_contacts=config.collision_probe,
+            ),
         )
     )
 

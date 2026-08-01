@@ -86,6 +86,11 @@ class EvalConfig:
 
     # -- diagnostics --------------------------------------------------------
     keep_tracking_series: bool = False
+    # The motion-taxonomy and coherence probes are unconditional: they are a few
+    # floating-point operations on ticks the executor already emits. The
+    # collision probe is the one that costs *simulator* time -- it samples the
+    # physics contact manifold once per control tick -- so it gets a switch.
+    collision_probe: bool = True
 
     # -- parallelism --------------------------------------------------------
     gpus: Optional[str] = None
@@ -239,6 +244,11 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     diag.add_argument("--keep-tracking-series", action="store_true",
                       help="store the per-tick commanded/achieved/lag series in each "
                            "episode record (large; the summary statistics usually suffice)")
+    diag.add_argument("--no-collision-probe", dest="collision_probe",
+                      action="store_false",
+                      help="skip the per-tick physics contact sample. The collision "
+                           "diagnostic ('contact' in each record) then reports nothing; "
+                           "the motion and coherence diagnostics are unaffected")
 
     par = parser.add_argument_group("parallelism")
     par.add_argument("--gpus", default=None,

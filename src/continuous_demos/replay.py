@@ -153,10 +153,20 @@ def _build_phases(num_actions, looking_slices):
 
     ``looking_slices`` are ``[start, end)`` half-open ranges in ACTION-index space
     (ascending, non-overlapping, as returned by
-    ``replay_human_demo.find_looking_slices``). Every gap between them -- plus the
-    head and tail -- becomes a ``move`` phase. Returns a list of
+    ``episode_io.find_looking_slices``). Every gap between them -- plus the head
+    and tail -- becomes a ``move`` phase. Returns a list of
     ``(kind, start, end)`` tuples, ``kind in {'move', 'look'}``, that exactly
     covers ``[0, num_actions)`` in order.
+
+    Note that a move phase's reference sub-path can be degenerate: the demos
+    contain MOVE_FORWARDs the collection-time agent could not execute (it walked
+    into geometry), which leave the recorded position unchanged, and 3.9% of move
+    phases are shorter than 1 cm end to end (measured over 6,950 episodes,
+    ``dump/rotation_segmentation/FINDINGS.md``). These are harmless: densify_path
+    drops the duplicate points, the path controller finds itself inside
+    ``goal_tolerance_dist`` immediately, and the phase ends after one tick. They
+    are deliberately not filtered here -- doing so would cost a code path to save
+    roughly a quarter of a tick per episode.
     """
     phases = []
     cursor = 0

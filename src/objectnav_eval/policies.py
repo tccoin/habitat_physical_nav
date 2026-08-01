@@ -230,6 +230,8 @@ def build_policy(config: Any, server_script: str, log_path: Optional[str] = None
     }
     if config.placeholder:
         backend_args["placeholder"] = config.placeholder
+    if config.policy_sys_path:
+        backend_args["sys_path"] = config.policy_sys_path
 
     if config.policy_python:
         from objectnav_eval.bridge import PolicyBridge

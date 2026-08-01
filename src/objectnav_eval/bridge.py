@@ -219,13 +219,54 @@ class PolicyBridge:
         self._log = open(self.log_path, "w")
         self.process = subprocess.Popen(command, stdout=self._log, stderr=subprocess.STDOUT)
         try:
-            self.conn = listener.accept()
+            self.conn = self._accept(listener)
         except BaseException:
             self.process.kill()
             raise
         finally:
             listener.close()
         print("[bridge] policy server connected", flush=True)
+
+    def _accept(self, listener):
+        """``listener.accept()``, but noticing if the server dies first.
+
+        A bare ``accept()`` blocks forever when the model-side interpreter
+        crashes on startup (a missing import, a checkpoint it cannot load), and
+        the run then hangs with no output at all. Accepting on a thread lets the
+        main thread poll the subprocess and turn that into the real error, with
+        the server's traceback attached.
+        """
+        import threading
+
+        outcome: Dict[str, Any] = {}
+
+        def _run() -> None:
+            try:
+                outcome["conn"] = listener.accept()
+            except BaseException as exc:  # noqa: BLE001 - reported below
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        while True:
+            thread.join(1.0)
+            if not thread.is_alive():
+                break
+            code = self.process.poll()
+            if code is not None:
+                tail = ""
+                try:
+                    self._log.flush()
+                    tail = Path(self.log_path).read_text()[-3000:]
+                except OSError:
+                    pass
+                raise RuntimeError(
+                    f"policy server exited with code {code} before connecting; "
+                    f"see {self.log_path}\n{tail}"
+                )
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["conn"]
 
     def _rpc(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         try:

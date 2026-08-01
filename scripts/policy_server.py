@@ -37,7 +37,18 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max-context-tokens", type=int, default=0)
     parser.add_argument("--placeholder", default=None)
+    parser.add_argument("--sys-path", default=None,
+                        help="colon-separated paths to prepend to sys.path before "
+                             "loading the backend -- the checkout the checkpoint's code "
+                             "lives in, which this environment need not have installed")
     args = parser.parse_args()
+
+    for entry in reversed((args.sys_path or "").split(":")):
+        # Prepended, not appended: a same-named namespace package from another
+        # checkout may already be importable, and it would shadow the intended
+        # one as a *missing submodule*, which is a confusing way to fail.
+        if entry and entry not in sys.path:
+            sys.path.insert(0, entry)
 
     print(f"loading {args.ckpt} on {args.device} (backend {args.backend})...", flush=True)
     backend = build_backend(

@@ -66,6 +66,12 @@ class EvalConfig:
     max_context_tokens: int = 110000
     placeholder: Optional[str] = None
     policy_python: Optional[str] = None
+    # Colon-separated paths prepended to sys.path *in the model interpreter*.
+    # The checkpoint's own code usually lives in a source checkout that the
+    # model env does not have installed -- and may have a same-named namespace
+    # package from a different checkout ahead of it, which fails as a missing
+    # submodule rather than a missing package.
+    policy_sys_path: Optional[str] = None
     control_chunk_len: int = 10
     control_speed: float = 1.0
 
@@ -198,6 +204,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     mdl.add_argument("--policy-python", default=os.environ.get("VECTOR_POLICY_PYTHON"),
                      help="interpreter that can load the checkpoint, when this env cannot. "
                           "Defaults to $VECTOR_POLICY_PYTHON")
+    mdl.add_argument("--policy-sys-path", default=os.environ.get("VECTOR_POLICY_SYS_PATH"),
+                     help="colon-separated paths prepended to sys.path in the model "
+                          "interpreter, e.g. the src/ of the checkout the checkpoint's "
+                          "code lives in. Defaults to $VECTOR_POLICY_SYS_PATH")
     mdl.add_argument("--control-chunk-len", type=int, default=10)
     mdl.add_argument("--control-speed", type=float, default=1.0,
                      help="m/s for the 'forward' control")

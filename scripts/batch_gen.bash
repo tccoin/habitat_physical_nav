@@ -29,15 +29,22 @@ IMAGE_EXT="jpeg"
 # ==========================================
 # Paths
 # ==========================================
+# Resolve everything from this script's own location. Previously TARGET_SCRIPT
+# was relative to scripts/ while OUTPUT_DIR was relative to the repo root, so the
+# script only worked from scripts/ and silently wrote its corpus into
+# scripts/output_25hz -- and running it from the repo root failed outright.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+
 export PYTHON_BIN="/workspace/conda/envs/vln/bin/python3"
-export TARGET_SCRIPT="generate_pose2d_dataset.py"
+export TARGET_SCRIPT="$SCRIPT_DIR/generate_pose2d_dataset.py"
 export INPUT_DIR="/Projects/continuous_demos/habitat-web/objectnav/objectnav_mp3d_thda_70k/train/content"
 # The 30 Hz pre-schema corpus lives in output/. Generation appends, and the
 # generator now refuses to append records to a shard recorded at a different
 # rate (or to a pre-schema shard, which carries no rate at all), so a
 # regeneration must write somewhere fresh -- hence the new default. Set
 # OUTPUT_DIR in the environment to resume a run in progress.
-export OUTPUT_DIR="${OUTPUT_DIR:-output_25hz}"
+export OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/output_25hz}"
 export LOGS_DIR="$OUTPUT_DIR/logs"
 
 # Export variables needed by the xargs subshell

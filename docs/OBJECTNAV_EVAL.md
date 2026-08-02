@@ -449,6 +449,32 @@ ticks):
 A human-driven demonstration essentially never reverses its turn direction
 mid-chunk. That is the bar.
 
+### What they resolve that the headline metrics do not
+
+The bin head's two decode rules, checkpoint-7250, same 45 HM3D episodes, paired
+(`scripts/compare_policies.py --behaviour`):
+
+| metric | mean | sample | Δ | 95% CI | MDE |
+| --- | --- | --- | --- | --- | --- |
+| **flip_rate** | 0.000 | 0.114 | **+0.114** | **[+0.105, +0.123]** | 0.013 |
+| frozen_frac | 0.558 | 0.497 | −0.061 | [−0.115, −0.010] | 0.076 |
+| obstructed_frac | 0.380 | 0.287 | −0.093 | [−0.173, −0.016] | 0.112 |
+| success | 0.156 | 0.200 | +0.044 | [−0.111, +0.200] | 0.233 |
+| spl | 0.078 | 0.070 | −0.007 | [−0.088, +0.075] | 0.118 |
+
+Success cannot tell these two apart at this episode count — the difference is a
+fifth of the minimum detectable effect. The sign-flip rate separates them by
+**8.6× the MDE**, and says *why*: sampling 30 independent slots produces a chunk
+that contradicts itself, while taking their mean produces one that is smooth by
+construction (0.000, below even the demonstrations).
+
+Reading them honestly also means reporting where they disagree with the
+impression that motivated them: mean decode turns out to freeze **more** than
+sample (0.558 vs 0.497 stationary, longest stall 9.6 s vs 3.4 s), and to spend
+more of its time in contact, in longer episodes of it. Sample collides more
+*often* (12.2 vs 8.0 events per episode) but is stuck for less of the run. Full
+write-up in `/Projects/spatial_training/dump/eval_system/FINDINGS.md` §6.
+
 ---
 
 ## Reference: the knobs that change what is measured

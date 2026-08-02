@@ -48,6 +48,15 @@ import numpy as np
 # success and SPL both saturate at zero for most episodes.
 BINARY_METRICS = ("success", "oracle_success")
 CONTINUOUS_METRICS = ("spl", "oracle_spl", "progress_m", "min_m", "final_m", "path_m")
+# The behavioural diagnostics, compared the same way. They are the ones most
+# likely to separate two heads that score indistinguishably on the outcome
+# metrics -- and they need the pairing and the MDE just as much, because "this
+# policy freezes more" is exactly the kind of claim that gets made from two
+# means and no interval.
+BEHAVIOUR_METRICS = (
+    "frozen_frac", "turn_frac", "drive_frac",
+    "obstructed_frac", "collisions_per_m", "flip_rate",
+)
 
 Z_ALPHA_TWO_SIDED_95 = 1.959963984540054
 Z_POWER_80 = 0.8416212335729143
@@ -254,7 +263,7 @@ class MetricComparison:
 def compare_runs(
     run_a: Dict[str, Dict[str, Any]],
     run_b: Dict[str, Dict[str, Any]],
-    metrics: Sequence[str] = BINARY_METRICS + CONTINUOUS_METRICS,
+    metrics: Sequence[str] = BINARY_METRICS + CONTINUOUS_METRICS + BEHAVIOUR_METRICS,
     seed: int = 0,
 ) -> List[MetricComparison]:
     """Per-metric paired comparison of ``b`` against ``a`` on their shared episodes."""
@@ -336,7 +345,7 @@ def rate_table(run: Dict[str, Dict[str, Any]], uids: Optional[Sequence[str]] = N
             out[metric] = successes / len(values)
             out[f"{metric}_ci"] = wilson_interval(successes, len(values))
             out[f"{metric}_n"] = len(values)
-    for metric in CONTINUOUS_METRICS:
+    for metric in CONTINUOUS_METRICS + BEHAVIOUR_METRICS:
         values = [float(r[metric]) for r in rows if _finite(r.get(metric))]
         if values:
             out[metric] = float(np.mean(values))

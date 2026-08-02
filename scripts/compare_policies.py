@@ -29,6 +29,7 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from objectnav_eval.compare import (  # noqa: E402
+    BEHAVIOUR_METRICS,
     BINARY_METRICS,
     CONTINUOUS_METRICS,
     common_uids,
@@ -62,7 +63,15 @@ def main() -> None:
     parser.add_argument("--json", default=None, help="also write the comparison as JSON")
     parser.add_argument("--metrics", nargs="*",
                         default=list(BINARY_METRICS) + list(CONTINUOUS_METRICS))
+    parser.add_argument("--behaviour", action="store_true",
+                        help="also compare the behavioural diagnostics (frozen time, "
+                             "obstruction, rotation sign-flip rate). They are what "
+                             "separate two heads that score the same on the outcome "
+                             "metrics, and they need the pairing and the MDE just as "
+                             "much")
     args = parser.parse_args()
+    if args.behaviour:
+        args.metrics = list(args.metrics) + list(BEHAVIOUR_METRICS)
 
     paths = [args.baseline] + list(args.runs)
     names = args.names or [Path(p).name for p in paths]

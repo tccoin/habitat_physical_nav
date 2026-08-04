@@ -31,6 +31,15 @@ python scripts/eval_objectnav_policy.py \
     --output-dir dump/eval_ckpt2500 --max-steps 200 --record-video \
     --gpus 4,5,6,7 --policy-python /workspace/conda/envs/longnav_vlm/bin/python
 
+# 3b. A non-regression head: pick the backend, and (optionally) its decode rule.
+python scripts/eval_objectnav_policy.py \
+    --policy-backend ar_rollout --policy-decode sample --policy-seed 0 \
+    --ckpt dump/autoregressive_head/run_vq256_ga8/checkpoint-225 \
+    --episodes .../val_mini --scene-root .../scene_datasets \
+    --output-dir dump/eval_ar225 --max-steps 200 --gpus 4,5,6,7 \
+    --policy-python /workspace/conda/envs/longnav_vlm/bin/python \
+    --policy-sys-path /Projects/spatial_training/src
+
 # 4. Recover the summary of a partial or crashed run, without re-running it.
 python scripts/eval_objectnav_policy.py --report dump/eval_ckpt2500/shards
 
@@ -99,13 +108,107 @@ contracts are that `uid` is unique across the whole return value and
 `view_points` is an `(N, 3)` array in the habitat world frame.
 
 **A new policy head type** (e.g. a normalizing-flow head). Implement
-`bridge.PolicyBackend` — `reset`, `act(rgb) -> (T, 3)`, optionally
+`bridge.PolicyBackend` — `reset`, `act(rgb, pose=None) -> (T, 3)`, optionally
 `wants_stop()` — and `register_backend("flow", loader)`. Run with
 `--policy-backend flow`. Nothing on the simulator side changes, because the
 wire format does not. Head-specific outputs (log-probs, sample sets) ride in
 `ActionChunk.extra` and land in the episode record without widening the
 interface. A head with a termination output sets `ActionChunk.stop` and the
 runner ends the episode there — `success` then means what it means in habitat.
+
+Registered today:
+
+| `--policy-backend` | head | `--policy-decode` |
+| --- | --- | --- |
+| `vector_rollout` (default) | turn-vector regression (`longnav.utils.vector_rollout`) | n/a — not distributional |
+| `bin_rollout` | discrete bins, one categorical per (tick, dimension) (`longnav.utils.bin_rollout`) | `argmax` (default) / `sample` / `mean` |
+| `ar_rollout` | autoregressive over ticks: one joint VQ code per tick, decoded sequentially through a small causal transformer (`longnav.utils.ar_action_head`) | `sample` (default) / `argmax` / `mean` |
+
+All three reach the simulator through `VectorRolloutPolicy` unmodified, because
+each head's `normalizer` slot already answers `denormalize(...) -> (T, 3)`. The
+backend's whole job is loading the right model class, fixing the decode rule and
+seeding the per-episode sampling stream — which is why a new head of this family
+is ~40 lines here and nothing anywhere else.
+
+Two things about `ar_rollout` fail *silently* if copied from `bin_rollout`. Its
+decode rule lives on the **normalizer** (`model.normalizer.decode`), not on
+`model.codec`: for this head `model.codec` is the `ChunkVQCodec` lookup table
+*inside* the `ARActionCodec`, so writing `model.codec.decode` sets an attribute
+nothing reads and the head decodes under its own default instead. And its
+`"context"` decode is the offline passthrough
+`dump/autoregressive_head/predict_ar.py` uses, returning the raw context vector
+rather than a chunk; the backend rejects it instead of sending a
+`(context_dim,)` array down the wire as an action. `"mean"` is accepted but is
+computed from a greedy-decoded prefix — the head's own docs call it
+reporting-only, not a deployable rule, and it is here for the same
+control-within-the-control the bin head kept it for.
+
+**A checkpoint that reads more than the image, or that can stop.** Neither is a
+new backend. Both are *properties of the checkpoint*, so both are switched on by
+reading it — see [Pose injection and the stop
+head](POSE_INJECTION_EVAL.md) for the full writeup.
+
+* **Pose.** `bridge._PoseFeed` looks for a modality spec declaring the
+  `pose_relative_first` transform. When one is there, every `act()` passes the
+  agent's **raw** planar `[X, Y, theta]` (straight from `get_2d_pose()`) as
+  `step(obs_pose=...)`, and the model's own `relative_se2` converts it — the
+  same function the training collator calls, never a copy of it. There is no
+  flag: a flag could disagree with the weights. Checkpoints without such a spec
+  take the identical code path they always did.
+* **Stop.** `bridge._StopHeadControl` finds `model.stop_head`. The stop
+  probability and its logit are recorded every step regardless; `--stop-head` is
+  what lets the decision actually end an episode. It is mutually exclusive with
+  `--auto-stop` (the config raises), because with both, an episode ends at
+  whichever fired first and neither can be read on its own.
+
+#### The AR decoder's architecture is not fixed, and the eval log has to say which one ran
+
+`CausalActionDecoder` carries four options that all default OFF, so a checkpoint
+written before any of them existed loads under the new code unchanged:
+
+| option | default | what it changes |
+| --- | --- | --- |
+| `n_context_tokens` | `1` | the context vector is split into this many transformer prefix tokens, lifting the hard `d_model` ceiling on how much context reaches the decoder |
+| `use_prefix_pose` | `False` | each tick additionally receives a 7-dim state `[x, y, cosθ, sinθ, dx_prev, dy_prev, dθ_prev]`, composed from the prefix's own decoded codes |
+| `attn_mode` | `"causal"` | `"markov"` restricts each tick to the context slots plus itself, making history-based heuristics structurally impossible |
+| `direct_context` | `False` | drops `context_proj`; the readout MLP's output reshapes straight into prefix tokens |
+
+**`ar_rollout` needs no change for any of them, and this is not luck.** The
+backend only ever calls `TurnARActionClassifier.from_pretrained` (which rebuilds
+the decoder from the checkpoint's own `ar_decoder_kwargs`) and sets
+`normalizer.decode`; it never constructs a decoder, never reads `context_proj` —
+which `direct_context=True` sets to `None` — and never touches the attention
+mask. The one option with an external requirement, `use_prefix_pose`, needs
+`centroids` passed into `decoder.forward()`/`decoder.decode()`, and
+`ARActionCodec.denormalize` already supplies them on both the sequential and the
+`"mean"` path. All of it verified end to end: every decode rule against a real
+`n_context_tokens=8, use_prefix_pose=True` checkpoint and against the previous
+architecture, plus synthetic checkpoints for `markov` and `direct_context`, which
+no trained run reaches yet.
+
+One thing that got *looser* rather than broken: `"mean"` with `use_prefix_pose=True`
+is now a double approximation. It was already the probability-weighted centroid
+given a greedy prefix; the pose/velocity features it conditions on are now also
+composed from those greedy codes, while the chunk it returns corresponds to no
+code sequence at all. It runs and it is finite, but it is even further from a
+deployable rule than before — which does not change how it should be used, since
+it was already reporting-only.
+
+What *did* need adding is the record of which one ran. `n_codes` and `n_ticks` are
+identical across these runs, so `describe()` — the only architecture statement in
+an eval run's output, printed once into
+`<output-dir>/logs/policy_shard<N>.log` — now prints the decoder config as well:
+
+```
+  [ar decode=sample seed_base=1000 n_codes=1024 n_ticks=10]
+  [ar decoder d_model=128 n_layers=4 n_heads=4 n_context_tokens=8 use_prefix_pose=True attn_mode=causal direct_context=False]
+```
+
+It reads `CausalActionDecoder.to_config()` — the same dict `save_pretrained`
+stores and `from_pretrained` rebuilds from — rather than restating the CLI flags,
+so it reports the architecture that actually loaded. Missing keys are printed at
+their defaults on purpose: a pre-option checkpoint stores nothing for them, and a
+line that silently shortens is not comparable by eye to one that does not.
 
 **A new metric.** Write a habitat `Measure` subclass (see `OracleSuccess` in
 `continuous_demos/objectnav.py` for the pattern) and pass it in
@@ -120,8 +223,8 @@ cannot perturb a run. A diagnostic that genuinely needs to *query* the simulator
 (the collision probe does) has the executor sample it and hand the result over
 on the `TickRecord`, which keeps that rule intact.
 
-Because every head runs through this one suite — `vector_rollout`, `bin_rollout`
-and whatever registers next — a probe added here is inherited by all of them and
+Because every head runs through this one suite — `vector_rollout`, `bin_rollout`,
+`ar_rollout` and whatever registers next — a probe added here is inherited by all of them and
 its numbers are comparable across them by construction. That is the reason to
 put a diagnostic here rather than in the experiment that wanted it.
 
@@ -162,6 +265,39 @@ and both distances are recorded (`geodesic_start_m` on the robot mesh,
 are counted in the summary and present in the JSONL with `status: "skipped"`.
 They are never silently dropped and never counted as failures — a harness that
 did either would report a very different, and much worse, number.
+
+#### Which one to measure on: `--navmesh`
+
+Both meshes are available, and neither is correct in general — they answer
+different questions, so the run records and prints which it used.
+
+| | `--navmesh robot` (default) | `--navmesh dataset` |
+| --- | --- | --- |
+| footprint | r=0.28 m, h=1.0 m — this robot | r=0.1 m point agent |
+| connectivity | fragmented; 28% of HM3D `val` screened `goal_unreachable` | connected; screening nearly never fires |
+| honest about | where the robot **fits** | comparability with published ObjectNav |
+| fails by | *overstating* difficulty, and detours | *understating* difficulty |
+
+The robot mesh's failure mode is worth stating concretely, because it produces a
+plausible wrong number rather than an error. **The robot is a physics body, not
+a navmesh agent** — nothing constrains it to the mesh. Where the mesh routes
+around an obstacle the body can simply drive through, the geodesic overstates
+the distance. On MP3D `8194nk5LbLH:39` the geodesic start was 9.15 m to a goal
+**2.20 m away in a straight line**; the robot arrived after 1.9 m of travel, the
+distance trace fell 9.99 → 0.02 in three policy steps, and **SPL pinned at
+1.000** because its reference path was longer than the route actually taken.
+
+`detour_ratio` (geodesic ÷ euclidean at the start) is recorded per episode as
+the signal for this. It gates nothing. On the current sets roughly 10% of
+episodes exceed 3×.
+
+The dataset mesh removes the detours and the island screening, at the cost of
+assuming a robot that fits through gaps this one does not — goals it calls
+reachable may be unreachable in fact, and those episodes become honest failures
+rather than screened-out ones.
+
+**Runs using different `--navmesh` values are not comparable.** Switching it
+changes every geodesic, SPL's denominator, and which episodes are screened.
 
 A handful of episodes also *start* inside the success radius (the dataset
 guarantees a minimum start distance on **its** navmesh, not on ours); those are
@@ -485,9 +621,12 @@ write-up in `/Projects/spatial_training/dump/eval_system/FINDINGS.md` §6.
 | `--dt` | Control tick length. Must match the demonstrations' true control rate. |
 | `--success-distance` | Also the screening threshold for trivially-successful episodes. |
 | `--evaluate-every` | Ticks between measure updates. `1` (default) matches the reference harness; higher is cheaper but makes the oracle metrics lower bounds. |
+| `--navmesh` | **Which navmesh every distance is measured on** — see [Two navmeshes](#2-two-navmeshes-and-episodes-that-are-unwinnable-on-ours). `robot` (default) recomputes it for this robot's footprint; `dataset` uses the point-agent mesh shipped with the scene. It does *not* change how the robot moves. Recorded in every results file and printed per scene. |
 | `--snap-start` | Off by default: the start is navigable on the dataset's mesh, and snapping onto the robot's smaller mesh would silently move the agent away from the pose the episode specifies. |
-| `--auto-stop` | Ends the episode on arrival, making `success == oracle_success` by construction. Off by default so both numbers stay informative. |
-| `--policy-decode` | Decode rule for a distributional head (`bin_rollout`): `argmax` / `sample` / `mean`. Changes the policy as much as changing the checkpoint does — a sampled chunk and a mean chunk from the same weights behave nothing alike. Ignored by backends that do not accept it. |
+| `--auto-stop` | **Oracle termination.** Ends the episode on the control *tick* the agent first comes within `--success-distance` — the stop a policy with no termination head cannot make for itself. Off by default so `success` and `oracle_success` stay independent readings. At `--evaluate-every 1` this makes `success == oracle_success` by construction; it cuts the chunk short rather than running it out, because a policy that arrives on tick 1 and drifts back out by tick 5 would otherwise score below the oracle that had already fired. Above `--evaluate-every 1` arrival is noticed late, so the identity weakens exactly as the oracle metrics do. |
+| `--policy-decode` | Decode rule for a distributional head (`bin_rollout`, `ar_rollout`): `argmax` / `sample` / `mean`. Changes the policy as much as changing the checkpoint does — a sampled chunk and a mean chunk from the same weights behave nothing alike. Ignored by backends that do not accept it. Unset means the backend's own default, and those differ: `argmax` for `bin_rollout`, `sample` for `ar_rollout` (its codec's own default, and the only rule its design treats as an executable sequential policy). |
+| `--stop-head` | **Lets the checkpoint's own stop classifier end the episode.** Mutually exclusive with `--auto-stop` — the config raises rather than picking a precedence. `oracle_success`/`oracle_spl` are unaffected either way (they latch on ever reaching `--success-distance`), so they stay comparable to every auto-stop run; `success`/`spl` stop being pinned equal to them and start measuring the policy's own termination. Expect longer episodes: nothing ends them on arrival any more. |
+| `--stop-inference` / `--stop-threshold` / `--stop-temperature` | Runtime knobs on that classifier, unset meaning the checkpoint's own values. They are post-hoc scalars by design and do not change its AP or AUC. Each episode record carries the per-step `(probability, logit)` trace under `"stop"` whether or not the head is acting, so a threshold or temperature can be swept offline instead of by re-running the split. |
 | `--policy-seed` | Base seed for a backend's per-episode seeded sampling. Combined with an episode counter, so re-running an episode list reproduces itself and an episode's result does not depend on how many ran before it. |
 | `--no-collision-probe` | Drops the per-tick contact sample. Measured at inside run-to-run noise, so there is rarely a reason. |
 | `--max-scenes` / `--sample-per-scene` | Stratified subsetting for big splits (MP3D val is 2195 episodes over 11 scenes). Seeded, so the same flags name the same episodes. Sampling per scene, not a head slice — the files are grouped by scene, so a head slice would evaluate one scene and call it a split. |

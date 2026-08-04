@@ -31,8 +31,25 @@ genuinely conflict), bridged over a unix socket — hence the two `--policy-*` f
 |---|---|
 | **regression head** (continuous) | `--ckpt <dir>` |
 | **bin head** (discrete, per-slot) | `--ckpt <dir> --policy-backend bin_rollout --policy-decode sample --policy-seed 1000` |
-| **AR head** (autoregressive) | `--ckpt <dir> --policy-backend ar_rollout --policy-decode sample --policy-seed 1000` *(backend not yet registered — see below)* |
+| **AR head** (autoregressive) | `--ckpt <dir> --policy-backend ar_rollout --policy-decode sample --policy-seed 1000` |
 | **image-blind control** | `--policy forward` or `--policy zero` |
+
+Two things are **not** flags in that table, because they are properties of the
+checkpoint rather than of the run — full writeup in `docs/POSE_INJECTION_EVAL.md`:
+
+* **Pose injection.** If the checkpoint declares a `<pose>` modality spec, the
+  harness feeds it the agent's raw planar pose every step and the model's own
+  `relative_se2` converts it to the episode-start frame. No flag, deliberately: a
+  flag could disagree with the weights. Confirm it happened — the server log
+  prints `pose=<pose> ...`, and each episode record grows a `pose_injected`
+  block whose first row must be exactly `(0, 0, 0)`.
+* **A stop head.** Its probability and logit are recorded every step regardless.
+  Add `--stop-head` to let it actually end episodes; it is **mutually exclusive
+  with `--auto-stop`** (the config raises). Swapping one for the other leaves
+  `oracle_success`/`oracle_spl` untouched — they latch on ever reaching
+  `--success-distance` — but `success`/`spl` stop being pinned equal to them, so
+  do not compare a `--stop-head` `success` against an `--auto-stop` one. Tune the
+  threshold offline with `scripts/sweep_stop_threshold.py` rather than re-running.
 
 **Always run the blind controls** on the same episodes. `forward` once beat a
 trained checkpoint on SPL at n=14 — without that floor you cannot tell a working
@@ -59,9 +76,21 @@ Implement `PolicyBackend` and call `register_backend("<name>", …)` in
 `src/objectnav_eval/bridge.py` — see `VectorRolloutBackend` and `BinRolloutBackend`.
 Nothing else changes; all metrics and probes are inherited.
 
-**The AR backend is not registered yet.** Evaluating an AR checkpoint requires
-adding one, following `BinRolloutBackend` (which loads a bin checkpoint into
-`VectorRolloutPolicy` unmodified by occupying the `normalizer` slot).
+### Which AR architecture did this run use?
+
+The AR head has grown decoder options that all default OFF, so two checkpoints
+with the same `n_codes` and `n_ticks` can be different architectures. The policy
+server log — `<output-dir>/logs/policy_shard<N>.log`, one per shard — states which
+one loaded, on the second `[ar decoder …]` line:
+
+```
+  [ar decode=sample seed_base=1000 n_codes=1024 n_ticks=10]
+  [ar decoder d_model=128 n_layers=4 n_heads=4 n_context_tokens=8 use_prefix_pose=True attn_mode=causal direct_context=False]
+```
+
+`n_context_tokens=1 use_prefix_pose=False attn_mode=causal direct_context=False`
+is the original architecture. Record that line with the run — it is the only
+place the eval output distinguishes one AR run from another.
 
 ## Reading the output
 

@@ -67,6 +67,12 @@ class TickRecord:
     #: Only populated when the executor was built with ``collect_contacts``;
     #: probes never query the simulator themselves.
     contacts: Optional[ContactSnapshot] = None
+    #: Vertical travel (the ``joint_z`` prismatic joint), metres, sampled by the
+    #: executor for the same reason ``contacts`` is: probes do not query the
+    #: simulator. Not in ``pose``, which is the planar ``[X, Y, theta]``. This
+    #: is what :class:`~objectnav_eval.probes.EscapeProbe` watches -- the robot
+    #: falling out of the world moves only in this coordinate.
+    height: Optional[float] = None
 
     @property
     def commanded_displacement(self) -> float:
@@ -164,6 +170,10 @@ class ChunkExecution:
     setpoints: np.ndarray
     poses: np.ndarray
     ticks: List[TickRecord]
+    #: True when ``stop_when`` cut the chunk short. ``setpoints``/``poses`` are
+    #: truncated to the ticks that actually ran, so every probe and diagnostic
+    #: sees the executed trajectory and nothing else.
+    stopped_early: bool = False
 
     @property
     def end_lag(self) -> float:
@@ -207,7 +217,19 @@ class ChunkExecutor:
         chunk: Any,
         chunk_index: int,
         on_tick: Optional[Callable[[TickRecord], None]] = None,
+        stop_when: Optional[Callable[[TickRecord], bool]] = None,
     ) -> ChunkExecution:
+        """Track ``chunk``'s first ``gap`` setpoints, one control tick each.
+
+        ``stop_when`` is consulted after ``on_tick`` on every tick, and a true
+        answer ends the chunk there. It exists for terminations the *episode*
+        owns rather than the policy -- the oracle stop, where an imaginary
+        observer ends the episode the moment the agent is close enough. Cutting
+        at the tick rather than at the chunk boundary is what makes that a real
+        oracle: stopping only at the boundary lets the robot arrive on tick 1
+        and drift back out by tick 5, so ``success`` would sit below
+        ``oracle_success`` even though the oracle had already fired.
+        """
         from continuous_demos.action_chunking import relative_to_pose
         from continuous_demos.pid_pose_controller import track_trajectory
 
@@ -221,6 +243,7 @@ class ChunkExecutor:
 
         reached = np.zeros((gap, 3), dtype=np.float64)
         ticks: List[TickRecord] = []
+        stopped_early = False
         previous_setpoint = anchor
         previous_pose = anchor
         for j, setpoint in enumerate(setpoints):
@@ -248,17 +271,29 @@ class ChunkExecutor:
                 contacts=(
                     robot_contacts(self.robot_sim) if self.collect_contacts else None
                 ),
+                # Unconditional, unlike contacts: one joint read per tick, and
+                # the failure it detects is one that every other metric scores
+                # as healthy.
+                height=float(self.robot_sim.get_joint_state("joint_z")),
             )
             ticks.append(record)
             if on_tick is not None:
                 on_tick(record)
             previous_setpoint = setpoint
             previous_pose = pose
+            if stop_when is not None and stop_when(record):
+                stopped_early = True
+                break
 
+        # Truncate to what ran. `reached` is preallocated, so a short chunk
+        # would otherwise hand every probe trailing rows of zeros -- read as a
+        # jump to the origin by anything that looks at poses[-1].
+        n = len(ticks)
         return ChunkExecution(
             chunk_index=chunk_index,
             anchor=anchor,
-            setpoints=setpoints,
-            poses=reached,
+            setpoints=setpoints[:n],
+            poses=reached[:n],
             ticks=ticks,
+            stopped_early=stopped_early,
         )

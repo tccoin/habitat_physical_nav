@@ -37,10 +37,18 @@ def build_scene_simulator(episode: EvalEpisode, config: Any):
     """One ``HabitatRobotSim`` for the episode's scene, plus its two navmeshes."""
     from continuous_demos.episode_io import DEFAULT_URDF_PATH, build_robot_sim
 
+    from objectnav_eval.navmesh import apply_navmesh_choice
+
     scene_path, scene_dataset_config = resolve_scene(episode, config.scene_root)
     robot_sim = build_robot_sim(
         scene_path, scene_dataset_config, config.width, config.height,
         str(DEFAULT_URDF_PATH),
+    )
+    # Which mesh every distance in this run is measured on. Printed rather than
+    # assumed -- it changes what the numbers mean, not how the robot moves.
+    print(
+        f"    navmesh         {apply_navmesh_choice(robot_sim, scene_path, config.navmesh)}",
+        flush=True,
     )
     return robot_sim, scene_path
 

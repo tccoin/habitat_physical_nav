@@ -593,6 +593,77 @@ def _corr(a: List[float], b: List[float]) -> float:
     return float(np.corrcoef(x, y)[0, 1])
 
 
+# The robot leaving the world. Thresholds are NOT chosen here -- they are the
+# ones the demonstration generator's escape detector was validated at, over
+# 2,227 episodes across all 56 scenes: 23/23 true positives, 0 false positives,
+# with every run length between 15 and 39 ticks empty (a flat surface, not a
+# knife edge). See /Projects/spatial_training/dump/drive_failure_detection/
+# FINDINGS.md. Matching them means "escaped" denotes the same event in training
+# data and in evaluation, which is the whole point of adding it here.
+#
+# Two things that document rejected alternatives, so they are not re-tried:
+#   * Depth alone is useless -- healthy episodes legitimately drop up to 6.4 m
+#     (a stairwell descent at 6.5 m/s), and 8 of 40 episodes in one scene drop
+#     over 3 m.
+#   * Contact-based detection missed 3 of the 23 escapes and needed floor/wall
+#     normal classification. Vertical speed needs neither.
+_ESCAPE_SPEED_MPS = 2.0     # sustained descent faster than this...
+_ESCAPE_DURATION_S = 1.0    # ...for at least this long
+
+
+@dataclass
+class EscapeProbe(RolloutProbe):
+    """Did the robot fall out of the navmesh, and how far.
+
+    Passive: it reads ``TickRecord.height`` (the vertical prismatic joint the
+    executor samples) and never touches the simulator. It gates nothing.
+
+    This is a strictly different question from the summary's
+    ``episodes_off_navmesh``, which counts episodes whose *final* geodesic is
+    non-finite. That conflates three unrelated states: a robot in a nook the
+    mesh does not cover, one stranded on a disconnected island, and one that
+    fell out of the world entirely. Only the third is a simulator failure rather
+    than a navigation outcome, and it is the one every trajectory metric scores
+    as healthy -- an escaped robot drives through the void with *better*
+    reference tracking than a healthy one.
+    """
+
+    name: str = "escape"
+    dt: float = 0.05
+    heights: List[float] = field(default_factory=list)
+
+    def reset(self, episode: Any) -> None:
+        self.heights = []
+
+    def on_tick(self, record: TickRecord) -> None:
+        if record.height is not None:
+            self.heights.append(float(record.height))
+
+    def summary(self) -> Dict[str, Any]:
+        if len(self.heights) < 2:
+            return {"escaped": False, "ticks": len(self.heights)}
+        h = np.asarray(self.heights, dtype=float)
+        # Descent speed is positive downward, so the thresholds read as written.
+        descent = -np.diff(h) / self.dt
+        fast = descent >= _ESCAPE_SPEED_MPS
+        longest = run = 0
+        for flag in fast:
+            run = run + 1 if flag else 0
+            longest = max(longest, run)
+        needed = max(1, int(round(_ESCAPE_DURATION_S / self.dt)))
+        return {
+            "escaped": bool(longest >= needed),
+            "peak_descent_mps": float(descent.max()),
+            "longest_descent_ticks": int(longest),
+            "longest_descent_s": float(longest * self.dt),
+            "total_drop_m": float(h[0] - h.min()),
+            "net_height_change_m": float(h[-1] - h[0]),
+            "escape_threshold_mps": _ESCAPE_SPEED_MPS,
+            "escape_threshold_ticks": needed,
+            "ticks": len(h),
+        }
+
+
 def default_probes(
     keep_series: bool = False, dt: float = 0.05, collect_contacts: bool = False
 ) -> List[RolloutProbe]:
@@ -609,4 +680,5 @@ def default_probes(
         MotionTaxonomy(dt=dt),
         CollisionProbe(dt=dt),
         MotionCoherence(dt=dt),
+        EscapeProbe(dt=dt),
     ]

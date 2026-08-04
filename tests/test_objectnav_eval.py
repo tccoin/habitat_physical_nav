@@ -189,6 +189,117 @@ def test_config_derived_values():
 
 
 # ---------------------------------------------------------------------------
+# the AR policy backend (no torch: only the parts that are ordinary code)
+# ---------------------------------------------------------------------------
+
+
+class _FakeDecoder:
+    def __init__(self, config):
+        self._config = config
+
+    def to_config(self):
+        return dict(self._config)
+
+
+class _FakeARModel:
+    def __init__(self, decoder_config, n_codes=1024, n_ticks=10):
+        self.decoder = _FakeDecoder(decoder_config)
+        self.n_codes = n_codes
+        self.n_ticks = n_ticks
+
+
+class _FakeARPolicy:
+    def __init__(self, model):
+        self.model = model
+
+    def describe(self):
+        return "prefix='**' postfix='**'"
+
+
+def ar_backend(decoder_config, decode="sample", seed=1000, **model_kwargs):
+    """An ``ARRolloutBackend`` wearing a fake policy.
+
+    ``__init__`` loads a multi-billion-parameter VLM, which is exactly the kind of thing
+    this suite does not do (see the module docstring). ``describe()`` is nonetheless
+    ordinary string formatting over ``CausalActionDecoder.to_config()``, and it is the
+    only record an eval run leaves of which decoder architecture produced its numbers, so
+    it is pinned here rather than left to the empirical runs.
+    """
+    from objectnav_eval.bridge import ARRolloutBackend
+
+    backend = ARRolloutBackend.__new__(ARRolloutBackend)
+    backend.decode = decode
+    backend.seed = seed
+    backend._episode_count = 0
+    backend.policy = _FakeARPolicy(_FakeARModel(decoder_config, **model_kwargs))
+    return backend
+
+
+def test_ar_backend_rejects_the_offline_context_passthrough():
+    """``"context"`` is ``ARActionCodec``'s raw-context passthrough for offline analysis,
+    not a policy. Accepting it would send a ``(context_dim,)`` vector down the wire as if
+    it were a ``(T, 3)`` chunk. The check runs before the backend's imports, so it fails
+    the same way in an interpreter that cannot load the checkpoint at all -- which is why
+    this test needs neither torch nor a checkpoint.
+    """
+    from objectnav_eval.bridge import ARRolloutBackend
+
+    with pytest.raises(ValueError, match="offline passthrough"):
+        ARRolloutBackend(ckpt="/nonexistent", decode="context")
+    with pytest.raises(ValueError, match="decode must be one of"):
+        ARRolloutBackend(ckpt="/nonexistent", decode="logits")
+
+
+def test_ar_describe_surfaces_the_decoder_architecture():
+    """Two runs that differ only in decoder options must leave distinguishable logs.
+
+    ``n_codes``/``n_ticks`` are identical across the v2 and v3 AR runs, so without the
+    architecture line the eval output cannot say which one produced it.
+    """
+    described = ar_backend(
+        {"d_model": 128, "n_layers": 4, "n_heads": 4, "dim_ff": 512, "dropout": 0.1,
+         "n_context_tokens": 8, "use_prefix_pose": True, "attn_mode": "causal",
+         "direct_context": False}
+    ).describe()
+
+    assert "n_context_tokens=8" in described
+    assert "use_prefix_pose=True" in described
+    assert "attn_mode=causal" in described
+    assert "direct_context=False" in described
+    assert "d_model=128" in described and "n_layers=4" in described
+    # the decode policy is still reported, and separately from the architecture
+    assert "decode=sample" in described and "seed_base=1000" in described
+    assert "n_codes=1024" in described and "n_ticks=10" in described
+
+
+def test_ar_describe_fills_in_the_defaults_of_a_pre_option_checkpoint():
+    """A checkpoint written before an option existed stores nothing for it, which is not
+    the same thing as storing its default -- but it is the same *architecture*. The log
+    has to state the architecture either way, or a v2 run's line is silently shorter than
+    a v3 run's and the two are not comparable by eye.
+    """
+    described = ar_backend(
+        {"d_model": 128, "n_layers": 4, "n_heads": 4, "dim_ff": 512, "dropout": 0.1}
+    ).describe()
+
+    assert "n_context_tokens=1" in described
+    assert "use_prefix_pose=False" in described
+    assert "attn_mode=causal" in described
+    assert "direct_context=False" in described
+
+
+def test_ar_describe_distinguishes_every_registered_decoder_option():
+    """The markov / direct_context variants no trained checkpoint reaches yet."""
+    causal = ar_backend({"d_model": 32, "n_layers": 2, "n_heads": 2,
+                         "n_context_tokens": 4, "attn_mode": "causal"}).describe()
+    markov = ar_backend({"d_model": 32, "n_layers": 2, "n_heads": 2,
+                         "n_context_tokens": 4, "attn_mode": "markov",
+                         "use_prefix_pose": True, "direct_context": True}).describe()
+    assert causal != markov
+    assert "attn_mode=markov" in markov and "direct_context=True" in markov
+
+
+# ---------------------------------------------------------------------------
 # control policies
 # ---------------------------------------------------------------------------
 
@@ -869,3 +980,150 @@ def test_episode_line_carries_the_behavioural_fields():
     bare = episode_line(make_result("A:2"))
     assert bare["frozen_frac"] is None and bare["flip_rate"] is None
     json.dumps(line)
+
+
+# ---------------------------------------------------------------------------
+# EscapeProbe: the robot falling out of the world
+# ---------------------------------------------------------------------------
+
+
+def _heights(probe, heights):
+    """Feed a height series through the probe, one tick each."""
+    zero = np.zeros(3)
+    probe.reset(None)
+    for index, height in enumerate(heights):
+        probe.on_tick(
+            TickRecord(
+                tick=index, chunk_index=0, tick_in_chunk=0,
+                setpoint=zero, previous_setpoint=zero,
+                pose=zero, previous_pose=zero,
+                sim_time=probe.dt * index, height=float(height),
+            )
+        )
+    return probe.summary()
+
+
+def test_escape_probe_does_not_fire_on_the_deepest_healthy_fall():
+    """4.2 m down a stairwell at 6.5 m/s over 14 ticks.
+
+    This is the worst *healthy* descent in the generator's 2,227-episode
+    validation set (dump/drive_failure_detection/FINDINGS.md), and it has a
+    regression test there for the same reason it has one here: depth alone
+    would reject it, and rejecting real stair descents would silently delete
+    the multi-floor episodes this robot is meant to be tested on.
+    """
+    from objectnav_eval.probes import EscapeProbe
+
+    fall = np.concatenate([np.zeros(20), np.linspace(0.0, -4.2, 14), np.full(50, -4.2)])
+    out = _heights(EscapeProbe(dt=0.05), fall)
+    assert out["escaped"] is False
+    assert out["total_drop_m"] == pytest.approx(4.2, abs=1e-6)
+
+
+def test_escape_probe_fires_on_a_sustained_fall_out_of_the_world():
+    from objectnav_eval.probes import EscapeProbe
+
+    out = _heights(EscapeProbe(dt=0.05), -np.cumsum(np.full(60, 0.5)))
+    assert out["escaped"] is True
+    assert out["peak_descent_mps"] > 2.0
+    assert out["longest_descent_s"] >= 1.0
+
+
+def test_escape_threshold_is_a_duration_not_a_tick_count():
+    """The same physical fall must classify identically at 20 Hz and 25 Hz.
+
+    The generator validated "faster than 2 m/s for at least 1 second"; storing
+    that as a tick count instead would silently change what counts as an escape
+    the moment --dt changed, exactly as the motion taxonomy's thresholds would
+    if they were stored as per-tick displacements.
+    """
+    from objectnav_eval.probes import EscapeProbe
+
+    # 1.2 s of descent at 5 m/s, sampled at two control rates.
+    slow = _heights(EscapeProbe(dt=0.05), -5.0 * 0.05 * np.arange(int(1.2 / 0.05) + 1))
+    fast = _heights(EscapeProbe(dt=0.04), -5.0 * 0.04 * np.arange(int(1.2 / 0.04) + 1))
+    assert slow["escaped"] is True and fast["escaped"] is True
+    assert slow["escape_threshold_ticks"] == 20
+    assert fast["escape_threshold_ticks"] == 25
+    # Same fall, same verdict, different tick counts.
+    assert slow["longest_descent_ticks"] != fast["longest_descent_ticks"]
+
+
+def test_escape_probe_is_inert_without_height_data():
+    from objectnav_eval.probes import EscapeProbe
+
+    probe = EscapeProbe(dt=0.05)
+    probe.reset(None)
+    assert probe.summary()["escaped"] is False
+
+
+# ---------------------------------------------------------------------------
+# _PeriodicContextReset: the memory-length ablation, and the production path
+# ---------------------------------------------------------------------------
+
+
+class _FakePolicy:
+    """Records reset() calls the way VectorRolloutPolicy would receive them."""
+
+    def __init__(self):
+        self.resets = []
+
+    def reset(self, goal_text=None):
+        self.resets.append(goal_text)
+
+
+def test_unlimited_memory_never_touches_the_policy():
+    """The production default must not call reset() mid-episode, ever.
+
+    This is the regression that matters: every number in the eval series was
+    produced on the unlimited path, and a stray reset would silently truncate
+    context without changing any flag or any log line.
+    """
+    from objectnav_eval.bridge import _PeriodicContextReset
+
+    ctx, policy = _PeriodicContextReset(0), _FakePolicy()
+    ctx.on_episode_reset("chair")
+    for _ in range(500):
+        ctx.before_act(policy)
+    assert policy.resets == []
+    assert ctx.resets == 0
+
+
+def test_periodic_reset_fires_on_block_boundaries_only():
+    from objectnav_eval.bridge import _PeriodicContextReset
+
+    ctx, policy = _PeriodicContextReset(5), _FakePolicy()
+    ctx.on_episode_reset("chair")
+    for _ in range(12):
+        ctx.before_act(policy)
+    # Steps 0..11: resets before steps 5 and 10, never before step 0 (the
+    # episode reset already cleared it -- a reset there would be a wasted
+    # forward pass and would double-count in `resets`).
+    assert len(policy.resets) == 2
+    assert policy.resets == ["chair", "chair"]
+    assert ctx.resets == 2
+
+
+def test_periodic_reset_restarts_its_counter_each_episode():
+    from objectnav_eval.bridge import _PeriodicContextReset
+
+    ctx, policy = _PeriodicContextReset(3), _FakePolicy()
+    ctx.on_episode_reset("chair")
+    for _ in range(4):
+        ctx.before_act(policy)          # one reset, before step 3
+    ctx.on_episode_reset("sofa")        # new episode
+    for _ in range(4):
+        ctx.before_act(policy)          # one more, with the new goal
+    assert policy.resets == ["chair", "sofa"]
+    assert ctx.resets == 1              # per-episode counter, not cumulative
+
+
+def test_memory_seconds_converts_with_the_control_rate():
+    """The knob is a duration, so the same request must survive a dt change."""
+    from objectnav_eval.config import EvalConfig
+
+    assert EvalConfig().context_reset_every is None            # production
+    assert EvalConfig(policy_memory_seconds=7.0, dt=0.04, gap=5).context_reset_every == 35
+    assert EvalConfig(policy_memory_seconds=7.0, dt=0.05, gap=5).context_reset_every == 28
+    # 35 * 5 * 0.04 == 28 * 5 * 0.05 == 7.0 s
+    assert EvalConfig(policy_memory_seconds=0.01, dt=0.04, gap=5).context_reset_every == 1

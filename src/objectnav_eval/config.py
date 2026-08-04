@@ -47,6 +47,29 @@ class EvalConfig:
     distance_to: str = "VIEW_POINTS"
     evaluate_every: int = 1
     auto_stop: bool = False
+    # Distance at which --auto-stop actually ends the episode. None means "the
+    # same as success_distance", i.e. terminate the moment the episode is won.
+    # Setting it *tighter* than success_distance decouples the two: the oracle
+    # measures still latch at success_distance (OracleSuccess on ever reaching
+    # it, OracleSPL freezing path length there), so oracle_success and
+    # oracle_spl are unchanged, while the robot keeps driving -- which is how
+    # you get full-length footage of an episode that has already been won.
+    # It does move `success` and `spl`, because path length keeps accruing and
+    # the episode now ends wherever the robot got to.
+    auto_stop_distance: Optional[float] = None
+    # Policy steps to keep running AFTER --auto-stop's condition first holds.
+    # 0 = terminate immediately, the historical behaviour. A positive value opens
+    # a window in which a gated stop classifier (see `stop_requires_oracle`) can
+    # declare for itself, while guaranteeing the episode ends soon after arrival
+    # rather than running to the step cap. Because the window opens only once the
+    # agent has already arrived, `oracle_success`/`oracle_spl` are untouched by
+    # it -- they latched at the moment the window opened.
+    auto_stop_delay: int = 0
+    # Which navmesh every distance is measured on: 'robot' (recomputed for
+    # r=0.28 h=1.0) or 'dataset' (the point-agent mesh shipped with the
+    # scene, what published ObjectNav numbers use). Changes what the metrics
+    # mean, not how the robot moves. See navmesh.apply_navmesh_choice.
+    navmesh: str = "robot"
     snap_start: bool = False
     screen_trivial: bool = True
     live_height: bool = True
@@ -83,6 +106,43 @@ class EvalConfig:
     # forward this flag" so backends that don't accept it (vector_rollout) are unaffected.
     policy_decode: Optional[str] = None
     policy_seed: Optional[int] = None
+    # Memory-length ablation. Expressed in SECONDS because that is the quantity
+    # that stays meaningful: one policy step is gap*dt seconds, so a step count
+    # silently changes duration the moment --dt or --gap moves -- the same trap
+    # the corpus dt mismatch set. None = unlimited memory (production).
+    policy_memory_seconds: Optional[float] = None
+    # -- the checkpoint's own stop classifier -------------------------------
+    # OFF by default, and that is a semantic choice rather than caution: with
+    # --auto-stop the oracle ends the episode on arrival, so a stop head firing
+    # underneath it would share credit for the same episode and neither could be
+    # read separately. When it *is* on, run without --auto-stop -- the oracle
+    # measures latch independently (OracleSuccess on ever reaching
+    # success_distance, OracleSPL freezing path length there), so oracle_success
+    # and oracle_spl stay comparable to every auto-stop run, while `success` and
+    # `spl` finally measure the policy's own termination instead of being pinned
+    # equal to their oracle counterparts.
+    #
+    # The stop *probability* is recorded every step regardless (see
+    # `stop_prob` in the runner's record), because temperature and threshold are
+    # post-hoc scalars fitted on saved scores -- a miscalibrated head is a
+    # calibration problem, and re-running the rollout to try another threshold
+    # would be paying for the same footage twice.
+    stop_head: bool = False
+    # Demote the classifier: it may end an episode ONLY at a moment the oracle
+    # agrees the agent is within --success-distance. Its false positives then
+    # cost nothing -- they are counted and discarded -- and what remains being
+    # measured is the question worth asking of a head this miscalibrated: *given
+    # that you are at the goal, do you say so?* Without the gate a head with a
+    # bad tail destroys the navigation metrics before they can be read, which is
+    # what happened at threshold 0.95 on run_v5_ar_pose/checkpoint-4400.
+    stop_requires_oracle: bool = False
+    stop_temperature: Optional[float] = None
+    stop_threshold: Optional[float] = None
+    stop_inference: Optional[str] = None
+    # Pose injection has no flag on purpose: whether the policy is shown its
+    # pose is a property of the checkpoint (a `<pose>` modality spec with the
+    # `pose_relative_first` transform), and a flag would let the command line
+    # disagree with the weights. See bridge._PoseFeed.
 
     # -- diagnostics --------------------------------------------------------
     keep_tracking_series: bool = False
@@ -108,6 +168,56 @@ class EvalConfig:
     @property
     def fps(self) -> int:
         return max(1, round(1.0 / self.dt))
+
+    def __post_init__(self) -> None:
+        # Both terminations at once would end each episode at whichever fired
+        # first, and the run could not say which -- the oracle's arrival and the
+        # policy's decision would share one `success` column. Rejected rather
+        # than resolved by precedence, because a precedence rule is exactly the
+        # kind of thing a later reader assumes went the other way.
+        if self.stop_head and self.auto_stop and not self.stop_requires_oracle:
+            raise ValueError(
+                "--stop-head and --auto-stop both terminate the episode; pick one, or "
+                "add --stop-requires-oracle. Alone, --stop-head measures the policy's "
+                "own stopping (oracle_success/oracle_spl still latch on ever reaching "
+                "--success-distance). Gated, the classifier can only fire where the "
+                "oracle already agrees, so the two cannot claim the same episode and "
+                "running them together is well defined."
+            )
+        if self.stop_requires_oracle and not self.stop_head:
+            raise ValueError(
+                "--stop-requires-oracle gates the classifier, but --stop-head is off so "
+                "the classifier cannot end an episode anyway"
+            )
+        if self.auto_stop_delay and not self.auto_stop:
+            raise ValueError(
+                "--auto-stop-delay without --auto-stop: nothing would open the window "
+                "it delays"
+            )
+        if self.auto_stop_delay < 0:
+            raise ValueError(f"--auto-stop-delay must be >= 0, got {self.auto_stop_delay}")
+
+    @property
+    def stop_distance(self) -> float:
+        """Where ``--auto-stop`` terminates. Explicitly not ``or``-defaulted: a
+        legitimate 0.0 must not silently fall back to ``success_distance``."""
+        return (
+            self.success_distance
+            if self.auto_stop_distance is None
+            else self.auto_stop_distance
+        )
+
+    @property
+    def context_reset_every(self) -> Optional[int]:
+        """``policy_memory_seconds`` in policy steps, or None for unlimited.
+
+        One policy step advances ``gap`` control ticks of ``dt`` seconds each.
+        Rounded to at least 1: a request below one step's duration cannot mean
+        less than one step, and 0 would silently mean 'unlimited'.
+        """
+        if self.policy_memory_seconds is None:
+            return None
+        return max(1, round(self.policy_memory_seconds / (self.gap * self.dt)))
 
     def selection_lists(self) -> Dict[str, Optional[List[str]]]:
         return {
@@ -184,7 +294,37 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                           "reference harness; higher is cheaper but makes the oracle "
                           "metrics lower bounds")
     run.add_argument("--auto-stop", action="store_true",
-                     help="end the episode on arrival; makes success == oracle_success")
+                     help="oracle termination: end the episode on the control tick the "
+                          "agent first comes within --success-distance, for policies with "
+                          "no termination head of their own. Makes success == "
+                          "oracle_success at --evaluate-every 1")
+    run.add_argument("--auto-stop-distance", type=float, default=None,
+                     help="terminate --auto-stop at this distance instead of "
+                          "--success-distance. Tighter values keep the robot driving "
+                          "after the episode is already won, for footage: oracle_success "
+                          "and oracle_spl are unaffected (they latch at "
+                          "--success-distance), but success and spl are, since path "
+                          "length keeps accruing")
+    run.add_argument("--auto-stop-delay", type=int, default=0,
+                     help="policy steps to keep running after --auto-stop's condition "
+                          "first holds, instead of terminating on the arriving tick. "
+                          "Opens a fixed window in which a gated stop classifier (see "
+                          "--stop-requires-oracle) can declare for itself. The window "
+                          "opens only once the agent has arrived, so oracle_success and "
+                          "oracle_spl already latched and are unaffected")
+    run.add_argument("--navmesh", default="robot", choices=["robot", "dataset"],
+                     help="WHICH NAVMESH THE METRICS ARE MEASURED ON. 'robot' "
+                          "(default) recomputes it for this robot's footprint "
+                          "(r=0.28 m, h=1.0 m) -- honest about where the robot fits, "
+                          "but fragmented: it screens out 28%% of HM3D val as "
+                          "goal-unreachable, and where it routes around something the "
+                          "physics body can drive through it overstates the distance "
+                          "and can pin SPL at 1.000. 'dataset' uses the point-agent "
+                          "mesh shipped with the scene -- connected, comparable with "
+                          "published ObjectNav numbers, no absurd jumps, but it "
+                          "understates difficulty by assuming a robot that fits "
+                          "through gaps this one does not. Does NOT change how the "
+                          "robot moves; it is a physics body either way")
     run.add_argument("--snap-start", action="store_true",
                      help="snap the spawn onto the robot navmesh instead of using the "
                           "episode's start position verbatim")
@@ -233,12 +373,53 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                      help="m/s for the 'forward' control")
     mdl.add_argument("--policy-decode", default=None,
                      choices=["argmax", "sample", "mean", "logits"],
-                     help="decode rule for a distributional policy head (bin_rollout "
-                          "backend); ignored by backends that don't accept it")
+                     help="decode rule for a distributional policy head (bin_rollout, "
+                          "ar_rollout); ignored by backends that don't accept it. Unset "
+                          "means the backend's own default, which differs between them: "
+                          "argmax for bin_rollout, sample for ar_rollout")
+    mdl.add_argument("--policy-memory-seconds", type=float, default=None,
+                     help="MEMORY-LENGTH ABLATION. Drop rollout history (KV cache and "
+                          "visual dedup DB) every this many seconds of simulated time, "
+                          "keeping the system prompt. Unset = unlimited memory, which is "
+                          "the production default and is byte-identical to not passing "
+                          "this. Converted to policy steps with gap*dt, so it means the "
+                          "same duration at any control rate. NB the memory is a SAWTOOTH "
+                          "not a window: within a block, history runs from 0 up to this "
+                          "value, averaging about half it")
     mdl.add_argument("--policy-seed", type=int, default=None,
                      help="base seed for a backend's per-episode seeded sampling "
-                          "(bin_rollout with --policy-decode sample); combined with an "
-                          "episode counter so each episode gets its own fixed seed")
+                          "(bin_rollout / ar_rollout with --policy-decode sample); "
+                          "combined with an episode counter so each episode gets its own "
+                          "fixed seed")
+    mdl.add_argument("--stop-head", action="store_true",
+                     help="let the checkpoint's own stop classifier end the episode. "
+                          "Requires a checkpoint that has one. Run this INSTEAD OF "
+                          "--auto-stop, not alongside it: with both, an episode ends at "
+                          "whichever fires first and neither can be read on its own. "
+                          "oracle_success/oracle_spl stay comparable to auto-stop runs "
+                          "either way (they latch on ever reaching --success-distance); "
+                          "success/spl become the policy's own termination. The stop "
+                          "probability is recorded per step regardless of this flag")
+    mdl.add_argument("--stop-requires-oracle", action="store_true",
+                     help="the classifier may only end an episode at a step where the "
+                          "agent is ALREADY within --success-distance. Its false "
+                          "positives are then counted and discarded instead of ending "
+                          "the run, so what gets measured is 'given that you are at the "
+                          "goal, do you say so'. Makes --stop-head and --auto-stop "
+                          "compatible: gated, they cannot claim the same episode")
+    mdl.add_argument("--stop-inference", default=None,
+                     choices=["sample", "threshold", "argmax"],
+                     help="how the stop logit becomes a decision. Unset = the "
+                          "checkpoint's own setting (the training default is 'sample'). "
+                          "'threshold' uses --stop-threshold; 'argmax' is the same rule "
+                          "pinned at 0.5")
+    mdl.add_argument("--stop-threshold", type=float, default=None,
+                     help="stop probability at/above which --stop-inference threshold "
+                          "terminates. Unset = the checkpoint's own value")
+    mdl.add_argument("--stop-temperature", type=float, default=None,
+                     help="divides the stop logit before the sigmoid. A post-hoc "
+                          "calibration knob -- it is not trained and does not change the "
+                          "head's AP or AUC, only where its operating point sits")
 
     diag = parser.add_argument_group("diagnostics")
     diag.add_argument("--keep-tracking-series", action="store_true",

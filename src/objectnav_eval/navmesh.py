@@ -31,6 +31,84 @@ ROBOT_NAVMESH_RADIUS = 0.28
 ROBOT_NAVMESH_HEIGHT = 1.0
 
 
+#: Valid values for ``EvalConfig.navmesh``. See :func:`apply_navmesh_choice`.
+NAVMESH_CHOICES = ("robot", "dataset")
+
+
+def apply_navmesh_choice(robot_sim, scene_path, choice: str) -> str:
+    """Choose which navmesh the *metrics* are measured on. Returns a description.
+
+    This is the single most consequential switch in the harness, because it
+    changes what every distance means, and it is easy to forget which one a
+    number was produced on. It does **not** change how the robot moves: the
+    robot is a physics body driven by the controller, never constrained to a
+    navmesh. It changes geodesic distances, SPL's reference path, and screening.
+
+    ``"robot"`` (the default) recomputes the mesh for the robot's own footprint
+    (r=0.28 m, h=1.0 m). It is the honest answer to "where can *this* robot
+    go", and it is strictly smaller and more fragmented than the mesh the
+    episodes were cut on. That fragmentation has two costs:
+
+    * It screens out episodes whose goal is on another island -- 28% of HM3D
+      `val` and 12% of MP3D `val`.
+    * Where it routes around something the physics body can simply drive
+      through, the geodesic overstates the true distance. On MP3D
+      ``8194nk5LbLH:39`` it said 9.15 m to a goal 2.20 m away in a straight
+      line; the robot arrived after 1.9 m of travel, the distance trace fell
+      9.99 -> 0.02 in three policy steps, and SPL pinned at **1.000** because
+      its reference path was longer than the route actually taken.
+
+    ``"dataset"`` uses the navmesh shipped with the scene -- what habitat and
+    every published ObjectNav number use, cut for a 0.1 m point agent. It is
+    connected and unfragmented, so the absurd jumps and the island screening
+    both go away, and distances become comparable with the literature.
+
+    **The trade is real and runs the other way**: the point-agent mesh assumes a
+    robot that fits through gaps this one does not, so it *understates*
+    difficulty. A goal it calls reachable may be unreachable in fact, and those
+    episodes become honest failures rather than screened-out ones.
+
+    Neither choice is correct in general; they answer different questions. What
+    matters is that a run says which it used, so ``navmesh`` is written into
+    every results file and printed in the run header.
+    """
+    if choice not in NAVMESH_CHOICES:
+        raise ValueError(f"navmesh must be one of {NAVMESH_CHOICES}, got {choice!r}")
+    if choice == "robot":
+        return f"robot (recomputed, r={ROBOT_NAVMESH_RADIUS} m h={ROBOT_NAVMESH_HEIGHT} m)"
+
+    pathfinder = dataset_pathfinder(Path(scene_path))
+    if pathfinder is None:
+        raise FileNotFoundError(
+            f"--navmesh dataset needs the navmesh shipped with {Path(scene_path).name}, "
+            "and none was found next to it. Fail loudly rather than silently "
+            "measuring on the robot mesh, which is what the caller did not ask for."
+        )
+    navmesh_file = _dataset_navmesh_path(Path(scene_path))
+    robot_sim.sim.pathfinder.load_nav_mesh(str(navmesh_file))
+    if not robot_sim.sim.pathfinder.is_loaded:
+        raise RuntimeError(f"failed to load {navmesh_file} into the simulator")
+    # HabitatRobotSim.reset(scene_id=...) re-runs navmesh_config_and_recompute()
+    # whenever this flag is set, which would silently put the robot mesh back on
+    # the next scene switch. Clearing it means a switch falls back to the
+    # scene's stock navmesh -- which is exactly this one.
+    robot_sim._navmesh_recomputed = False
+    return f"dataset (shipped point-agent mesh, {navmesh_file.name})"
+
+
+def _dataset_navmesh_path(scene_path: Path) -> Optional[Path]:
+    """The shipped navmesh file for a scene, or None. See dataset_pathfinder."""
+    candidates = []
+    hm3d = Path(str(scene_path).replace(".basis.glb", ".basis.navmesh"))
+    if hm3d != scene_path:
+        candidates.append(hm3d)
+    candidates.append(scene_path.with_suffix(".navmesh"))
+    for nav in candidates:
+        if nav.suffix == ".navmesh" and nav.exists():
+            return nav
+    return None
+
+
 def robot_position_3d(robot_sim) -> np.ndarray:
     """The robot's habitat-frame ``[x, y, z]`` position.
 

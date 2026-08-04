@@ -89,6 +89,11 @@ class EpisodeRunner:
         goal_probe.reset(episode)
 
         start_distance = float(start_metrics["distance_to_goal"])
+        # Sampled here, before a single tick, so it is the *start* euclidean and
+        # not wherever the robot ended up. Its ratio to the geodesic is the
+        # signal for a navmesh that routes the long way round something the
+        # physics body can simply drive through -- see `detour_ratio` below.
+        start_euclidean = self._euclidean_to_goal(episode)
         distance = start_distance
         min_distance = distance
         goal_probe.observe(distance)
@@ -99,14 +104,37 @@ class EpisodeRunner:
         )
 
         first_reach_step: Optional[int] = None
+        # Separate from first_reach_step: arrival is judged at success_distance
+        # (what the oracle measures latch on and what the overlay reports),
+        # termination at config.stop_distance, which may be tighter.
+        stop_step: Optional[int] = None
         latencies: List[float] = []
+        # Per-step stop-classifier scores, kept whether or not the head is acting.
+        # A threshold and a temperature are one scalar each, fitted after the
+        # fact on saved scores (`stop_head.py`: they do not change AP or AUC), so
+        # recording them turns "the head is miscalibrated" into an offline sweep
+        # rather than a re-run of the whole split. `stop_trace` stays None on a
+        # checkpoint without a stop head, so nothing else grows a column.
+        stop_trace: Optional[List[List[float]]] = None
+        # Proof that pose injection actually happened, per step: the value the
+        # model was *shown*, straight out of the policy. The failure this catches
+        # is the silent one -- a checkpoint that declares a pose spec while the
+        # harness feeds it nothing would still produce a full set of plausible
+        # metrics, and this column would be empty.
+        pose_trace: Optional[List[List[float]]] = None
+        # Times the classifier said stop somewhere the oracle did not agree, under
+        # --stop-requires-oracle. Counted rather than merely ignored: this IS the
+        # head's false-positive rate at the configured operating point, measured
+        # on the trajectory the policy actually drives, and it is the number the
+        # gate exists to expose.
+        stop_suppressed = 0
         terminated: Optional[str] = None
         chunk: Optional[ActionChunk] = None
         steps = 0
         started = time.perf_counter()
 
         def on_tick(record: TickRecord) -> None:
-            nonlocal distance, min_distance, first_reach_step
+            nonlocal distance, min_distance, first_reach_step, stop_step
             task.observe_pose(record.pose)
             for probe in ctx.probes:
                 probe.on_tick(record)
@@ -117,6 +145,8 @@ class EpisodeRunner:
                     min_distance = min(min_distance, distance)
                 if distance < config.success_distance and first_reach_step is None:
                     first_reach_step = record.chunk_index
+                if distance < config.stop_distance and stop_step is None:
+                    stop_step = record.chunk_index
             # The next step's [obs] frame covers the final tick of this chunk,
             # so it is not re-rendered here.
             if config.record_video and record.tick_in_chunk < ctx.executor.gap - 1:
@@ -156,23 +186,77 @@ class EpisodeRunner:
                     pose=ctx.robot_sim.get_2d_pose(),
                     sim_time=ctx.executor.sim_time,
                 )
+                # Sampled at *observation* time, because that is the frame the
+                # classifier looked at. Checking the post-chunk distance instead
+                # would credit or blame it for `gap` ticks of motion it had not
+                # seen when it decided.
+                distance_when_asked = distance
                 chunk = ctx.policy.act(observation)
                 latencies.append(float(chunk.stats.get("latency_s", float("nan"))))
+                if chunk.stats.get("stop_prob") is not None:
+                    if stop_trace is None:
+                        stop_trace = []
+                    # Path length alongside the score, because an offline
+                    # threshold sweep needs BOTH to be exact. Stopping does not
+                    # change the trajectory -- the policy never sees the stop
+                    # decision -- so "what would threshold X have scored" is a
+                    # lookup into these traces, not an estimate. Without the path
+                    # length only `success` is recoverable; SPL would have to be
+                    # computed from the final path, which is wrong in the
+                    # flattering direction. Recorded only when a stop head is
+                    # present, so no other run grows a column.
+                    stop_trace.append([
+                        float(chunk.stats["stop_prob"]),
+                        float(chunk.stats.get("stop_logit", float("nan"))),
+                        float(getattr(task.path_tracker, "length", float("nan"))),
+                    ])
+                if chunk.stats.get("pose_value") is not None:
+                    if pose_trace is None:
+                        pose_trace = []
+                    pose_trace.append([float(v) for v in chunk.stats["pose_value"]])
                 steps = step + 1
 
-                execution = ctx.executor.execute(chunk, step, on_tick=on_tick)
+                # The oracle stop, for a policy with no termination head of its
+                # own: end the episode on the tick the agent first gets close
+                # enough, not at the end of whatever chunk that tick fell in.
+                # `on_tick` runs first and sets `first_reach_step`, so the
+                # arriving tick is the one that stops it.
+                execution = ctx.executor.execute(
+                    chunk, step, on_tick=on_tick,
+                    stop_when=(
+                        # Cutting the chunk short is only right when arrival is
+                        # meant to END the episode. With a delay the window has
+                        # just opened and the robot should keep driving through
+                        # it, so the chunk runs out.
+                        (lambda _record: stop_step is not None)
+                        if config.auto_stop and not config.auto_stop_delay else None
+                    ),
+                )
                 for probe in ctx.probes:
                     probe.on_chunk(execution)
                 goal_probe.observe(distance)
 
                 if chunk.stop:
-                    terminated = "policy called stop"
-                    break
+                    # Gated: the classifier only gets to end the episode where the
+                    # oracle already agrees. Elsewhere its call is recorded as a
+                    # false positive and the rollout carries on.
+                    if config.stop_requires_oracle and not (
+                        distance_when_asked < config.success_distance
+                    ):
+                        stop_suppressed += 1
+                    else:
+                        terminated = "policy called stop"
+                        break
                 if ctx.robot_sim.is_tipped_over():
                     terminated = "robot tipped over"
                     break
-                if config.auto_stop and first_reach_step is not None:
-                    terminated = "auto-stop on arrival"
+                if config.auto_stop and stop_step is not None and (
+                    step >= stop_step + config.auto_stop_delay
+                ):
+                    terminated = (
+                        "auto-stop on arrival" if not config.auto_stop_delay
+                        else f"oracle stop +{config.auto_stop_delay} steps"
+                    )
                     break
         finally:
             recorder.close()
@@ -188,8 +272,11 @@ class EpisodeRunner:
             episode=episode, screen=screen, metrics=metrics, start_metrics=start_metrics,
             distance=distance, min_distance=min_distance, steps=steps,
             first_reach_step=first_reach_step, terminated=terminated,
+            start_euclidean=start_euclidean,
             latencies=latencies, goal_probe=goal_probe, recorder=recorder,
             wall_seconds=time.perf_counter() - started, chunk=chunk,
+            stop_trace=stop_trace, pose_trace=pose_trace,
+            stop_suppressed=stop_suppressed,
         )
 
     # ------------------------------------------------------------------
@@ -215,9 +302,13 @@ class EpisodeRunner:
     def _record(
         self, *, episode: EvalEpisode, screen: ScreenResult, metrics: Dict[str, Any],
         start_metrics: Dict[str, Any], distance: float, min_distance: float, steps: int,
+        start_euclidean: float,
         first_reach_step: Optional[int], terminated: Optional[str],
         latencies: List[float], goal_probe: GoalDistanceProbe, recorder: Recorder,
         wall_seconds: float, chunk: Optional[ActionChunk],
+        stop_trace: Optional[List[List[float]]] = None,
+        pose_trace: Optional[List[List[float]]] = None,
+        stop_suppressed: int = 0,
     ) -> Dict[str, Any]:
         ctx = self.ctx
         record: Dict[str, Any] = {
@@ -241,6 +332,21 @@ class EpisodeRunner:
             geodesic_start_m=float(start_metrics["distance_to_goal"]),
             geodesic_start_screen_m=float(screen.geodesic_start_m),
             geodesic_start_dataset_m=float(screen.geodesic_start_dataset_m),
+            geodesic_start_euclidean_m=float(start_euclidean),
+            # How far out of its way the navmesh says the robot must go. The
+            # robot is a *physics body*, not a navmesh agent -- it can drive
+            # routes the conservative robot navmesh (r=0.28, h=1.0) forbids. On
+            # MP3D `8194nk5LbLH:39` the geodesic start was 9.15 m and the goal
+            # was 2.20 m away in a straight line; the robot reached it in 1.9 m
+            # of travel, the distance trace fell 9.99 -> 0.02 in three policy
+            # steps, and SPL pinned at 1.000 because its reference path was
+            # longer than the route actually taken. A high ratio is where that
+            # happens. Diagnostic only -- nothing filters on it.
+            detour_ratio=(
+                float(start_metrics["distance_to_goal"]) / float(start_euclidean)
+                if np.isfinite(start_euclidean) and start_euclidean > 1e-6
+                else float("nan")
+            ),
             dataset_geodesic_m=episode.dataset_geodesic,
             steps=int(steps),
             ticks=int(ctx.executor.tick),
@@ -259,6 +365,37 @@ class EpisodeRunner:
             record[probe.name] = probe.summary()
         if chunk is not None and chunk.extra:
             record["policy_extra"] = chunk.extra
+        if stop_trace is not None:
+            probs = [row[0] for row in stop_trace]
+            record["stop"] = {
+                # `acted`: did the policy's own head end this episode, as opposed
+                # to the oracle or the step cap. Distinguishable from `terminated`
+                # only because both can be present in one run's records.
+                "acted": record["terminated"] == "policy called stop",
+                # Fired where the oracle disagreed and was discarded. Only ever
+                # nonzero under --stop-requires-oracle; it is the head's false
+                # positive count on this episode's own trajectory.
+                "suppressed": stop_suppressed,
+                "steps": len(probs),
+                "max_prob": max(probs),
+                "max_prob_step": int(np.argmax(probs)),
+                "final_prob": probs[-1],
+                # (prob, logit, path_length_m) per step. The logit is what a
+                # post-hoc temperature refit needs, the probability is what a
+                # threshold sweep needs, and the path length is what makes the
+                # swept SPL exact rather than an estimate.
+                "trace": stop_trace,
+            }
+        if pose_trace is not None:
+            record["pose_injected"] = {
+                "steps": len(pose_trace),
+                # Relative to this episode's first observation, so row 0 is
+                # exactly (0, 0, 0) -- a cheap end-to-end assertion that the
+                # frame convention survived the trip.
+                "first": pose_trace[0],
+                "last": pose_trace[-1],
+                "trace": pose_trace,
+            }
         return record
 
 

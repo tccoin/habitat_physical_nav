@@ -392,6 +392,19 @@ dependency sets conflict. `bridge.py` and `scripts/policy_server.py` are the
 checkpoint's own code lives in a checkout the model env has not installed,
 `--policy-sys-path`.
 
+Fifth thing, added for the pose-injection run and documented in
+`docs/POSE_INJECTION_EVAL.md`: **a checkpoint can want more than an image, and can
+want to stop.** Neither is a new backend — both are properties of the checkpoint,
+switched on by reading it, so `bridge._PoseFeed` and `bridge._StopHeadControl` are
+shared by all three backends and are inert on a checkpoint declaring neither.
+The rule that matters: the harness sends the **raw** planar pose from
+`get_2d_pose()` and never computes the training frame itself — `pose_frame.
+relative_se2` in the model environment is the single implementation, called by
+the collator and the rollout alike. A second, "equivalent" implementation here
+would not raise when it drifted; the model would read confident nonsense and the
+run would still print a number. `--stop-head` and `--auto-stop` are mutually
+exclusive (the config raises) because both terminate the episode.
+
 `objectnav_eval/probes.py` carries the PID tracking diagnostic (commanded vs
 achieved displacement, lag, undershoot ratio, controller saturation). It is a
 diagnostic and gates nothing; see

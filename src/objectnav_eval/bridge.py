@@ -23,7 +23,7 @@ from __future__ import annotations
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Sequence
 
 import numpy as np
 
@@ -53,9 +53,17 @@ class PolicyBackend:
     def reset(self, goal_text: Optional[str]) -> None:  # pragma: no cover
         raise NotImplementedError
 
-    def act(self, rgb: np.ndarray) -> np.ndarray:  # pragma: no cover
-        """Return an ``(T, 3)`` chunk of ``[dx, dy, dtheta]`` offsets."""
-        raise NotImplementedError
+    def act(self, rgb: np.ndarray, pose: Optional[Sequence[float]] = None) -> np.ndarray:
+        """Return an ``(T, 3)`` chunk of ``[dx, dy, dtheta]`` offsets.
+
+        ``pose`` is the agent's **raw planar** ``[X, Y, theta]`` at this
+        observation, exactly as ``HabitatRobotSim.get_2d_pose()`` returns it --
+        scene frame, arbitrary per-scene origin, *not* relative to anything. It
+        is offered to every backend and ignored by the ones whose checkpoint
+        declares no use for it; see :class:`_PoseFeed` for why the raw value is
+        what crosses the wire.
+        """
+        raise NotImplementedError  # pragma: no cover
 
     @property
     def last_stats(self) -> Dict[str, Any]:
@@ -88,6 +96,268 @@ def available_backends() -> list:
     return sorted(_BACKENDS)
 
 
+# ---------------------------------------------------------------------------
+# Shared, checkpoint-driven capabilities
+# ---------------------------------------------------------------------------
+# Neither of the two below is a backend. They are the parts of a rollout that
+# some checkpoints have and others do not, and which are therefore switched on
+# by *reading the checkpoint*, not by picking a different `--policy-backend`.
+# A pose-injecting AR head and a pose-injecting vector head are the same eval
+# problem; making them two backends would duplicate the one piece that can be
+# silently wrong.
+
+
+class _PoseFeed:
+    """Per-turn agent pose, for a checkpoint whose config declares a pose modality.
+
+    What crosses the wire is the **raw scene-frame** ``[X, Y, theta]`` the
+    simulator reports, and the conversion to the frame the model was trained on
+    happens inside ``VectorRolloutPolicy.pose_values`` -> ``pose_frame.
+    relative_se2``. That is the whole point, and it is worth being explicit
+    about why the conversion is not done here:
+
+    the model is shown pose **relative to the first observation in context**,
+    expressed in that observation's own frame. Training derives that at collate
+    time from the raw ``obs_poses`` column via the spec's
+    ``pose_relative_first`` transform, which is a thin binding to the same
+    ``relative_se2``. So there is exactly one implementation of the convention
+    and both paths call it. Reimplementing it here -- even correctly -- would
+    create a second one, and a divergence between the two does not raise: the
+    model reads confident nonsense and the run produces a number. Two ways it
+    would go wrong that no assertion downstream would catch: a *previous-frame
+    delta* instead of an episode-start anchor (plausible values, wrong
+    semantics), and an unwrapped heading difference, which on this corpus
+    reaches 5.955 rad where the true rotation is 0.400 rad.
+
+    Detection is by **transform, not token name**: ``_resolve_pose_spec``
+    already picks the single spec declaring ``pose_relative_first``, because
+    that transform *is* the contract ``step(obs_pose=...)`` implements. A spec
+    called ``<pose>`` that did not declare it would need its values supplied
+    some other way, and would correctly not be fed from here.
+
+    **Supplying the value is only half of it: the marker has to be in the
+    text.** ``RolloutConfig.modality_marker`` defaults to ``None``, and nothing
+    on the model side fills it in -- ``from_checkpoint`` does not, because the
+    marker belongs to how a *turn is rendered*, not to the weights. Left unset,
+    the values are supplied with no marker to bind them to and the embedder
+    raises "modality values were provided but nothing was injected", on the very
+    first step of every episode. So this class installs it, from
+    ``spec.token``, never from a literal here: the token string is the spec's
+    identity, and a copy of it in this file is a second place for it to be
+    wrong. `format_action_chunk_dataset.py` and the rollout both build the turn
+    through `vector_rollout.user_block_content`, so setting the marker
+    reproduces the training message structure exactly -- position included,
+    which matters because a marker directly after ``<|vision_start|>`` would
+    silently corrupt every position id downstream.
+
+    Inert on every checkpoint that declares no such spec: no marker is
+    installed, ``step_kwargs`` returns an empty dict, and the ``step()`` call is
+    character for character the one that ran before this existed.
+    """
+
+    def __init__(self, policy: Any):
+        # `_pose_spec` is None on any checkpoint without the modality mechanism,
+        # and the attribute itself is absent on a longnav old enough to predate
+        # it -- both mean "this checkpoint does not want pose".
+        self.spec = getattr(policy, "_pose_spec", None)
+        self.fed = 0
+        self.marker: Optional[str] = None
+        if self.spec is not None:
+            self._install_marker(policy)
+
+    def _install_marker(self, policy: Any) -> None:
+        """Write this spec's token into every turn's user block."""
+        config = getattr(policy, "cfg", None)
+        if config is None or not hasattr(config, "modality_marker"):
+            raise RuntimeError(
+                f"this checkpoint declares modality {self.spec.token}, but its "
+                "RolloutConfig has no `modality_marker` field -- the longnav checkout on "
+                "--policy-sys-path predates the modality mechanism and cannot render the "
+                "marker into a turn. Point it at one that has it."
+            )
+        existing = config.modality_marker
+        if existing is None:
+            config.modality_marker = self.spec.token
+        elif existing != self.spec.token:
+            raise ValueError(
+                f"the rollout config already writes marker {existing!r} into each turn, "
+                f"but the checkpoint's spec is {self.spec.token!r}. One of them is not "
+                "what the model was trained on; refusing to guess which."
+            )
+        self.marker = config.modality_marker
+
+    def __bool__(self) -> bool:
+        return self.spec is not None
+
+    def on_episode_reset(self) -> None:
+        self.fed = 0
+
+    def step_kwargs(self, pose: Optional[Sequence[float]]) -> Dict[str, Any]:
+        if self.spec is None:
+            return {}
+        if pose is None:
+            raise RuntimeError(
+                f"this checkpoint declares modality {self.spec.token} with the "
+                "'pose_relative_first' transform, so every turn needs the agent's raw "
+                "planar [X, Y, theta] -- but the caller sent none. The marker is in the "
+                "text either way, so continuing would inject nothing and the model would "
+                "read a meaningless embedding. (Sim side: Observation.pose must reach "
+                "PolicyBridge.act; in-process: pass act(rgb, pose=...).)"
+            )
+        values = [float(v) for v in pose]
+        if len(values) != 3:
+            raise ValueError(
+                f"pose must be 3 numbers [X, Y, theta], got {len(values)}: {values}"
+            )
+        self.fed += 1
+        return {"obs_pose": values}
+
+    def describe(self) -> str:
+        if self.spec is None:
+            return "pose=none (no spec declares 'pose_relative_first')"
+        return (
+            f"pose={self.spec.token} raw [X, Y, theta] -> relative_se2 vs this "
+            f"episode's first observation (transform={self.spec.transform}, "
+            f"column={self.spec.source_column}, marker in user block={self.marker!r})"
+        )
+
+
+class _StopHeadControl:
+    """The checkpoint's stop classifier, and the runtime knobs on it.
+
+    Off unless asked for, and that default is the point rather than caution.
+    Every evaluation in this project so far ran with the harness's oracle
+    ``--auto-stop``, which ends an episode on arrival; a stop head firing under
+    that regime would be indistinguishable from the oracle in the metrics, and
+    the two would silently share credit for the same episode. So ``enabled``
+    gates only whether :meth:`decided` can return True -- the probability is
+    computed and reported either way, which is what makes a threshold fittable
+    after the fact rather than by re-running.
+
+    ``temperature`` / ``threshold`` / ``inference`` are written onto the loaded
+    ``StopHeadConfig``. They are runtime knobs by design (``stop_head.py``:
+    temperature "is not trained and does not change AP or AUC"), so a
+    miscalibrated head is a scalar to fit on saved scores, not a failed
+    experiment. They are validated here because assigning to a dataclass field
+    after construction bypasses its ``__post_init__``.
+    """
+
+    MODES = ("sample", "threshold", "argmax")
+
+    def __init__(
+        self,
+        policy: Any,
+        enabled: bool = False,
+        temperature: Optional[float] = None,
+        threshold: Optional[float] = None,
+        inference: Optional[str] = None,
+    ):
+        self.head = getattr(getattr(policy, "model", None), "stop_head", None)
+        self.enabled = bool(enabled)
+        if self.enabled and self.head is None:
+            raise ValueError(
+                "--stop-head was requested but this checkpoint has no stop head "
+                "(model.stop_head is None). Nothing would ever end the episode; use "
+                "--auto-stop for the oracle stop instead."
+            )
+        if self.head is None:
+            return
+        cfg = self.head.cfg
+        if inference is not None:
+            if inference not in self.MODES:
+                raise ValueError(
+                    f"stop inference must be one of {self.MODES}, got {inference!r}"
+                )
+            cfg.inference = inference
+        if temperature is not None:
+            if float(temperature) <= 0:
+                raise ValueError(f"stop temperature must be > 0, got {temperature}")
+            cfg.temperature = float(temperature)
+        if threshold is not None:
+            if not 0.0 <= float(threshold) <= 1.0:
+                raise ValueError(f"stop threshold must be in [0, 1], got {threshold}")
+            cfg.threshold = float(threshold)
+
+    def __bool__(self) -> bool:
+        return self.head is not None
+
+    def seed(self, policy: Any, seed: int) -> None:
+        """Pin the sampled decision for this episode.
+
+        Only meaningful for ``inference == 'sample'``, and harmless otherwise --
+        but only called when sampling, so a threshold run does not allocate a
+        generator it will never read.
+        """
+        if self.head is not None and self.head.cfg.inference == "sample":
+            policy.seed_stop(int(seed))
+
+    def annotate(self, stats: Dict[str, Any]) -> Dict[str, Any]:
+        """Add ``stop_logit`` -- the *uncalibrated* score -- next to ``stop_prob``.
+
+        The recorded probability is already temperature-scaled, and the episode
+        record rounds floats to 3 decimals, so a head whose probabilities all sit
+        in (0.000, 0.005) would be saved as a column of zeros and no threshold
+        could be fitted on it afterwards. The logit has none of that dynamic-range
+        problem, and it is the quantity a post-hoc fit actually wants: temperature
+        divides it, so refitting T offline is only possible from the logit.
+
+        Recovered by inverting the reported probability rather than by a second
+        forward pass, which makes it exactly the number the head produced.
+        Saturated probabilities (|logit| beyond about 17 in float32) are clamped
+        and reported at the clamp; that is a limit of the recorded value, not of
+        the head, and it only bites where the decision is not in doubt anyway.
+        """
+        if self.head is None:
+            return stats
+        prob = stats.get("stop_prob")
+        if prob is None:
+            return stats
+        import math
+
+        p = min(max(float(prob), 1e-7), 1.0 - 1e-7)
+        stats["stop_logit"] = float(self.head.cfg.temperature) * math.log(p / (1.0 - p))
+        return stats
+
+    def decided(self, stats: Dict[str, Any]) -> bool:
+        """The policy's own termination decision, or False when the head is off.
+
+        Reads ``last_stats['stop']``, which ``VectorRolloutPolicy.step`` already
+        computed under the configured inference rule. Recomputing it here would
+        be a second decision rule for the same logit.
+        """
+        return bool(self.enabled and stats.get("stop"))
+
+    def describe(self) -> str:
+        if self.head is None:
+            return "stop head=none (oracle --auto-stop is the only termination)"
+        cfg = self.head.cfg
+        state = "ACTIVE" if self.enabled else "reported only (not acting)"
+        return (
+            f"stop head={state} inference={cfg.inference} "
+            f"temperature={cfg.temperature} threshold={cfg.threshold}"
+        )
+
+
+def _wire_safe(stats: Dict[str, Any]) -> Dict[str, Any]:
+    """Make ``last_stats`` survive the socket.
+
+    ``VectorRolloutPolicy.last_stats['pose_value']`` is a **torch tensor** (the
+    value actually injected, kept so a decodability probe does not have to
+    re-derive the frame). The sim environment has no torch, and the two
+    environments also disagree about numpy, so anything but plain Python here
+    fails at ``conn.recv()`` -- as an unpickling error a whole episode away from
+    its cause. Converted rather than dropped: it is the one number that proves
+    what the model was shown.
+    """
+    out: Dict[str, Any] = {}
+    for key, value in stats.items():
+        if hasattr(value, "tolist"):
+            out[key] = value.tolist()
+        else:
+            out[key] = value
+    return out
+
+
 class VectorRolloutBackend(PolicyBackend):
     """The turn-vector action-chunk head (``longnav.utils.vector_rollout``).
 
@@ -102,6 +372,11 @@ class VectorRolloutBackend(PolicyBackend):
         merge_lora: bool = True,
         max_context_tokens: int = 0,
         placeholder: Optional[str] = None,
+        seed: int = 0,
+        stop_head: bool = False,
+        stop_temperature: Optional[float] = None,
+        stop_threshold: Optional[float] = None,
+        stop_inference: Optional[str] = None,
     ):
         from longnav.utils.vector_rollout import RolloutConfig, VectorRolloutPolicy
 
@@ -111,21 +386,43 @@ class VectorRolloutBackend(PolicyBackend):
         if placeholder:
             config.placeholder = placeholder
         self.policy = VectorRolloutPolicy.from_checkpoint(ckpt, config)
+        self.seed = int(seed)
+        self._episode_count = 0
+        # Both read the checkpoint and are inert on one that declares neither, so
+        # a plain vector head loads and runs exactly as it did before.
+        self._pose = _PoseFeed(self.policy)
+        self._stop = _StopHeadControl(
+            self.policy, enabled=stop_head, temperature=stop_temperature,
+            threshold=stop_threshold, inference=stop_inference,
+        )
 
     def reset(self, goal_text: Optional[str]) -> None:
         self.policy.reset(goal_text=goal_text)
+        self._pose.on_episode_reset()
+        self._stop.seed(self.policy, self.seed + self._episode_count)
+        self._episode_count += 1
 
-    def act(self, rgb: np.ndarray) -> np.ndarray:
+    def act(self, rgb: np.ndarray, pose: Optional[Sequence[float]] = None) -> np.ndarray:
         from PIL import Image
 
-        return np.asarray(self.policy.step(Image.fromarray(rgb)).numpy(), dtype=np.float32)
+        chunk = self.policy.step(
+            Image.fromarray(rgb), **self._pose.step_kwargs(pose)
+        )
+        return np.asarray(chunk.numpy(), dtype=np.float32)
 
     @property
     def last_stats(self) -> Dict[str, Any]:
-        return dict(self.policy.last_stats)
+        return self._stop.annotate(_wire_safe(self.policy.last_stats))
+
+    def wants_stop(self) -> bool:
+        return self._stop.decided(self.policy.last_stats)
 
     def describe(self) -> str:
-        return self.policy.describe()
+        return (
+            f"{self.policy.describe()}\n"
+            f"  [{self._pose.describe()}]\n"
+            f"  [{self._stop.describe()}]"
+        )
 
 
 register_backend("vector_rollout", VectorRolloutBackend)
@@ -153,6 +450,10 @@ class BinRolloutBackend(PolicyBackend):
         placeholder: Optional[str] = None,
         decode: str = "argmax",
         seed: int = 0,
+        stop_head: bool = False,
+        stop_temperature: Optional[float] = None,
+        stop_threshold: Optional[float] = None,
+        stop_inference: Optional[str] = None,
     ):
         from longnav.utils.bin_rollout import load_bin_policy, seed_sampling
         from longnav.utils.vector_rollout import RolloutConfig
@@ -167,27 +468,290 @@ class BinRolloutBackend(PolicyBackend):
         self.seed = int(seed)
         self._episode_count = 0
         self.policy = load_bin_policy(ckpt, config, decode=decode)
+        self._pose = _PoseFeed(self.policy)
+        self._stop = _StopHeadControl(
+            self.policy, enabled=stop_head, temperature=stop_temperature,
+            threshold=stop_threshold, inference=stop_inference,
+        )
 
     def reset(self, goal_text: Optional[str]) -> None:
         self.policy.reset(goal_text=goal_text)
         if self.decode == "sample":
             self._seed_sampling(self.policy, self.seed + self._episode_count)
+        self._pose.on_episode_reset()
+        self._stop.seed(self.policy, self.seed + self._episode_count)
         self._episode_count += 1
 
-    def act(self, rgb: np.ndarray) -> np.ndarray:
+    def act(self, rgb: np.ndarray, pose: Optional[Sequence[float]] = None) -> np.ndarray:
         from PIL import Image
 
-        return np.asarray(self.policy.step(Image.fromarray(rgb)).numpy(), dtype=np.float32)
+        chunk = self.policy.step(Image.fromarray(rgb), **self._pose.step_kwargs(pose))
+        return np.asarray(chunk.numpy(), dtype=np.float32)
 
     @property
     def last_stats(self) -> Dict[str, Any]:
-        return dict(self.policy.last_stats)
+        return self._stop.annotate(_wire_safe(self.policy.last_stats))
+
+    def wants_stop(self) -> bool:
+        return self._stop.decided(self.policy.last_stats)
 
     def describe(self) -> str:
-        return f"{self.policy.describe()} [bin decode={self.decode} seed_base={self.seed}]"
+        return (
+            f"{self.policy.describe()} [bin decode={self.decode} seed_base={self.seed}]\n"
+            f"  [{self._pose.describe()}]\n"
+            f"  [{self._stop.describe()}]"
+        )
 
 
 register_backend("bin_rollout", BinRolloutBackend)
+
+
+class _PeriodicContextReset:
+    """Memory-length ablation: drop rollout history every ``every`` policy steps.
+
+    ``VectorRolloutPolicy.reset()`` clears ``past_key_values`` **and**
+    ``past_image_embeds``, zeroes ``rope_offset`` and ``step_index``, and
+    re-stakes the tokenised system prompt. So the step after a reset is
+    byte-for-byte the shape of an episode's first step: prompt retained, history
+    gone, positions restarting at 0. No KV surgery, no RoPE hole.
+
+    Memory is a **sawtooth, not a window**: within a block the available history
+    runs 0 -> ``every``-1 steps, so the arm measures an average memory of about
+    half the block, not a constant one. Sufficient to answer "does history
+    matter at all", imprecise for "how much".
+
+    Two things it deliberately does not do:
+
+    * It calls ``policy.reset()``, **never the backend's** ``reset()``. The
+      latter reseeds the per-episode sampling generator; re-running it
+      mid-episode would restart the RNG stream and correlate the chunks either
+      side of a block boundary, corrupting the very thing being measured.
+    * With ``every == 0`` (the default) ``before_act`` returns before touching
+      anything, so the unlimited-memory path is exactly what it was.
+
+    Known confounds, recorded because they are reasons a result could move that
+    have nothing to do with image memory: ``step_index`` restarts, so the policy
+    always sees "Observation 0, 1, 2..." and cannot know how long it has been
+    searching; and a policy that opens an episode with a sweep will repeat that
+    sweep every block.
+
+    On a pose-injecting checkpoint ``reset()`` also clears ``_raw_poses``, so
+    each block gets a fresh pose origin. That is the *correct* reading rather
+    than a third confound -- ``pose_frame.py`` defines the value as relative to
+    the first observation **in context**, and a block is exactly a context --
+    but it does mean this ablation removes metric history along with visual
+    history, so the two cannot be separated by running it.
+    """
+
+    def __init__(self, every: int = 0):
+        self.every = max(0, int(every))
+        self.goal: Optional[str] = None
+        self.step = 0
+        self.resets = 0
+
+    def on_episode_reset(self, goal_text: Optional[str]) -> None:
+        self.goal, self.step, self.resets = goal_text, 0, 0
+
+    def before_act(self, policy) -> None:
+        if not self.every:
+            return  # production path: unlimited memory, untouched
+        if self.step and self.step % self.every == 0:
+            policy.reset(goal_text=self.goal)
+            self.resets += 1
+        self.step += 1
+
+
+class ARRolloutBackend(PolicyBackend):
+    """The autoregressive-over-ticks action head (``longnav.utils.ar_action_head``).
+
+    Structurally the same backend as :class:`BinRolloutBackend` -- load the checkpoint,
+    fix a decode rule, reseed once per episode -- for the same reason: a
+    ``TurnARActionClassifier`` also occupies ``VectorRolloutPolicy``'s ``normalizer``
+    slot, so ``step()`` needs no override. Its last line calls
+    ``normalizer.denormalize(...)``, and ``ARActionCodec`` runs the sequential decode
+    there (T forward passes through the tiny causal decoder, each tick's chosen code fed
+    back in) and composes a real ``(T, 3)`` chunk. The wire format is therefore unchanged
+    and nothing on the simulator side knows this head exists.
+
+    There is no ``longnav.utils.ar_rollout`` to import the way ``bin_rollout`` provides
+    ``load_bin_policy``, so the four lines that build the policy live here.
+
+    Three differences from the bin head, all of which fail *silently* if copied across:
+
+    * **The decode rule lives on the normalizer, not on ``model.codec``.** For a
+      ``TurnBinClassifier`` those are one object; here ``model.codec`` is the
+      ``ChunkVQCodec`` lookup table *inside* the ``ARActionCodec``. Writing
+      ``model.codec.decode`` sets an attribute nothing reads, and the head then decodes
+      under its own default rather than the requested rule. ``ChunkVQCodec.DECODES`` is a
+      different tuple as well, so validating against it would admit ``"logits"``, which
+      this head does not implement.
+    * **``"context"`` is not a policy.** It is ``ARActionCodec``'s passthrough for offline
+      analysis (``dump/autoregressive_head/predict_ar.py``), returning the raw
+      ``(context_dim,)`` trunk vector. Rejected here rather than sent down the wire as a
+      256-long "chunk" that the executor would happily try to drive.
+    * **The default decode is ``"sample"``**, not the bin backend's ``"argmax"``. It is
+      this codec's own default and the only rule the head's design treats as an executable
+      sequential policy. ``"mean"`` is accepted because it is the control-within-the-
+      control -- if creeping returns under mean decode from these same weights, averaging
+      is the failure mode independent of architecture -- but it is computed from a
+      greedy-decoded prefix and is reporting-only, not a deployable rule.
+
+    Temperature stays at the codec's default of 1.0; there is no CLI flag for it.
+
+    **Decoder architecture is checkpoint-carried, and deliberately not this backend's
+    business.** ``CausalActionDecoder`` has grown options -- multi-token context
+    (``n_context_tokens``), a per-tick pose/velocity state (``use_prefix_pose``), a
+    ``markov`` attention mode, and ``direct_context``, which sets ``context_proj`` to
+    ``None`` outright -- all defaulting OFF so older checkpoints load unchanged. None of
+    them reaches this class: ``from_pretrained`` rebuilds the decoder from the
+    checkpoint's own ``ar_decoder_kwargs``, and the only decoder attribute written here
+    is ``normalizer.decode``. ``use_prefix_pose`` is the one with an external
+    requirement -- it needs ``centroids`` handed to ``decoder.forward``/``decode`` -- and
+    ``ARActionCodec.denormalize`` already supplies them, on the ``"mean"`` path as well
+    as the sequential one. So the backend is architecture-agnostic by construction, and
+    the only thing it owes a new architecture is *saying which one it loaded*: see
+    :meth:`describe`.
+    """
+
+    def __init__(
+        self,
+        ckpt: str,
+        device: str = "cuda",
+        merge_lora: bool = True,
+        max_context_tokens: int = 0,
+        placeholder: Optional[str] = None,
+        decode: str = "sample",
+        seed: int = 0,
+        context_reset_every: int = 0,
+        stop_head: bool = False,
+        stop_temperature: Optional[float] = None,
+        stop_threshold: Optional[float] = None,
+        stop_inference: Optional[str] = None,
+    ):
+        # Checked before the imports: a bad decode rule should fail the same way in any
+        # interpreter, not only in one that can already load the checkpoint.
+        if decode not in ("argmax", "sample", "mean"):
+            raise ValueError(
+                f"decode must be one of ('argmax', 'sample', 'mean'), got {decode!r}"
+                + (" -- 'context' is the offline passthrough, not an executable policy"
+                   if decode == "context" else "")
+            )
+
+        from transformers import AutoProcessor
+
+        from longnav.utils.ar_action_head import TurnARActionClassifier
+        from longnav.utils.vector_rollout import RolloutConfig, VectorRolloutPolicy
+
+        config = RolloutConfig(
+            device=device, merge_lora=merge_lora, max_context_tokens=max_context_tokens
+        )
+        if placeholder:
+            config.placeholder = placeholder
+        self.decode = decode
+        self.seed = int(seed)
+        self._episode_count = 0
+        # 0 = unlimited memory (production default); see _PeriodicContextReset.
+        self._context = _PeriodicContextReset(context_reset_every)
+
+        processor = AutoProcessor.from_pretrained(str(ckpt))
+        model = TurnARActionClassifier.from_pretrained(
+            ckpt, processor, dtype=config.dtype, device=config.device
+        )
+        model.normalizer.decode = decode
+        self.policy = VectorRolloutPolicy(model, processor, config)
+        # Read off the checkpoint, inert when it declares neither -- so every AR
+        # checkpoint evaluated before these existed runs the identical path.
+        self._pose = _PoseFeed(self.policy)
+        self._stop = _StopHeadControl(
+            self.policy, enabled=stop_head, temperature=stop_temperature,
+            threshold=stop_threshold, inference=stop_inference,
+        )
+
+    def _reseed(self, seed: int) -> None:
+        """Reseed ``ARActionCodec.generator`` -- the sticky fallback ``denormalize`` hands
+        to the decoder's ``torch.multinomial``. The generator's device must match the
+        logits' (they are produced by the decoder, which lives wherever the model does),
+        or ``multinomial`` refuses the pair outright."""
+        import torch
+
+        device = next(self.policy.model.decoder.parameters()).device
+        generator = torch.Generator(device=device if device.type == "cuda" else "cpu")
+        generator.manual_seed(int(seed))
+        self.policy.model.normalizer.generator = generator
+
+    def reset(self, goal_text: Optional[str]) -> None:
+        self.policy.reset(goal_text=goal_text)
+        if self.decode == "sample":
+            self._reseed(self.seed + self._episode_count)
+        self._pose.on_episode_reset()
+        self._stop.seed(self.policy, self.seed + self._episode_count)
+        self._episode_count += 1
+        self._context.on_episode_reset(goal_text)
+
+    def act(self, rgb: np.ndarray, pose: Optional[Sequence[float]] = None) -> np.ndarray:
+        from PIL import Image
+
+        # No-op unless --context-reset-every was passed; see _PeriodicContextReset.
+        self._context.before_act(self.policy)
+        chunk = self.policy.step(Image.fromarray(rgb), **self._pose.step_kwargs(pose))
+        return np.asarray(chunk.numpy(), dtype=np.float32)
+
+    @property
+    def last_stats(self) -> Dict[str, Any]:
+        stats = self._stop.annotate(_wire_safe(self.policy.last_stats))
+        context = getattr(self, "_context", None)
+        if context is not None and context.every:
+            stats["context_resets"] = context.resets
+        return stats
+
+    def wants_stop(self) -> bool:
+        return self._stop.decided(self.policy.last_stats)
+
+    #: Decoder options that default OFF, so a checkpoint predating them looks exactly like
+    #: one that declined them. Printed with their defaults filled in precisely because of
+    #: that: the eval log has to say which architecture ran, and "absent" and "off" are
+    #: indistinguishable in the stored config.
+    AR_DECODER_KEYS = (
+        ("n_context_tokens", 1),
+        ("use_prefix_pose", False),
+        ("attn_mode", "causal"),
+        ("direct_context", False),
+    )
+
+    def describe(self) -> str:
+        """One line of decode policy, one of decoder architecture.
+
+        The architecture line reads ``CausalActionDecoder.to_config()`` -- the same dict
+        ``save_pretrained`` stores as ``ar_decoder_kwargs`` and ``from_pretrained``
+        rebuilds the decoder from -- so it reports what was actually loaded rather than
+        restating the flags this backend was called with. Without it a v2 run and a v3 run
+        leave identical eval logs (``n_codes``/``n_ticks`` are the same across them), and
+        comparing the two afterwards is guesswork.
+        """
+        model = self.policy.model
+        cfg = model.decoder.to_config()
+        arch = " ".join(f"{key}={cfg.get(key, default)}"
+                        for key, default in self.AR_DECODER_KEYS)
+        # getattr: the test suite builds a partial backend with __new__ to avoid
+        # loading a multi-billion-parameter VLM, and describe() has to keep
+        # working on it -- that is the point of pinning it there.
+        context = getattr(self, "_context", None)
+        memory = (f"memory={context.every} steps/block"
+                  if context is not None and context.every else "memory=unlimited")
+        pose = getattr(self, "_pose", None)
+        stop = getattr(self, "_stop", None)
+        return (
+            f"{self.policy.describe()}\n"
+            f"  [ar decode={self.decode} seed_base={self.seed} "
+            f"n_codes={model.n_codes} n_ticks={model.n_ticks} {memory}]\n"
+            f"  [ar decoder d_model={cfg.get('d_model')} n_layers={cfg.get('n_layers')} "
+            f"n_heads={cfg.get('n_heads')} {arch}]"
+            + (f"\n  [{pose.describe()}]" if pose is not None else "")
+            + (f"\n  [{stop.describe()}]" if stop is not None else "")
+        )
+
+
+register_backend("ar_rollout", ARRolloutBackend)
 
 
 def serve(socket_path: str, backend: PolicyBackend) -> None:
@@ -218,7 +782,14 @@ def serve(socket_path: str, backend: PolicyBackend) -> None:
                 rgb = np.frombuffer(message["data"], dtype=message["dtype"]).reshape(
                     message["shape"]
                 )
-                chunk = np.asarray(backend.act(rgb), dtype=np.float32)
+                # A plain list of three floats, not an array: the two environments
+                # disagree about numpy (1.26 vs 2.x) and this has to unpickle in
+                # both. `.get` rather than `[...]`, so a sim side predating pose
+                # still talks to a server that has it -- the backend raises with
+                # a real explanation if its checkpoint actually needed one.
+                chunk = np.asarray(
+                    backend.act(rgb, pose=message.get("pose")), dtype=np.float32
+                )
                 conn.send(
                     {
                         "chunk": chunk.tobytes(),
@@ -347,10 +918,16 @@ class PolicyBridge:
     def reset(self, goal_text: Optional[str]) -> None:
         self._rpc({"cmd": CMD_RESET, "goal_text": goal_text})
 
-    def act(self, rgb: np.ndarray) -> Dict[str, Any]:
+    def act(self, rgb: np.ndarray, pose: Optional[Sequence[float]] = None) -> Dict[str, Any]:
         rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
         reply = self._rpc(
-            {"cmd": CMD_ACT, "shape": rgb.shape, "dtype": "uint8", "data": rgb.tobytes()}
+            {
+                "cmd": CMD_ACT, "shape": rgb.shape, "dtype": "uint8", "data": rgb.tobytes(),
+                # Raw planar [X, Y, theta] straight from `get_2d_pose()`. Sent
+                # unconditionally and cheaply (three floats); what to do with it is
+                # the checkpoint's business, not the simulator's -- see _PoseFeed.
+                "pose": None if pose is None else [float(v) for v in pose],
+            }
         )
         chunk = (
             np.frombuffer(reply["chunk"], dtype=np.float32)

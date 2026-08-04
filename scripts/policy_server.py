@@ -15,8 +15,26 @@ Normally launched for you. To debug the model side alone:
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
+
+# Set before torch is imported (the backend imports it lazily, inside its
+# __init__), because the allocator reads this once at initialisation.
+#
+# A rollout is a pathological allocation pattern for the default caching
+# allocator: the KV cache grows monotonically across a 350-step episode and is
+# then released at reset, so each episode leaves the reserved pool more
+# fragmented than the last. On a box where the GPUs are shared with training
+# this fragments into an OOM after a handful of episodes -- observed at ~7 GB
+# nominal headroom, with 4.19 GiB sitting *reserved but unallocated* in the
+# failing process. Expandable segments let the allocator give that back.
+#
+# It matters more here than it would elsewhere because a policy-server OOM is
+# not a lost episode: the error crosses the socket, `PolicyBridge._rpc` raises,
+# and the exception takes down the whole worker shard along with every episode
+# it had not yet run. `train_ar_action_sft.py` sets the same variable.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # The model environment has no reason to have this package installed, and
 # installing it there would drag habitat-lab expectations into an env that
@@ -38,11 +56,25 @@ def main() -> None:
     parser.add_argument("--max-context-tokens", type=int, default=0)
     parser.add_argument("--placeholder", default=None)
     parser.add_argument("--decode", default=None,
-                        help="decode rule for a distributional head (bin_rollout "
-                             "backend); unset means the backend's own default")
+                        help="decode rule for a distributional head (bin_rollout, "
+                             "ar_rollout); unset means the backend's own default")
+    parser.add_argument("--context-reset-every", type=int, default=None,
+                        help="memory-length ablation: drop rollout history (KV cache and "
+                             "visual dedup DB) every N policy steps, keeping the system "
+                             "prompt. Unset/0 = unlimited memory, the production default. "
+                             "In STEPS because that is what the backend can count; the "
+                             "harness converts from --policy-memory-seconds using dt*gap")
     parser.add_argument("--seed", type=int, default=None,
                         help="base seed for a backend's per-episode seeded sampling "
-                             "(bin_rollout with --decode sample)")
+                             "(bin_rollout / ar_rollout with --decode sample)")
+    parser.add_argument("--stop-head", action="store_true",
+                        help="let the checkpoint's stop classifier terminate episodes. "
+                             "Off = the probability is still computed and reported in "
+                             "last_stats, but wants_stop() is always False")
+    parser.add_argument("--stop-inference", default=None,
+                        choices=["sample", "threshold", "argmax"])
+    parser.add_argument("--stop-threshold", type=float, default=None)
+    parser.add_argument("--stop-temperature", type=float, default=None)
     parser.add_argument("--sys-path", default=None,
                         help="colon-separated paths to prepend to sys.path before "
                              "loading the backend -- the checkout the checkpoint's code "
@@ -69,6 +101,16 @@ def main() -> None:
         kwargs["decode"] = args.decode
     if args.seed is not None:
         kwargs["seed"] = args.seed
+    if args.context_reset_every is not None:
+        kwargs["context_reset_every"] = args.context_reset_every
+    # Same rule as above: only forwarded when the run asked for it, so a backend
+    # that predates the stop head sees exactly the kwargs it always saw.
+    if args.stop_head:
+        kwargs["stop_head"] = True
+    for name in ("stop_inference", "stop_threshold", "stop_temperature"):
+        value = getattr(args, name)
+        if value is not None:
+            kwargs[name] = value
     backend = build_backend(args.backend, **kwargs)
     print(backend.describe(), flush=True)
     serve(args.socket, backend)

@@ -28,6 +28,8 @@ import numpy as np
 RATE_KEYS = ["success", "oracle_success", "spl", "oracle_spl", "soft_spl"]
 DISTANCE_KEYS = [
     "distance_to_goal_m",
+    "geodesic_start_euclidean_m",
+    "detour_ratio",
     "min_distance_to_goal_m",
     "path_length_m",
     "geodesic_start_m",
@@ -80,6 +82,10 @@ PROBE_KEYS: Dict[str, List[str]] = {
         "obstructed_while_driving_frac", "collisions", "collisions_per_100_ticks",
         "collisions_per_m", "longest_obstructed_run_ticks",
         "peak_obstruction_force_max",
+    ],
+    # "escaped" is a bool per episode, so its mean IS the escape rate.
+    "escape": [
+        "escaped", "peak_descent_mps", "longest_descent_s", "total_drop_m",
     ],
     "coherence": [
         "flip_rate_within_chunk", "flip_rate_all_adjacent",
@@ -252,6 +258,8 @@ def episode_line(record: Dict[str, Any]) -> Dict[str, Any]:
             "episode_id": record["episode_id"], "category": record["category"],
             "status": "skipped", "reason_code": record.get("reason_code"),
             "reason": record.get("reason"),
+            # No euclidean/detour here: a skipped episode never ran, so the
+            # runner never sampled them.
             "start_m": jsonable(record.get("geodesic_start_m"), 2),
             "start_dataset_m": jsonable(record.get("geodesic_start_dataset_m"), 2),
         }
@@ -259,6 +267,7 @@ def episode_line(record: Dict[str, Any]) -> Dict[str, Any]:
     motion = record.get("motion") or {}
     contact = record.get("contact") or {}
     coherence = record.get("coherence") or {}
+    escape = record.get("escape") or {}
     line = {
         "uid": record["uid"], "scene": record["scene"],
         "episode_id": record["episode_id"], "category": record["category"],
@@ -268,6 +277,11 @@ def episode_line(record: Dict[str, Any]) -> Dict[str, Any]:
         "spl": jsonable(record.get("spl")), "oracle_spl": jsonable(record.get("oracle_spl")),
         "soft_spl": jsonable(record.get("soft_spl")),
         "start_m": jsonable(record.get("geodesic_start_m"), 2),
+        "start_euclid_m": jsonable(record.get("geodesic_start_euclidean_m"), 2),
+        # geodesic / euclidean at the start. High means the navmesh routes the
+        # long way round something the physics body may simply drive through,
+        # which inflates SPL's reference path. Diagnostic; nothing filters on it.
+        "detour_ratio": jsonable(record.get("detour_ratio"), 2),
         "final_m": jsonable(record.get("distance_to_goal_m"), 2),
         "min_m": jsonable(record.get("min_distance_to_goal_m"), 2),
         "path_m": jsonable(record.get("path_length_m"), 2),
@@ -284,6 +298,8 @@ def episode_line(record: Dict[str, Any]) -> Dict[str, Any]:
         "obstructed_frac": jsonable(contact.get("obstructed_frac"), 3),
         "collisions_per_m": jsonable(contact.get("collisions_per_m"), 3),
         "flip_rate": jsonable(coherence.get("flip_rate_within_chunk"), 3),
+        "escaped": escape.get("escaped"),
+        "total_drop_m": jsonable(escape.get("total_drop_m"), 2),
         "video": Path(record["video"]).name if record.get("video") else None,
     }
     return line
@@ -373,6 +389,16 @@ def print_summary(
         f"{_n('min_distance_to_goal_m')}, "
         f"start {summary['geodesic_start_m']:.2f} m)"
     )
+    escape = summary.get("escape") or {}
+    if escape:
+        n_escaped = round(escape.get("escaped", 0.0) * escape.get("episodes", 0))
+        print(
+            f"  escaped world    {n_escaped}/{escape.get('episodes', 0)} episode(s) "
+            f"({escape.get('escaped', 0.0) * 100:.1f}%)   "
+            f"max drop {escape.get('total_drop_m', float('nan')):.2f} m, "
+            f"peak descent {escape.get('peak_descent_mps', float('nan')):.2f} m/s"
+            + ("   <-- these episodes are invalid, not failures" if n_escaped else "")
+        )
     if summary.get("episodes_off_navmesh"):
         print(
             f"                   {summary['episodes_off_navmesh']} episode(s) ended off "

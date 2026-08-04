@@ -142,7 +142,10 @@ class BridgedPolicy(Policy):
         self.bridge.reset(goal)
 
     def act(self, obs: Observation) -> ActionChunk:
-        reply = self.bridge.act(obs.rgb)
+        # The pose goes over the wire on every step, whatever the checkpoint is.
+        # Deciding here would mean the simulator side knowing which checkpoints
+        # inject pose, and it is three floats next to a full RGB frame.
+        reply = self.bridge.act(obs.rgb, pose=obs.pose)
         self._last_stats = reply["stats"]
         return ActionChunk(reply["chunk"], stop=reply["stop"], stats=reply["stats"])
 
@@ -169,7 +172,9 @@ class InProcessPolicy(Policy):
         self.backend.reset(goal)
 
     def act(self, obs: Observation) -> ActionChunk:
-        chunk = self.backend.act(np.ascontiguousarray(obs.rgb, dtype=np.uint8))
+        chunk = self.backend.act(
+            np.ascontiguousarray(obs.rgb, dtype=np.uint8), pose=obs.pose
+        )
         return ActionChunk(
             chunk, stop=self.backend.wants_stop(), stats=dict(self.backend.last_stats)
         )
@@ -236,6 +241,9 @@ def build_policy(config: Any, server_script: str, log_path: Optional[str] = None
         backend_args["decode"] = config.policy_decode
     if config.policy_seed is not None:
         backend_args["seed"] = config.policy_seed
+    if config.context_reset_every is not None:
+        backend_args["context_reset_every"] = config.context_reset_every
+    backend_args.update(_stop_head_args(config))
 
     if config.policy_python:
         from objectnav_eval.bridge import PolicyBridge
@@ -256,5 +264,26 @@ def build_policy(config: Any, server_script: str, log_path: Optional[str] = None
         in_process_kwargs["decode"] = config.policy_decode
     if config.policy_seed is not None:
         in_process_kwargs["seed"] = config.policy_seed
+    if config.context_reset_every is not None:
+        in_process_kwargs["context_reset_every"] = config.context_reset_every
+    in_process_kwargs.update(_stop_head_args(config))
     backend = build_backend(config.policy_backend, **in_process_kwargs)
     return InProcessPolicy(backend)
+
+
+def _stop_head_args(config: Any) -> Dict[str, Any]:
+    """The stop-classifier knobs, only when the run actually asked for them.
+
+    Omitted rather than passed as ``None`` so a backend that predates the stop
+    head still accepts the kwargs it is given. ``stop_head`` is a bare switch:
+    ``PolicyBridge`` drops falsey values, so ``False`` sends no flag at all,
+    which is the same command line a run before this existed produced.
+    """
+    args: Dict[str, Any] = {}
+    if getattr(config, "stop_head", False):
+        args["stop_head"] = True
+    for name in ("stop_temperature", "stop_threshold", "stop_inference"):
+        value = getattr(config, name, None)
+        if value is not None:
+            args[name] = value
+    return args

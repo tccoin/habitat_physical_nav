@@ -136,6 +136,23 @@ class EvalConfig:
     # bad tail destroys the navigation metrics before they can be read, which is
     # what happened at threshold 0.95 on run_v5_ar_pose/checkpoint-4400.
     stop_requires_oracle: bool = False
+    # POSE-FRAME ABLATION. Mirror and/or rotate the frame the injected pose is
+    # expressed in, keeping it perfectly self-consistent but pointing the wrong
+    # way. The test of whether a pose-injecting policy actually *uses* the metric
+    # frame: if it navigates by noiseless GPS+compass this should wreck it, and
+    # if it ignores the injection the numbers should not move at all. Diagnostic
+    # only -- never a configuration to report a headline number under.
+    pose_mirror: bool = False
+    pose_rotate_deg: float = 0.0
+    # POSE-INFORMATION ABLATION. Inject another episode's pose sequence, drawn
+    # from a training-corpus dataset. Complements the mirror/rotate corruption,
+    # which is an isometry and therefore leaves every intrinsic quantity intact
+    # (distance travelled, revisit structure, coverage) -- a policy using pose
+    # only for "have I been here" survives that untouched. Foreign poses stay on
+    # the encoder's training distribution, unlike zeros or noise, while carrying
+    # no information about where the robot actually is.
+    pose_foreign: Optional[str] = None
+    pose_foreign_split: str = "train"
     stop_temperature: Optional[float] = None
     stop_threshold: Optional[float] = None
     stop_inference: Optional[str] = None
@@ -400,6 +417,29 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                           "either way (they latch on ever reaching --success-distance); "
                           "success/spl become the policy's own termination. The stop "
                           "probability is recorded per step regardless of this flag")
+    mdl.add_argument("--pose-mirror", action="store_true",
+                     help="POSE-FRAME ABLATION: mirror the injected pose about the "
+                          "start heading, flipping the strafe axis (+y left becomes "
+                          "-y) and negating the heading. Applied to the RELATIVE pose, "
+                          "so it is exactly the frame the model reads")
+    mdl.add_argument("--pose-rotate-deg", type=float, default=0.0,
+                     help="POSE-FRAME ABLATION: rotate the injected pose frame by this "
+                          "many degrees. Applied AFTER --pose-mirror (they do not "
+                          "commute). Note this must act on the relative pose: rotating "
+                          "the raw scene pose is algebraically cancelled by "
+                          "relative_se2's re-anchoring and would be a silent no-op")
+    mdl.add_argument("--pose-foreign", default=None,
+                     help="POSE-INFORMATION ABLATION: inject another episode's pose "
+                          "sequence instead of the robot's, sampled per episode from "
+                          "this load_from_disk() dataset (needs an `obs_poses` column, "
+                          "e.g. data/v2_25hz/formatted_pose). Stays on the encoder's "
+                          "training distribution -- unlike zeros or noise, which "
+                          "conflate 'no information' with 'input never seen' -- while "
+                          "carrying nothing about where the robot is. Trajectories are "
+                          "chained with an SE(2) rebase when one runs short of "
+                          "--max-steps, so the walk stays continuous")
+    mdl.add_argument("--pose-foreign-split", default="train",
+                     help="split of --pose-foreign to draw from")
     mdl.add_argument("--stop-requires-oracle", action="store_true",
                      help="the classifier may only end an episode at a step where the "
                           "agent is ALREADY within --success-distance. Its false "

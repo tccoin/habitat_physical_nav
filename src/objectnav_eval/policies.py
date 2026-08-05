@@ -286,4 +286,15 @@ def _stop_head_args(config: Any) -> Dict[str, Any]:
         value = getattr(config, name, None)
         if value is not None:
             args[name] = value
+    if getattr(config, "stop_requires_oracle", False):
+        # Gating happens runner-side, not in the backend: the backend cannot see
+        # the distance to goal. Recorded here only so the server log states it.
+        pass
+    if getattr(config, "pose_mirror", False):
+        args["pose_mirror"] = True
+    if getattr(config, "pose_rotate_deg", 0.0):
+        args["pose_rotate_deg"] = config.pose_rotate_deg
+    if getattr(config, "pose_foreign", None):
+        args["pose_foreign"] = config.pose_foreign
+        args["pose_foreign_split"] = getattr(config, "pose_foreign_split", "train")
     return args

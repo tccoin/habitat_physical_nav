@@ -344,12 +344,71 @@ This is the same pattern already recorded for this architecture: eval loss falls
 while navigation does not follow it. Use ckpt-3400's numbers as the matched
 baseline for the pose arm and do not read a trend into the 2600→3400 pair.
 
-### The pose arm: `run_v5_ar_pose`
+### The pose arm: `run_v5_ar_pose/checkpoint-4400`
 
-**Pending.** The run started 2026-08-03 ~07:08 UTC at ~19 s/step with
-`--save-steps 200`, so checkpoints land roughly every 65 minutes. Nothing to
-report yet, and nothing should be reported before the level-2 check in §3 has
-run against the first checkpoint.
+The run is `dump/pose_injection/run_v5_ar_pose` -- an **AR** head warm-started
+from `run_v3_ctx8_pose/checkpoint-3400`, launched by `ar_launch.sh` (see §7.2).
+Backend `ar_rollout`.
+
+**Termination had to be reworked before any number here was readable.** With the
+classifier acting ungated it ended every episode by step 46 and dragged
+`oracle_success` to 0.073 -- not because navigation failed but because the
+episode was over before it could start. §5 covers the fix; the arms below all use
+`--auto-stop --auto-stop-delay 30 --stop-head --stop-requires-oracle
+--stop-inference threshold --stop-threshold 0.5`, which lets the oracle open a
+30-step window on arrival and lets the classifier declare only inside it.
+
+| arm | n | oracle_success | oracle_spl |
+| --- | --- | --- | --- |
+| n41, true frame | 36 | 0.472 | 0.262 |
+| **sample101, true frame** | **70** | **0.486** | **0.271** |
+| v3 ckpt-3400 control (no injection) | 41 | 0.390 | 0.191 |
+
+`sample101` is the number to quote: 70 fresh episodes over 20 scenes, no splice
+and no shifted seeds. (An earlier n41 figure of 0.537 was a splice of 36 fresh
+episodes plus 5 carried over *because they had succeeded* -- an upward bias.
+Do not use it.)
+
+The +0.10 over the control is **not** resolvable at this n (MDE ~0.20), and in any
+case a pose-injecting policy has noiseless GPS+compass and is not comparable to
+one without it.
+
+### The ablations: does the policy use the injected pose?
+
+Three arms, same checkpoint, same gated config, paired uid for uid:
+
+| ablation | what it destroys | paired n | delta oracle_success | 95% CI | p | delta oracle_spl |
+| --- | --- | --- | --- | --- | --- | --- |
+| mirror + 90 deg | the frame's orientation only (an isometry) | 36 | **+0.000** | [-0.167, +0.139] | 1.000 | -0.004 |
+| foreign poses | everything -- an unrelated trajectory | 70 | **-0.057** | [-0.200, +0.086] | 0.557 | **+0.001** |
+| foreign poses | " | 36 | **+0.056** | [-0.139, +0.250] | 0.774 | +0.014 |
+
+**Null across the board.** Every interval spans zero, no p below 0.55, and the two
+foreign arms disagree in sign -- the signature of noise, not a small real effect.
+Behaviour is flat too: on the n=70 arm `turn_frac` +0.013 [-0.015, +0.042],
+`drive_frac` -0.024 [-0.065, +0.016], `flip_rate` +0.000.
+
+Why two different corruptions, and why the second is the one that counts: mirror
++ rotation is an **isometry**, so distances travelled, revisit structure and
+coverage all survive it. A policy using pose only for "have I been here before"
+is untouched by it, and a null there means "pose is not bound to visual
+direction", not "pose is unused". The foreign-trajectory arm removes that escape
+-- the injected walk is a real corpus trajectory, so still on the encoder's
+training distribution (unlike zeros or noise, which would confound "no
+information" with "input never seen"), but it carries nothing about where the
+robot is. It too is null.
+
+**So: at checkpoint-4400 the injected pose is not contributing to navigation.**
+
+What that does *not* establish, and must not be collapsed into it:
+
+1. **Unused vs. unusable.** `FourierSE2Encoder`'s output projection is
+   zero-initialised by design, so "the model cannot yet read the pose" predicts
+   exactly this result. No behavioural arm can separate the two; the decodability
+   probe (DESIGN.md section 9) is the only thing that can, and it does not exist yet.
+2. **Power.** MDE is 0.204 on the largest arm. This rules out a large
+   contribution, not a modest one.
+3. **One checkpoint**, 22% into a 20k-step run.
 
 ---
 

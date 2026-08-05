@@ -107,6 +107,179 @@ def available_backends() -> list:
 # silently wrong.
 
 
+class _PoseCorruption:
+    """Mirror and/or rotate the frame the pose is expressed in. **Diagnostic only.**
+
+    An ablation for the question the pose-injection run exists to answer: does the
+    policy *use* the injected pose, or does it merely tolerate it? A corrupted
+    frame is still perfectly self-consistent -- distances, pairwise separations
+    and the shape of the travelled path are all preserved, and row 0 stays at the
+    origin. What changes is which way "ahead at the start" points. (Row 0's
+    *heading* does become the rotation angle, which is the consistent reading of
+    a frame rotation: re-expressing the episode in a frame turned by -phi means
+    the agent started out facing phi. Rotating the positions while pinning the
+    heading at 0 would corrupt the geometry rather than the frame.) A policy navigating by the injected metric frame
+    should degrade sharply; one that ignores it should not move at all.
+
+    **The corruption applies to the RELATIVE pose, never to the raw scene pose,
+    and that is not a detail.** ``relative_se2`` re-anchors every value in the
+    first observation's own frame, so a rigid rotation of the raw poses is
+    *algebraically cancelled*::
+
+        rel' = R(-(theta0 + phi)) . R(phi) . (p - p0) = R(-theta0) . (p - p0) = rel
+
+    Corrupting the input would therefore be an exact no-op for rotation, and the
+    run would look like "rotating the frame changes nothing", which is a
+    conclusion about the transform rather than about the model. (A mirror is
+    *not* cancelled -- it conjugates through -- so a raw-pose implementation
+    would have silently ablated half of what was asked for and no-opped the
+    other half.)
+
+    Order is **mirror, then rotate**, and it matters: reflections and rotations
+    do not commute. ``mirror`` flips the strafe axis, `+y` (left) becoming `-y`,
+    with the heading negated to match -- the world seen through a mirror placed
+    along the start heading.
+    """
+
+    def __init__(self, mirror: bool = False, rotate_deg: float = 0.0):
+        self.mirror = bool(mirror)
+        self.rotate_deg = float(rotate_deg)
+
+    def __bool__(self) -> bool:
+        return self.mirror or bool(self.rotate_deg % 360.0)
+
+    def apply(self, rel):
+        """``(1, 3)`` relative pose -> corrupted ``(1, 3)``. Identity when inert."""
+        if not self:
+            return rel
+        import math
+
+        import torch
+
+        from longnav.utils.pose_frame import wrap_to_pi
+
+        x, y, theta = (float(v) for v in rel[0])
+        if self.mirror:
+            y, theta = -y, -theta
+        if self.rotate_deg:
+            phi = math.radians(self.rotate_deg)
+            cos, sin = math.cos(phi), math.sin(phi)
+            x, y = cos * x - sin * y, sin * x + cos * y
+            theta = theta + phi
+        theta = float(wrap_to_pi(torch.tensor(theta, dtype=torch.float64)))
+        return torch.tensor([[x, y, theta]], dtype=torch.float32)
+
+    def describe(self) -> str:
+        if not self:
+            return "pose frame=true"
+        parts = []
+        if self.mirror:
+            parts.append("MIRRORED about the start heading (strafe axis flipped)")
+        if self.rotate_deg:
+            parts.append(f"ROTATED {self.rotate_deg:g} deg")
+        return "pose frame=CORRUPTED: " + " then ".join(parts) + " -- diagnostic, not a policy"
+
+
+class _ForeignPose:
+    """Inject a **different episode's** pose sequence. The information ablation.
+
+    The mirror/rotate corruption above is an isometry: it breaks the binding
+    between the pose frame and world direction, but every intrinsic quantity
+    survives -- distances travelled, revisit structure, how much ground has been
+    covered. A policy using pose only for "have I been here before" is entirely
+    unharmed by it, so a null result there cannot distinguish *unused* from
+    *used, but only frame-intrinsically*.
+
+    This closes that gap. The injected poses are real trajectories drawn from the
+    training corpus, so they stay squarely on the distribution the encoder was
+    fitted to -- unlike zeros or noise, which conflate "no information" with
+    "input the model has never seen". What they carry is zero information about
+    where the robot actually is or has been.
+
+    **Chaining.** Corpus episodes top out at 311 observations while an eval
+    episode may run 350 steps, so one trajectory is not always enough. Rather
+    than wrapping (which teleports) or holding the last pose (which reads as
+    "stopped dead", a signal of its own), the next trajectory is rebased by the
+    SE(2) transform that puts its first pose exactly on the current last pose.
+    The result is still one continuous, plausible walk.
+
+    Sampling is seeded per episode from the same base as every other stochastic
+    part of a rollout, so a run reproduces.
+    """
+
+    def __init__(self, path: str, split: str = "train", column: str = "obs_poses"):
+        from datasets import load_from_disk
+
+        data = load_from_disk(path)
+        if hasattr(data, "keys"):
+            if split not in data:
+                raise KeyError(
+                    f"split {split!r} not in {path}; have {sorted(data.keys())}"
+                )
+            data = data[split]
+        if column not in data.column_names:
+            raise KeyError(
+                f"column {column!r} not in {path}:{split}; have {data.column_names}"
+            )
+        self.data = data
+        self.column = column
+        self.path = path
+        self.split = split
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def draw(self, rng) -> np.ndarray:
+        row = self.data[int(rng.integers(len(self.data)))]
+        return np.asarray(row[self.column], dtype=np.float64).reshape(-1, 3)
+
+    def walk(self, seed: int) -> "_ForeignWalk":
+        return _ForeignWalk(self, np.random.default_rng(int(seed)))
+
+    def describe(self) -> str:
+        return (f"pose source=FOREIGN {self.path}:{self.split}[{self.column}] "
+                f"({len(self)} trajectories) -- diagnostic, not a policy")
+
+
+class _ForeignWalk:
+    """One episode's worth of foreign poses, extended on demand."""
+
+    def __init__(self, source: _ForeignPose, rng):
+        self.source = source
+        self.rng = rng
+        self.buffer = source.draw(rng)
+        self.index = 0
+        self.trajectories = 1
+
+    def _extend(self) -> None:
+        """Append another trajectory, rebased to continue from the current end."""
+        import math
+
+        nxt = self.source.draw(self.rng)
+        if len(nxt) < 2:
+            return
+        end = self.buffer[-1]
+        d_theta = end[2] - nxt[0, 2]
+        cos, sin = math.cos(d_theta), math.sin(d_theta)
+        rel = nxt[1:, :2] - nxt[0, :2]
+        moved = np.empty_like(nxt[1:])
+        moved[:, 0] = cos * rel[:, 0] - sin * rel[:, 1] + end[0]
+        moved[:, 1] = sin * rel[:, 0] + cos * rel[:, 1] + end[1]
+        moved[:, 2] = nxt[1:, 2] + d_theta
+        self.buffer = np.concatenate([self.buffer, moved], axis=0)
+        self.trajectories += 1
+
+    def next(self) -> list:
+        while self.index >= len(self.buffer):
+            before = len(self.buffer)
+            self._extend()
+            if len(self.buffer) == before:  # degenerate rows only; avoid spinning
+                return [float(v) for v in self.buffer[-1]]
+        pose = self.buffer[self.index]
+        self.index += 1
+        return [float(v) for v in pose]
+
+
 class _PoseFeed:
     """Per-turn agent pose, for a checkpoint whose config declares a pose modality.
 
@@ -155,12 +328,18 @@ class _PoseFeed:
     character for character the one that ran before this existed.
     """
 
-    def __init__(self, policy: Any):
+    def __init__(self, policy: Any, corruption: Optional["_PoseCorruption"] = None,
+                 foreign: Optional["_ForeignPose"] = None, seed: int = 0):
         # `_pose_spec` is None on any checkpoint without the modality mechanism,
         # and the attribute itself is absent on a longnav old enough to predate
         # it -- both mean "this checkpoint does not want pose".
         self.spec = getattr(policy, "_pose_spec", None)
         self.fed = 0
+        self.corruption = corruption or _PoseCorruption()
+        self.foreign = foreign
+        self.seed = int(seed)
+        self.walk: Optional[_ForeignWalk] = None
+        self.episodes = 0
         self.marker: Optional[str] = None
         if self.spec is not None:
             self._install_marker(policy)
@@ -191,8 +370,14 @@ class _PoseFeed:
 
     def on_episode_reset(self) -> None:
         self.fed = 0
+        # A fresh draw per episode, seeded like every other stochastic part of a
+        # rollout so the run reproduces.
+        if self.foreign is not None:
+            self.walk = self.foreign.walk(self.seed + self.episodes)
+        self.episodes += 1
 
-    def step_kwargs(self, pose: Optional[Sequence[float]]) -> Dict[str, Any]:
+    def step_kwargs(self, policy: Any,
+                    pose: Optional[Sequence[float]]) -> Dict[str, Any]:
         if self.spec is None:
             return {}
         if pose is None:
@@ -209,8 +394,21 @@ class _PoseFeed:
             raise ValueError(
                 f"pose must be 3 numbers [X, Y, theta], got {len(values)}: {values}"
             )
+        if self.walk is not None:
+            # Substituted BEFORE the frame conversion, so the foreign poses go
+            # through the identical relative_se2 the real ones would have. The
+            # robot's actual pose is simply discarded.
+            values = self.walk.next()
         self.fed += 1
-        return {"obs_pose": values}
+        if not self.corruption:
+            # Production path: hand the raw pose over and let the model's own
+            # `pose_values` -> `relative_se2` do the conversion, untouched.
+            return {"obs_pose": values}
+        # Corrupting: take the relative value from the SAME function, then map
+        # it. `pose_values` also records the raw pose, so the episode-start
+        # anchor stays correct. `obs_pose=` and `modality[key]` are mutually
+        # exclusive by design, so the corrupted value goes through `modality`.
+        return {"modality": {self.spec.key: self.corruption.apply(policy.pose_values(values))}}
 
     def describe(self) -> str:
         if self.spec is None:
@@ -219,6 +417,8 @@ class _PoseFeed:
             f"pose={self.spec.token} raw [X, Y, theta] -> relative_se2 vs this "
             f"episode's first observation (transform={self.spec.transform}, "
             f"column={self.spec.source_column}, marker in user block={self.marker!r})"
+            + (f"\n  [{self.corruption.describe()}]" if self.corruption else "")
+            + (f"\n  [{self.foreign.describe()}]" if self.foreign is not None else "")
         )
 
 
@@ -377,6 +577,10 @@ class VectorRolloutBackend(PolicyBackend):
         stop_temperature: Optional[float] = None,
         stop_threshold: Optional[float] = None,
         stop_inference: Optional[str] = None,
+        pose_mirror: bool = False,
+        pose_rotate_deg: float = 0.0,
+        pose_foreign: Optional[str] = None,
+        pose_foreign_split: str = "train",
     ):
         from longnav.utils.vector_rollout import RolloutConfig, VectorRolloutPolicy
 
@@ -390,7 +594,11 @@ class VectorRolloutBackend(PolicyBackend):
         self._episode_count = 0
         # Both read the checkpoint and are inert on one that declares neither, so
         # a plain vector head loads and runs exactly as it did before.
-        self._pose = _PoseFeed(self.policy)
+        self._pose = _PoseFeed(
+            self.policy, _PoseCorruption(pose_mirror, pose_rotate_deg),
+            _ForeignPose(pose_foreign, pose_foreign_split) if pose_foreign else None,
+            seed=int(seed),
+        )
         self._stop = _StopHeadControl(
             self.policy, enabled=stop_head, temperature=stop_temperature,
             threshold=stop_threshold, inference=stop_inference,
@@ -406,7 +614,7 @@ class VectorRolloutBackend(PolicyBackend):
         from PIL import Image
 
         chunk = self.policy.step(
-            Image.fromarray(rgb), **self._pose.step_kwargs(pose)
+            Image.fromarray(rgb), **self._pose.step_kwargs(self.policy, pose)
         )
         return np.asarray(chunk.numpy(), dtype=np.float32)
 
@@ -454,6 +662,10 @@ class BinRolloutBackend(PolicyBackend):
         stop_temperature: Optional[float] = None,
         stop_threshold: Optional[float] = None,
         stop_inference: Optional[str] = None,
+        pose_mirror: bool = False,
+        pose_rotate_deg: float = 0.0,
+        pose_foreign: Optional[str] = None,
+        pose_foreign_split: str = "train",
     ):
         from longnav.utils.bin_rollout import load_bin_policy, seed_sampling
         from longnav.utils.vector_rollout import RolloutConfig
@@ -468,7 +680,11 @@ class BinRolloutBackend(PolicyBackend):
         self.seed = int(seed)
         self._episode_count = 0
         self.policy = load_bin_policy(ckpt, config, decode=decode)
-        self._pose = _PoseFeed(self.policy)
+        self._pose = _PoseFeed(
+            self.policy, _PoseCorruption(pose_mirror, pose_rotate_deg),
+            _ForeignPose(pose_foreign, pose_foreign_split) if pose_foreign else None,
+            seed=int(seed),
+        )
         self._stop = _StopHeadControl(
             self.policy, enabled=stop_head, temperature=stop_temperature,
             threshold=stop_threshold, inference=stop_inference,
@@ -485,7 +701,7 @@ class BinRolloutBackend(PolicyBackend):
     def act(self, rgb: np.ndarray, pose: Optional[Sequence[float]] = None) -> np.ndarray:
         from PIL import Image
 
-        chunk = self.policy.step(Image.fromarray(rgb), **self._pose.step_kwargs(pose))
+        chunk = self.policy.step(Image.fromarray(rgb), **self._pose.step_kwargs(self.policy, pose))
         return np.asarray(chunk.numpy(), dtype=np.float32)
 
     @property
@@ -627,6 +843,10 @@ class ARRolloutBackend(PolicyBackend):
         stop_temperature: Optional[float] = None,
         stop_threshold: Optional[float] = None,
         stop_inference: Optional[str] = None,
+        pose_mirror: bool = False,
+        pose_rotate_deg: float = 0.0,
+        pose_foreign: Optional[str] = None,
+        pose_foreign_split: str = "train",
     ):
         # Checked before the imports: a bad decode rule should fail the same way in any
         # interpreter, not only in one that can already load the checkpoint.
@@ -661,7 +881,11 @@ class ARRolloutBackend(PolicyBackend):
         self.policy = VectorRolloutPolicy(model, processor, config)
         # Read off the checkpoint, inert when it declares neither -- so every AR
         # checkpoint evaluated before these existed runs the identical path.
-        self._pose = _PoseFeed(self.policy)
+        self._pose = _PoseFeed(
+            self.policy, _PoseCorruption(pose_mirror, pose_rotate_deg),
+            _ForeignPose(pose_foreign, pose_foreign_split) if pose_foreign else None,
+            seed=int(seed),
+        )
         self._stop = _StopHeadControl(
             self.policy, enabled=stop_head, temperature=stop_temperature,
             threshold=stop_threshold, inference=stop_inference,
@@ -693,7 +917,7 @@ class ARRolloutBackend(PolicyBackend):
 
         # No-op unless --context-reset-every was passed; see _PeriodicContextReset.
         self._context.before_act(self.policy)
-        chunk = self.policy.step(Image.fromarray(rgb), **self._pose.step_kwargs(pose))
+        chunk = self.policy.step(Image.fromarray(rgb), **self._pose.step_kwargs(self.policy, pose))
         return np.asarray(chunk.numpy(), dtype=np.float32)
 
     @property

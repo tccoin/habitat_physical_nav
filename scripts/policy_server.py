@@ -67,6 +67,16 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=None,
                         help="base seed for a backend's per-episode seeded sampling "
                              "(bin_rollout / ar_rollout with --decode sample)")
+    parser.add_argument("--pose-mirror", action="store_true",
+                        help="pose-frame ablation: mirror the injected pose about the "
+                             "start heading")
+    parser.add_argument("--pose-rotate-deg", type=float, default=0.0,
+                        help="pose-frame ablation: rotate the injected pose frame, "
+                             "applied after --pose-mirror")
+    parser.add_argument("--pose-foreign", default=None,
+                        help="pose-information ablation: inject another episode's pose "
+                             "sequence, sampled from this load_from_disk() dataset")
+    parser.add_argument("--pose-foreign-split", default="train")
     parser.add_argument("--stop-head", action="store_true",
                         help="let the checkpoint's stop classifier terminate episodes. "
                              "Off = the probability is still computed and reported in "
@@ -111,6 +121,13 @@ def main() -> None:
         value = getattr(args, name)
         if value is not None:
             kwargs[name] = value
+    if args.pose_mirror:
+        kwargs["pose_mirror"] = True
+    if args.pose_rotate_deg:
+        kwargs["pose_rotate_deg"] = args.pose_rotate_deg
+    if args.pose_foreign:
+        kwargs["pose_foreign"] = args.pose_foreign
+        kwargs["pose_foreign_split"] = args.pose_foreign_split
     backend = build_backend(args.backend, **kwargs)
     print(backend.describe(), flush=True)
     serve(args.socket, backend)

@@ -31,6 +31,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 
+from objectnav_eval.navmesh import camera_pose
+
 
 @dataclass
 class ContactSnapshot:
@@ -73,6 +75,13 @@ class TickRecord:
     #: is what :class:`~objectnav_eval.probes.EscapeProbe` watches -- the robot
     #: falling out of the world moves only in this coordinate.
     height: Optional[float] = None
+    #: Habitat **world** pose of the camera, ``[x, y, z, qw, qx, qy, qz]``, or
+    #: None when not being sampled. Not derivable from `pose` (planar control
+    #: frame, and the base rather than the camera) nor from `height` (a joint
+    #: value). This is the pose the rendered frame was taken from, mounting
+    #: offset and camera pitch included. Sampled by the executor, like
+    #: `contacts` and `height`, because probes must not touch the simulator.
+    camera: Optional[List[float]] = None
 
     @property
     def commanded_displacement(self) -> float:
@@ -174,6 +183,12 @@ class ChunkExecution:
     #: truncated to the ticks that actually ran, so every probe and diagnostic
     #: sees the executed trajectory and nothing else.
     stopped_early: bool = False
+    #: The chunk exactly as the policy emitted it -- (T, 3) relative offsets,
+    #: BEFORE truncation to `gap` and before anchoring. `setpoints` is what was
+    #: executed; this is what was asked for, which is the thing you need to tell
+    #: "the policy commanded something odd" from "the controller failed to
+    #: track it". Carried by reference, so it costs nothing.
+    chunk: Optional[Any] = None
 
     @property
     def end_lag(self) -> float:
@@ -194,7 +209,8 @@ class ChunkExecutor:
     """
 
     def __init__(
-        self, robot_sim, controller, dt: float, gap: int, collect_contacts: bool = False
+        self, robot_sim, controller, dt: float, gap: int, collect_contacts: bool = False,
+        log_camera: bool = False, sensor_uuid: str = "color_sensor"
     ):
         self.robot_sim = robot_sim
         self.controller = controller
@@ -204,6 +220,11 @@ class ChunkExecutor:
         # costs simulator time rather than arithmetic, so it is opt-in and the
         # executor -- not a probe -- is what reads it.
         self.collect_contacts = bool(collect_contacts)
+        # Sampling the camera's world transform walks the scene-node chain; cheap,
+        # but it IS a simulator read, so it is opt-in and driven by whether the
+        # trajectory log wants it.
+        self.log_camera = bool(log_camera)
+        self.sensor_uuid = sensor_uuid
         self.tick = 0
         self.sim_time = 0.0
 
@@ -275,6 +296,10 @@ class ChunkExecutor:
                 # the failure it detects is one that every other metric scores
                 # as healthy.
                 height=float(self.robot_sim.get_joint_state("joint_z")),
+                camera=(
+                    camera_pose(self.robot_sim, self.sensor_uuid)
+                    if self.log_camera else None
+                ),
             )
             ticks.append(record)
             if on_tick is not None:
@@ -296,4 +321,5 @@ class ChunkExecutor:
             poses=reached[:n],
             ticks=ticks,
             stopped_early=stopped_early,
+            chunk=chunk,
         )

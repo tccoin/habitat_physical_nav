@@ -317,10 +317,13 @@ class MotionTaxonomy(RolloutProbe):
     achieved_class: List[str] = field(default_factory=list)
     achieved_speed: List[float] = field(default_factory=list)
     achieved_rate: List[float] = field(default_factory=list)
+    drive_disp: List[float] = field(default_factory=list)
+    commanded_drive_disp: List[float] = field(default_factory=list)
 
     def reset(self, episode: Any = None) -> None:
         self.commanded_class, self.achieved_class = [], []
         self.achieved_speed, self.achieved_rate = [], []
+        self.drive_disp, self.commanded_drive_disp = [], []
 
     def on_tick(self, record: TickRecord) -> None:
         commanded = record.commanded_body_delta()
@@ -335,6 +338,16 @@ class MotionTaxonomy(RolloutProbe):
         )
         self.achieved_speed.append(achieved_xy / self.dt)
         self.achieved_rate.append(abs(float(achieved[2])) / self.dt)
+        # Displacement on ticks classified DRIVE, kept separately from
+        # `achieved_speed`. "Metres per moving tick" averages DRIVE and TURN
+        # together, and a turning-in-place tick contributes ~0 translation --
+        # so that quantity is diluted by however much the policy happens to be
+        # turning, which is precisely the confound it would be used to rule out.
+        # This one answers "when it does drive, how far does it get".
+        if self.achieved_class[-1] == "drive":
+            self.drive_disp.append(achieved_xy)
+        if self.commanded_class[-1] == "drive":
+            self.commanded_drive_disp.append(commanded_xy)
 
     def summary(self) -> Dict[str, Any]:
         ticks = len(self.achieved_class)
@@ -346,6 +359,21 @@ class MotionTaxonomy(RolloutProbe):
             "drive_threshold_mps": _DRIVE_SPEED_MPS,
             "turn_threshold_radps": _TURN_RATE_RADPS,
         }
+        # Distance covered per DRIVE tick -- the "when it moves, does it move
+        # well" number, independent of the drive/turn mix.
+        for label, series in (("", self.drive_disp),
+                              ("commanded_", self.commanded_drive_disp)):
+            if series:
+                out[f"{label}drive_disp_mean_m"] = float(np.mean(series))
+                out[f"{label}drive_disp_median_m"] = float(np.median(series))
+                out[f"{label}drive_speed_mean_mps"] = float(np.mean(series)) / self.dt
+            else:
+                out[f"{label}drive_disp_mean_m"] = 0.0
+                out[f"{label}drive_disp_median_m"] = 0.0
+                out[f"{label}drive_speed_mean_mps"] = 0.0
+        # Metres of translation per unit of *time spent driving* -- what an
+        # efficiency comparison wants when two policies turn different amounts.
+        out["drive_distance_m"] = float(np.sum(self.drive_disp))
         for label, classes in (("", self.achieved_class),
                                ("commanded_", self.commanded_class)):
             for name in _CLASSES:
@@ -664,8 +692,97 @@ class EscapeProbe(RolloutProbe):
         }
 
 
+@dataclass
+class TrajectoryLog(RolloutProbe):
+    """The raw trajectory: every control tick's pose, and every chunk commanded.
+
+    Everything else in this module is a *summary*. This is the thing summaries
+    are computed from, kept so that a question nobody anticipated can still be
+    answered from a finished run instead of requiring a re-run. That has already
+    cost this project real time: "did it approach directly or circle", "where
+    exactly did it stall", "what was it commanding when it left the navmesh" were
+    all answered from video and aggregates because the trajectory was discarded.
+
+    It is nearly free. A 350-step episode is 1750 ticks: the tick series is
+    1750 x 4 floats and the chunk series 350 x 10 x 3, about 125 kB per episode
+    rounded, against the ~700 kB of MP4 the same episode already writes. Storing
+    the cheap thing and keeping the expensive one was the wrong trade.
+
+    Deliberately NOT here: activations and raw frames. Those are large, and the
+    video already carries what the frames would show.
+    """
+
+    name: str = "trajectory"
+    #: Round-trip precision. Millimetre / milliradian is far below the
+    #: controller's own tracking error (lag p95 is ~16 mm), so this loses
+    #: nothing measurable and roughly halves the stored size.
+    ndigits: int = 4
+    enabled: bool = True
+
+    ticks: List[List[float]] = field(default_factory=list)
+    chunks: List[List[List[float]]] = field(default_factory=list)
+    heights: List[float] = field(default_factory=list)
+    cameras: List[Any] = field(default_factory=list)
+
+    def reset(self, episode: Any = None) -> None:
+        self.ticks, self.chunks, self.heights = [], [], []
+        self.cameras = []
+
+    def on_tick(self, record: TickRecord) -> None:
+        if not self.enabled:
+            return
+        n = self.ndigits
+        # [sim_time, X, Y, theta] in the planar control frame, plus the vertical
+        # joint separately -- `pose` is planar by definition, and height is what
+        # distinguishes "descending through the floor" from "driving".
+        self.ticks.append([
+            round(float(record.sim_time), 3),
+            round(float(record.pose[0]), n),
+            round(float(record.pose[1]), n),
+            round(float(record.pose[2]), n),
+        ])
+        height = getattr(record, "height", None)
+        self.heights.append(None if height is None else round(float(height), n))
+        camera = getattr(record, "camera", None)
+        self.cameras.append(None if camera is None else [round(float(v), n) for v in camera])
+
+    def on_chunk(self, execution: ChunkExecution) -> None:
+        if not self.enabled:
+            return
+        chunk = getattr(execution, "chunk", None)
+        poses = getattr(chunk, "poses", None) if chunk is not None else None
+        if poses is None:
+            return
+        n = self.ndigits
+        self.chunks.append([[round(float(v), n) for v in row] for row in poses])
+
+    def summary(self) -> Dict[str, Any]:
+        if not self.enabled or not self.ticks:
+            return {"enabled": self.enabled, "ticks": 0}
+        out: Dict[str, Any] = {
+            "enabled": True,
+            "ticks": len(self.ticks),
+            #: [sim_time, X, Y, theta] per control tick, planar control frame
+            #: (X = habitat_x, Y = -habitat_z, theta CCW from +X).
+            "tick_pose": self.ticks,
+            #: Chunks as EMITTED -- (T, 3) relative [dx, dy, dtheta] in the
+            #: emitting pose's own frame, before the executor truncated to `gap`.
+            "chunks": self.chunks,
+        }
+        if any(h is not None for h in self.heights):
+            out["tick_height"] = self.heights
+        if any(c is not None for c in self.cameras):
+            #: Habitat WORLD pose of the camera per tick,
+            #: [x, y, z, qw, qx, qy, qz] -- where the rendered frame was taken
+            #: from. Carries the mounting offset (~1.19 m up, 0.10 m back) and
+            #: the camera pitch, neither of which is in `tick_pose`.
+            out["tick_camera"] = self.cameras
+        return out
+
+
 def default_probes(
-    keep_series: bool = False, dt: float = 0.05, collect_contacts: bool = False
+    keep_series: bool = False, dt: float = 0.05, collect_contacts: bool = False,
+    log_trajectory: bool = True,
 ) -> List[RolloutProbe]:
     """The diagnostics every episode carries.
 
@@ -678,6 +795,7 @@ def default_probes(
     return [
         TrackingDiagnostic(keep_series=keep_series),
         MotionTaxonomy(dt=dt),
+        TrajectoryLog(enabled=log_trajectory),
         CollisionProbe(dt=dt),
         MotionCoherence(dt=dt),
         EscapeProbe(dt=dt),

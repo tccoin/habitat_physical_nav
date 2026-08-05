@@ -47,7 +47,7 @@ import numpy as np
 # image-blind control on a small split (see docs/OBJECTNAV_EVAL.md), because
 # success and SPL both saturate at zero for most episodes.
 BINARY_METRICS = ("success", "oracle_success")
-CONTINUOUS_METRICS = ("spl", "oracle_spl", "progress_m", "min_m", "final_m", "path_m")
+CONTINUOUS_METRICS = ("spl", "oracle_spl", "npwpl", "progress_m", "min_m", "final_m", "path_m")
 # The behavioural diagnostics, compared the same way. They are the ones most
 # likely to separate two heads that score indistinguishably on the outcome
 # metrics -- and they need the pairing and the MDE just as much, because "this
@@ -105,6 +105,16 @@ def _derive(row: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(start, (int, float)) and isinstance(minimum, (int, float))
         else None
     )
+    # Derived for runs recorded before `npwpl` existed, so old results stay
+    # comparable. Falls back to the total path when `path_at_min_m` is absent --
+    # which under-credits an episode that reached the goal and then wandered, so
+    # a run without the frozen path is not interchangeable with one that has it.
+    if row.get("npwpl") is None:
+        path = row.get("path_at_min_m")
+        if path is None:
+            path = row.get("path_m")
+        if all(isinstance(v, (int, float)) for v in (start, minimum, path)) and start > 0:
+            row["npwpl"] = max(0.0, 1.0 - minimum / start) * (start / max(start, path))
     return row
 
 

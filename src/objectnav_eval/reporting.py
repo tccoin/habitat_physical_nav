@@ -25,7 +25,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
 
-RATE_KEYS = ["success", "oracle_success", "spl", "oracle_spl", "soft_spl"]
+RATE_KEYS = ["success", "oracle_success", "spl", "oracle_spl", "soft_spl", "npwpl"]
 DISTANCE_KEYS = [
     "distance_to_goal_m",
     "geodesic_start_euclidean_m",
@@ -276,6 +276,7 @@ def episode_line(record: Dict[str, Any]) -> Dict[str, Any]:
         "oracle_success": int(record.get("oracle_success", 0)),
         "spl": jsonable(record.get("spl")), "oracle_spl": jsonable(record.get("oracle_spl")),
         "soft_spl": jsonable(record.get("soft_spl")),
+        "npwpl": jsonable(record.get("npwpl")),
         "start_m": jsonable(record.get("geodesic_start_m"), 2),
         "start_euclid_m": jsonable(record.get("geodesic_start_euclidean_m"), 2),
         # geodesic / euclidean at the start. High means the navmesh routes the
@@ -285,6 +286,7 @@ def episode_line(record: Dict[str, Any]) -> Dict[str, Any]:
         "final_m": jsonable(record.get("distance_to_goal_m"), 2),
         "min_m": jsonable(record.get("min_distance_to_goal_m"), 2),
         "path_m": jsonable(record.get("path_length_m"), 2),
+        "path_at_min_m": jsonable(record.get("path_at_min_m"), 2),
         "steps": record.get("steps"),
         "terminated": record.get("terminated"),
         "undershoot": jsonable(tracking.get("undershoot_ratio_moving"), 3),

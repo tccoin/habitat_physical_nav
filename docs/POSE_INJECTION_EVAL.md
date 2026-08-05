@@ -444,3 +444,178 @@ more was established than was.
    (or fires immediately) would depress `success`/`spl` without touching the
    oracle numbers, and the fix is a sweep over the recorded traces, not a
    conclusion about the head.
+
+---
+
+## 8. The encoder rebuild, and what it settled (2026-08-05)
+
+Sections 1-7 end with three null ablations on `run_v5_ar_pose` and the caveat that
+they could not distinguish "localisation was not the bottleneck" from "the
+encoding was unusable". An audit resolved that: **the encoding was unusable**, and
+a second one that is not produces a sharply different picture -- though not the
+one that was hoped for.
+
+### 8.1 What was wrong with `FourierSE2Encoder`
+
+Measured on the trained `run_v5_ar_pose` encoder over real relative poses:
+
+| defect | measurement |
+| --- | --- |
+| heading nearly invisible | reversing the agent 180 deg moved the injected vector **3.6x LESS** than sliding it 10 cm (1.81 vs 6.48). Heading was ~1% of the varying energy. |
+| geometry inverted | corr(pose distance, embedding distance) = **-0.218**. Poses further apart in metres landed *closer* in embedding space. |
+| aliasing | the corpus's modal step is 0.4004 m against a 0.25 m shortest basis period; 39.6% of consecutive observations alias. Effective rank of the varying output: **2.02 of 2048**. |
+| norm mismatch | injected norm reached **16.5** against **0.362** for the tokens actually present in a sequence -- 45x, still growing, `grad_norm` median 10.7 vs 1.9 for a comparable run. |
+
+Cause of the first: two bounded heading channels `(cos, sin)` next to an
+*unbounded* raw `xy` channel with std 3.0 m, which alone was 55% of the first
+layer's input variance. Not a bandwidth problem -- a survey of 17 navigation
+repos found **k=1 heading is universal** (habitat DD-PPO, PIRLNav, VLN-DUET,
+VLN-HAMT, Recurrent-VLN-BERT all use exactly `(cos, sin)`), and none of them
+Fourier-expands position either.
+
+### 8.2 The `max_norm` bug that killed `run_v6_regress_pose`
+
+`run_v6_regress_pose` trained ~4200 steps with its pose encoder **completely
+frozen**. `zero_init` makes the output exactly zero; the `max_norm` soft cap
+multiplies by `tanh(||out||/m) * m / (||out|| + 1e-12)`, which is **0** at
+`||out|| == 0`; backward carries the same factor. Output 0 -> grad 0 -> weights
+never move, permanently. Encoder weights are bit-identical at steps 200, 2000 and
+3600. Three separate gradient paths all vanish, which is why it is airtight
+rather than merely fragile.
+
+The same cap is dead at the *other* end too: at v5's real output norms (12-19),
+fp32 `tanh` returns exactly 1.0 above 9.011, so the radial gradient is exactly
+zero there as well.
+
+Consequence: **v6 is a free, exactly matched no-pose control** -- same seed, same
+data order, same architecture, one line of config different.
+
+### 8.3 `PlanarSE2Encoder`
+
+`[x/s, y/s, cos theta, sin theta]`, four features. Position raw (as the field
+does), `pos_scale=4.0` to balance channel variance (x/4 std 0.77 vs heading's
+0.71), output normalised to `out_norm` so the norm cannot drift, and a scalar
+`out_gain` that starts at zero but whose *gradient does not*. Verified on the
+trained ckpt-8200 equivalent:
+
+| | fourier (v5) | planar (v7) |
+| --- | --- | --- |
+| heading share of varying energy | 1.0% | **62%** |
+| corr(pose dist, embedding dist) | -0.218 | **+0.589** |
+| output norm | 16.5, growing | **0.400 exactly** |
+
+### 8.4 It works -- on the training objective
+
+`run_v7_planar_pose` vs its matched `run_v6_regress_pose` control, identical
+batches:
+
+* v7 lower `eval_loss` on **9 of 10** eval points (only step 200 favours v6 --
+  the transient as the pathway comes online)
+* the gain is **heading**: `rmse_dtheta` lower at every point from step 400,
+  by 8-11%, while `rmse_dx` is roughly tied
+* the gap **widens** with training: at step 4200, `mae_dtheta` 0.0975 vs 0.1216
+  (20% better) while v6's own curve had stalled
+* at step 6000 every component is still at an all-time low (loss 0.0729,
+  `mae_dtheta` 0.0890) -- 41.6% improvement over steps 200-2000, then a further
+  20.6% over 2000-6000. The rate bends but does not flatten.
+
+### 8.5 And does not convert into navigation
+
+Four checkpoints x pose condition, paired on the same 70 `sample101` episodes:
+
+| ckpt | NPWPL true | foreign | delta | oracle true | foreign |
+| --- | --- | --- | --- | --- | --- |
+| 600 | 0.338 | 0.351 | +0.013 | 0.543 | 0.543 |
+| 1000 | 0.292 | 0.350 | +0.058 | 0.543 | 0.543 |
+| 1400 | 0.375 | 0.342 | -0.033 | 0.514 | 0.457 |
+| 2000 | 0.325 | 0.378 | +0.053 | 0.371 | 0.586 |
+| 5800 | 0.327 | pending | | 0.414 | |
+
+Pooled NPWPL change from replacing the pose with an unrelated episode's:
+**+0.023, 95% CI [-0.011, +0.057]**. And ckpt-2000 -> ckpt-5800 on the true arm,
+across nearly 3x the training and a 31% fall in eval loss: **NPWPL +0.002,
+CI [-0.066, +0.070]**.
+
+**Caution on `oracle_success`.** At ckpt-2000 it read +0.214 for the foreign arm,
+which looked like a large effect; NPWPL on the same episodes read +0.053, CI
+spanning zero. The binary metric counts an episode ending at 1.01 m identically
+to one ending at 8 m, and the arms' episodes cluster either side of that line.
+Do not read checkpoint-to-checkpoint deltas off it.
+
+### 8.6 What the pose *does* change: rotation, and getting stuck
+
+Pooled over four checkpoints, replacing the true pose with a foreign one:
+
+| metric | real pose | fake pose | change | 95% CI |
+| --- | --- | --- | --- | --- |
+| median_turnrate_degps | 25.7 | 38.1 | **+13.8** | [+12.5, +15.2] |
+| frac_turn | 0.315 | 0.384 | +0.069 | [+0.055, +0.083] |
+| median_speed_mps | 0.295 | 0.230 | -0.065 | [-0.099, -0.031] |
+| flip_rate_within_chunk | 0.250 | 0.180 | -0.070 | [-0.088, -0.052] |
+| **frac_drive** | 0.496 | 0.495 | -0.001 | [-0.018, +0.016] |
+| **undershoot_ratio_moving** | 0.800 | 0.801 | +0.001 | [-0.011, +0.013] |
+
+The last two are the controls that make the rest credible: translation share and
+controller tracking are **unchanged**, so this is the policy commanding different
+motion, not the executor behaving differently. `commanded_frac_turn` moves on its
+own (+0.032), which is what the policy asked for before the controller touched it.
+
+**The mechanism is pose *dynamics*, not frame correctness.** A three-way at
+ckpt-2000 separates them, because mirror+90deg is an isometry of the robot's own
+trajectory (so a stuck robot still sees a frozen pose) while a foreign trajectory
+never stops moving:
+
+| arm | stuck-share | cap@350 | turn deg/s |
+| --- | --- | --- | --- |
+| TRUE | 0.428 | 45 | 19.0 |
+| MIRROR90 | 0.497 | 44 | 15.4 |
+| FOREIGN | 0.234 | 32 | 37.2 |
+
+`stationary_share_in_runs_ge_10`, paired: TRUE->MIRROR90 **+0.069, CI
+[-0.010, +0.147] (not significant)**; TRUE->FOREIGN **-0.194, CI
+[-0.272, -0.116]**; MIRROR90->FOREIGN **-0.263, CI [-0.342, -0.183]**.
+
+So a *completely wrong frame* behaves like the correct pose, and only breaking
+the dynamics changes the stuck behaviour. The working hypothesis this supports:
+when the robot stalls, the injected pose goes near-stationary, which is a regime
+the training corpus never contains -- expert demonstrations are always moving. An
+always-moving foreign pose keeps the policy out of that regime.
+
+**Not yet verified directly.** The mechanism is inferred from aggregates. The
+runs from ckpt-5800 onward carry the per-tick trajectory log (section 8.7), so
+"is the injected pose actually frozen during the long stalls" is now checkable
+rather than assumed. Do that before treating it as established.
+
+### 8.7 Instrumentation added
+
+* **`npwpl`** -- normalised progress to the *closest approach*, weighted by path
+  efficiency at that same instant. `soft_spl` measures progress to the *final*
+  pose, which charges a stop-head-less checkpoint for drifting away after
+  arrival; 22 of 38 successes at one checkpoint did exactly that. MDE 0.095 vs
+  `oracle_success`'s 0.180 on this episode set. `path_at_min_m` is recorded to
+  make the denominator exact; before it existed the metric mixed a frozen
+  numerator with a total-path denominator and was wrong.
+* **`TrajectoryLog`** -- per control tick: `[sim_time, X, Y, theta]`, the habitat
+  **world camera pose** `[x, y, z, qw, qx, qy, qz]` (1.19 m up and 0.10 m behind
+  the base, carrying camera pitch that appears nowhere else), `joint_z`, and
+  every action chunk **as emitted** before truncation to `gap`. ~230 kB/episode
+  against ~700 kB of MP4 the same episode already writes. On by default.
+* **drive-conditioned motion** -- `drive_disp_mean_m`, `drive_speed_mean_mps`,
+  `drive_distance_m`. The pre-existing `achieved_disp_mean_moving_m` pools DRIVE
+  and TURN ticks, so it is diluted by whatever drive/turn mix a policy happens to
+  have -- exactly the confound it would be used to rule out.
+* **`model_metrics`** (training side) -- per-module `grad_norm`, `weight_delta`,
+  `act_norm_mean`, `act_over_embed`, `cap_sat_frac`. Any one of these logged at
+  step 1 would have caught the v6 dead encoder immediately.
+
+### 8.8 Open
+
+1. The stuck-pose mechanism is unverified at the trajectory level (8.6).
+2. `MIRROR90` has only been run at ckpt-2000. ckpt-600 is the informative one --
+   TRUE and FOREIGN were exactly tied there, so a split would be attributable to
+   the corruption rather than to checkpoint quality.
+3. The `constant`-encoder control (same marker, same rate, no value) has never
+   been run. It would separate "reads the pose" from "reads that a marker is
+   present", which the ablations here cannot.
+4. Whether any of this changes past 30% of training. Every navigation number is
+   flat from ckpt-600 to ckpt-5800 while the loss falls monotonically.

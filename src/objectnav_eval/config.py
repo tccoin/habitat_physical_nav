@@ -168,6 +168,11 @@ class EvalConfig:
     # collision probe is the one that costs *simulator* time -- it samples the
     # physics contact manifold once per control tick -- so it gets a switch.
     collision_probe: bool = True
+    # Per-tick pose and per-step action chunks, in every episode record. ON by
+    # default: ~125 kB per episode against the ~700 kB of video the same episode
+    # already writes, and it is the difference between answering a new question
+    # from a finished run and having to re-run it.
+    log_trajectory: bool = True
 
     # -- parallelism --------------------------------------------------------
     gpus: Optional[str] = None
@@ -465,6 +470,12 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     diag.add_argument("--keep-tracking-series", action="store_true",
                       help="store the per-tick commanded/achieved/lag series in each "
                            "episode record (large; the summary statistics usually suffice)")
+    diag.add_argument("--no-trajectory-log", dest="log_trajectory",
+                      action="store_false",
+                      help="drop the per-tick pose and per-step action-chunk series "
+                           "from each episode record. They cost ~125 kB per episode "
+                           "and are what lets an unanticipated question be answered "
+                           "from a finished run rather than a re-run")
     diag.add_argument("--no-collision-probe", dest="collision_probe",
                       action="store_false",
                       help="skip the per-tick physics contact sample. The collision "

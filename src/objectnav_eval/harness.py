@@ -76,6 +76,8 @@ def _build_runner(robot_sim, scene_id: str, config: Any, policy) -> EpisodeRunne
                 dt=config.dt,
                 gap=config.gap,
                 collect_contacts=config.collision_probe,
+                log_camera=getattr(config, "log_trajectory", True),
+                sensor_uuid=config.sensor_uuid,
             ),
             policy=policy,
             config=config,
@@ -84,6 +86,7 @@ def _build_runner(robot_sim, scene_id: str, config: Any, policy) -> EpisodeRunne
                 config.keep_tracking_series,
                 dt=config.dt,
                 collect_contacts=config.collision_probe,
+                log_trajectory=getattr(config, "log_trajectory", True),
             ),
         )
     )

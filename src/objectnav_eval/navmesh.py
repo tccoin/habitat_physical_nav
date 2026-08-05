@@ -293,3 +293,44 @@ class GoalTracker:
         if np.isnan(snapped[0]):
             return float("inf"), euclidean
         return geodesic(self.pathfinder, snapped, self.goals), euclidean
+
+
+import magnum as _mn  # noqa: E402  (only needed by camera_pose)
+
+
+def camera_pose(robot_sim, sensor_uuid: str = "color_sensor"):
+    """The camera's **habitat world** pose: ``[x, y, z, qw, qx, qy, qz]``.
+
+    Distinct from everything else recorded per tick, and none of those substitute
+    for it:
+
+      * ``get_2d_pose()`` is the planar *control* frame (``X = habitat_x``,
+        ``Y = -habitat_z``), and is the base, not the camera.
+      * ``joint_z`` is a joint value, not a world coordinate.
+      * ``robot.translation`` is pinned at the spawn (see :func:`robot_position_3d`).
+
+    The sensor is reparented onto a robot link at setup (``sim.py``
+    ``_setup_robot_and_sensors``) and carries its own fixed rotation, so its world
+    transform is the link's chain times that offset -- which is what
+    ``absolute_transformation()`` returns. This is the pose the rendered image was
+    actually taken from, including the ``LOOK_UP``/``LOOK_DOWN`` camera pitch that
+    never appears in the base pose at all.
+
+    Returns ``None`` rather than raising if the sensor cannot be found: a missing
+    diagnostic must never take down a rollout.
+    """
+    try:
+        agent = robot_sim.sim.get_agent(robot_sim.agent_id)
+        node = agent.scene_node.subtree_sensors.get(sensor_uuid)
+        if node is None:
+            return None
+        transform = node.object.absolute_transformation()
+        translation = transform.translation
+        quaternion = _mn.Quaternion.from_matrix(transform.rotation())
+        vector = quaternion.vector
+        return [
+            float(translation.x), float(translation.y), float(translation.z),
+            float(quaternion.scalar), float(vector.x), float(vector.y), float(vector.z),
+        ]
+    except Exception:  # noqa: BLE001 - a diagnostic must not break a run
+        return None

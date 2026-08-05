@@ -46,6 +46,23 @@ from objectnav_eval.video import OverlayState, Recorder, annotate
 RATE_METRICS = ("success", "oracle_success", "spl", "oracle_spl", "soft_spl")
 
 
+def _npwpl(start: float, closest: float, path: float) -> float:
+    """Normalised progress to the closest approach, weighted by path efficiency.
+
+    ``max(0, 1 - closest/start) * start/max(start, path)``. Both terms are
+    evaluated at the same instant -- the closest approach -- which is what keeps
+    it bounded below by nothing in particular but comparable across episodes.
+    Zero when the start distance is degenerate or anything is non-finite, so an
+    off-navmesh episode contributes 0 rather than a NaN that poisons the mean.
+    """
+    if not (np.isfinite(start) and np.isfinite(closest) and np.isfinite(path)):
+        return 0.0
+    if start <= 0:
+        return 0.0
+    progress = max(0.0, 1.0 - closest / start)
+    return progress * (start / max(start, path))
+
+
 @dataclass
 class RunnerContext:
     """Everything a runner needs that is scene-scoped rather than per-episode."""
@@ -89,6 +106,13 @@ class EpisodeRunner:
         goal_probe.reset(episode)
 
         start_distance = float(start_metrics["distance_to_goal"])
+        # Path length at the moment of closest approach, frozen the same way
+        # `OracleSPL` freezes it at first success. Both halves of `npwpl` have to
+        # refer to the same instant or the metric charges the agent for travel
+        # that happened *after* the progress it is being credited for -- which is
+        # exactly the "reach the goal then wander off" pattern these stop-head-less
+        # checkpoints show, and would penalise it twice.
+        path_at_min = 0.0
         # Sampled here, before a single tick, so it is the *start* euclidean and
         # not wherever the robot ended up. Its ratio to the geodesic is the
         # signal for a navmesh that routes the long way round something the
@@ -134,15 +158,16 @@ class EpisodeRunner:
         started = time.perf_counter()
 
         def on_tick(record: TickRecord) -> None:
-            nonlocal distance, min_distance, first_reach_step, stop_step
+            nonlocal distance, min_distance, first_reach_step, stop_step, path_at_min
             task.observe_pose(record.pose)
             for probe in ctx.probes:
                 probe.on_tick(record)
             if record.tick % config.evaluate_every == 0:
                 metrics = task.evaluate()
                 distance = float(metrics["distance_to_goal"])
-                if np.isfinite(distance):
-                    min_distance = min(min_distance, distance)
+                if np.isfinite(distance) and distance < min_distance:
+                    min_distance = distance
+                    path_at_min = float(getattr(task.path_tracker, "length", 0.0))
                 if distance < config.success_distance and first_reach_step is None:
                     first_reach_step = record.chunk_index
                 if distance < config.stop_distance and stop_step is None:
@@ -265,8 +290,9 @@ class EpisodeRunner:
         task.call_stop()
         metrics = task.evaluate()
         distance = float(metrics["distance_to_goal"])
-        if np.isfinite(distance):
-            min_distance = min(min_distance, distance)
+        if np.isfinite(distance) and distance < min_distance:
+            min_distance = distance
+            path_at_min = float(getattr(task.path_tracker, "length", 0.0))
 
         return self._record(
             episode=episode, screen=screen, metrics=metrics, start_metrics=start_metrics,
@@ -276,7 +302,7 @@ class EpisodeRunner:
             latencies=latencies, goal_probe=goal_probe, recorder=recorder,
             wall_seconds=time.perf_counter() - started, chunk=chunk,
             stop_trace=stop_trace, pose_trace=pose_trace,
-            stop_suppressed=stop_suppressed,
+            stop_suppressed=stop_suppressed, path_at_min=path_at_min,
         )
 
     # ------------------------------------------------------------------
@@ -309,6 +335,7 @@ class EpisodeRunner:
         stop_trace: Optional[List[List[float]]] = None,
         pose_trace: Optional[List[List[float]]] = None,
         stop_suppressed: int = 0,
+        path_at_min: float = 0.0,
     ) -> Dict[str, Any]:
         ctx = self.ctx
         record: Dict[str, Any] = {
@@ -324,6 +351,29 @@ class EpisodeRunner:
             distance_to_goal_m=float(distance),
             distance_to_goal_euclidean_m=self._euclidean_to_goal(episode),
             min_distance_to_goal_m=float(min_distance),
+            # Path travelled up to the closest approach -- the denominator `npwpl`
+            # needs, and the counterpart of the freeze `OracleSPL` performs.
+            path_at_min_m=float(path_at_min),
+            # NORMALISED PROGRESS WEIGHTED BY PATH LENGTH. `soft_spl` with two
+            # changes, both because these checkpoints have no stop head:
+            #
+            #   * progress is measured to the CLOSEST APPROACH, not the final
+            #     pose. `soft_spl` charges an agent that reaches the goal and then
+            #     drifts, which here is a stopping deficit rather than a
+            #     navigation one -- 22 of 38 successes at one checkpoint reached
+            #     the goal and left during the delay window.
+            #   * efficiency uses the path AT that moment, so numerator and
+            #     denominator refer to the same instant. Using the total path
+            #     with a frozen numerator penalises post-arrival wandering twice
+            #     and breaks the bound against `oracle_spl`.
+            #
+            # Continuous rather than binary, which is the point: measured on this
+            # episode set its MDE is 0.075 against `oracle_success`'s 0.180, so it
+            # resolves differences ~2.4x smaller for the same number of episodes.
+            npwpl=_npwpl(
+                float(start_metrics["distance_to_goal"]), float(min_distance),
+                float(path_at_min),
+            ),
             path_length_m=float(metrics.get("path_length", float("nan"))),
             # Two start distances, deliberately: the task's own measure (the SPL
             # denominator) and screening's (explicitly snapped goal set). They

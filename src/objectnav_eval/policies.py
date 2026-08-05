@@ -239,6 +239,8 @@ def build_policy(config: Any, server_script: str, log_path: Optional[str] = None
         backend_args["sys_path"] = config.policy_sys_path
     if config.policy_decode is not None:
         backend_args["decode"] = config.policy_decode
+    if getattr(config, "policy_inference_steps", None) is not None:
+        backend_args["num_inference_steps"] = config.policy_inference_steps
     if config.policy_seed is not None:
         backend_args["seed"] = config.policy_seed
     if config.context_reset_every is not None:
@@ -262,6 +264,8 @@ def build_policy(config: Any, server_script: str, log_path: Optional[str] = None
     )
     if config.policy_decode is not None:
         in_process_kwargs["decode"] = config.policy_decode
+    if getattr(config, "policy_inference_steps", None) is not None:
+        in_process_kwargs["num_inference_steps"] = config.policy_inference_steps
     if config.policy_seed is not None:
         in_process_kwargs["seed"] = config.policy_seed
     if config.context_reset_every is not None:

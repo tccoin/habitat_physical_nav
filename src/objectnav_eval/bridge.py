@@ -978,6 +978,203 @@ class ARRolloutBackend(PolicyBackend):
 register_backend("ar_rollout", ARRolloutBackend)
 
 
+class FlowRolloutBackend(PolicyBackend):
+    """The flow-matching action head (``longnav.utils.flow_matching_head``).
+
+    The same backend shape as :class:`ARRolloutBackend`, for the same structural reason: a
+    ``TurnFlowActionRegressor`` occupies ``VectorRolloutPolicy``'s ``normalizer`` slot too,
+    so ``step()`` needs no override -- its last line calls ``normalizer.denormalize(...)``
+    and ``FlowActionCodec`` runs the Euler loop there (``num_inference_steps`` forwards of a
+    ~1M-parameter velocity field over 18 positions, from t=1 down to t=0) and composes the
+    per-tick differentials into a real ``(T, 3)`` chunk. The wire format is unchanged and
+    nothing on the simulator side knows this head exists.
+
+    Unlike the AR head there *is* a ``longnav.utils.flow_rollout`` -- ``load_flow_policy``,
+    written as the analogue of ``bin_rollout.load_bin_policy`` -- so the model class and the
+    decode/step wiring live on the model side, where the head is, and this class supplies
+    only what an eval run chooses.
+
+    Three differences from the other two distributional backends:
+
+    * **There is exactly one executable decode rule, ``"sample"``.**
+      ``FlowActionCodec.DECODES`` is ``("sample", "context")`` and has **no** ``"mean"``,
+      deliberately: averaging several ODE solutions is not a draw from the conditional, it
+      is the conditional mean -- the creeping failure this head was built to remove. So
+      ``--policy-decode mean`` is rejected here rather than quietly approximated, and
+      ``"context"`` is rejected for the same reason it is on the AR head: it is the offline
+      passthrough (a ``(context_dim,)`` trunk vector), and sending it down the wire would
+      hand the executor a 1024-long "chunk" it would happily try to drive.
+    * **Seeding is unconditional.** For the bin and AR backends reseeding is gated on
+      ``decode == "sample"`` because they have decode rules that consume no randomness.
+      This head has ONE generation mode and it always draws ``x_1 ~ N(0, I)``, so every
+      episode is reseeded from ``seed + <episode count>``; without it a closed-loop number
+      is not reproducible at all.
+    * **The number of Euler steps is part of the policy.** It is a checkpoint field
+      (``FlowMatchingConfig.num_inference_steps``, restored by ``from_pretrained``), so the
+      default is whatever the run trained under. ``--policy-inference-steps`` overrides it
+      for a sweep -- the one knob that changes what the same weights produce -- and
+      :meth:`describe` prints the value actually loaded, so the eval log says which
+      integration produced its numbers.
+
+    Pose injection needs nothing special here, and that is the point of the shared
+    :class:`_PoseFeed`: it reads the checkpoint's own spec, installs the marker from
+    ``spec.token``, and hands the **raw** planar ``[X, Y, theta]`` to ``step(obs_pose=...)``
+    so the frame conversion happens in ``pose_frame.relative_se2`` -- the same function the
+    training collator calls. A second implementation of that transform is the one divergence
+    in this system that raises nothing and produces confident nonsense.
+    """
+
+    def __init__(
+        self,
+        ckpt: str,
+        device: str = "cuda",
+        merge_lora: bool = True,
+        max_context_tokens: int = 0,
+        placeholder: Optional[str] = None,
+        decode: str = "sample",
+        num_inference_steps: Optional[int] = None,
+        seed: int = 0,
+        context_reset_every: int = 0,
+        stop_head: bool = False,
+        stop_temperature: Optional[float] = None,
+        stop_threshold: Optional[float] = None,
+        stop_inference: Optional[str] = None,
+        pose_mirror: bool = False,
+        pose_rotate_deg: float = 0.0,
+        pose_foreign: Optional[str] = None,
+        pose_foreign_split: str = "train",
+    ):
+        # Checked before the imports, as on the AR backend: a bad decode rule should fail
+        # the same way in any interpreter, not only in one that can load the checkpoint.
+        if decode != "sample":
+            hint = ""
+            if decode == "context":
+                hint = (" -- 'context' is the offline passthrough (the raw trunk vector), "
+                        "not an executable policy")
+            elif decode in ("mean", "argmax"):
+                hint = (" -- this head has no such decode and must not get one: averaging "
+                        "ODE samples reproduces the conditional mean, which is the creeping "
+                        "failure the head exists to avoid")
+            raise ValueError(f"decode must be 'sample', got {decode!r}{hint}")
+
+        from longnav.utils.flow_rollout import load_flow_policy, seed_sampling
+        from longnav.utils.vector_rollout import RolloutConfig
+
+        self._seed_sampling = seed_sampling
+        config = RolloutConfig(
+            device=device, merge_lora=merge_lora, max_context_tokens=max_context_tokens
+        )
+        if placeholder:
+            config.placeholder = placeholder
+        self.decode = decode
+        self.seed = int(seed)
+        self._episode_count = 0
+        # 0 = unlimited memory (production default); see _PeriodicContextReset.
+        self._context = _PeriodicContextReset(context_reset_every)
+        self.policy = load_flow_policy(
+            ckpt, config, decode=decode, num_inference_steps=num_inference_steps
+        )
+        # Read back off the codec rather than from the argument: None means "keep the
+        # checkpoint's own", and the log has to state the value that actually ran.
+        self.num_inference_steps = int(self.policy.model.codec.num_inference_steps)
+        # Both read the checkpoint and are inert on one that declares neither.
+        self._pose = _PoseFeed(
+            self.policy, _PoseCorruption(pose_mirror, pose_rotate_deg),
+            _ForeignPose(pose_foreign, pose_foreign_split) if pose_foreign else None,
+            seed=int(seed),
+        )
+        self._stop = _StopHeadControl(
+            self.policy, enabled=stop_head, temperature=stop_temperature,
+            threshold=stop_threshold, inference=stop_inference,
+        )
+
+    def _reseed(self, seed: int) -> None:
+        """Pin this episode's noise draws.
+
+        Delegates to ``longnav.utils.flow_rollout.seed_sampling`` rather than building the
+        generator here: it has to live on the device the context does (that is where
+        ``generate()`` allocates ``x_1``), and the model side is where that is known. Note
+        this head's ``.codec`` **is** the normalizer-slot object -- unlike the AR head, whose
+        ``.codec`` is the VQ table and whose generator lives on ``.normalizer``.
+        """
+        self._seed_sampling(self.policy, int(seed))
+
+    def reset(self, goal_text: Optional[str]) -> None:
+        self.policy.reset(goal_text=goal_text)
+        # Unconditional: one generation mode, and it always draws noise.
+        self._reseed(self.seed + self._episode_count)
+        self._pose.on_episode_reset()
+        self._stop.seed(self.policy, self.seed + self._episode_count)
+        self._episode_count += 1
+        self._context.on_episode_reset(goal_text)
+
+    def act(self, rgb: np.ndarray, pose: Optional[Sequence[float]] = None) -> np.ndarray:
+        from PIL import Image
+
+        # No-op unless --policy-memory-seconds was passed; see _PeriodicContextReset.
+        self._context.before_act(self.policy)
+        chunk = self.policy.step(Image.fromarray(rgb), **self._pose.step_kwargs(self.policy, pose))
+        return np.asarray(chunk.numpy(), dtype=np.float32)
+
+    @property
+    def last_stats(self) -> Dict[str, Any]:
+        stats = self._stop.annotate(_wire_safe(self.policy.last_stats))
+        context = getattr(self, "_context", None)
+        if context is not None and context.every:
+            stats["context_resets"] = context.resets
+        return stats
+
+    def wants_stop(self) -> bool:
+        return self._stop.decided(self.policy.last_stats)
+
+    #: Velocity-field options that default OFF or to the shape the v8 run uses, so a
+    #: checkpoint predating one of them looks exactly like one that declined it. Printed
+    #: with their defaults filled in for the same reason the AR backend does it: "absent"
+    #: and "off" are indistinguishable in the stored config, and the eval log has to say
+    #: which architecture produced its numbers.
+    FLOW_DECODER_KEYS = (
+        ("n_context_tokens", 8),
+        ("use_incoming_motion", False),
+        ("n_dims", 3),
+    )
+
+    def describe(self) -> str:
+        """One line of decode policy, one of velocity-field architecture.
+
+        The integration line is the load-bearing one here. The same weights integrated with
+        4 Euler steps and with 10 are different policies, and ``action_scales`` decides what
+        the field's unit-scale output means in metres -- both live on the codec, both are
+        checkpoint-carried, and neither is visible in the checkpoint path.
+        """
+        model = self.policy.model
+        cfg = model.decoder.to_config()
+        arch = " ".join(f"{key}={cfg.get(key, default)}"
+                        for key, default in self.FLOW_DECODER_KEYS)
+        codec = model.codec
+        scales = tuple(round(float(s), 6) for s in codec.action_scales.tolist())
+        # getattr: the test suite builds a partial backend with __new__ to avoid loading a
+        # multi-billion-parameter VLM, and describe() has to keep working on it.
+        context = getattr(self, "_context", None)
+        memory = (f"memory={context.every} steps/block"
+                  if context is not None and context.every else "memory=unlimited")
+        pose = getattr(self, "_pose", None)
+        stop = getattr(self, "_stop", None)
+        return (
+            f"{self.policy.describe()}\n"
+            f"  [flow decode={self.decode} seed_base={self.seed} "
+            f"n_ticks={model.decoder.n_ticks} {memory}]\n"
+            f"  [flow ODE euler_steps={getattr(self, 'num_inference_steps', None)} "
+            f"action_scales={scales}]\n"
+            f"  [flow field d_model={cfg.get('d_model')} n_layers={cfg.get('n_layers')} "
+            f"n_heads={cfg.get('n_heads')} {arch}]"
+            + (f"\n  [{pose.describe()}]" if pose is not None else "")
+            + (f"\n  [{stop.describe()}]" if stop is not None else "")
+        )
+
+
+register_backend("flow_rollout", FlowRolloutBackend)
+
+
 def serve(socket_path: str, backend: PolicyBackend) -> None:
     """Answer reset/act over ``socket_path`` until told to stop.
 

@@ -106,6 +106,11 @@ class EvalConfig:
     # forward this flag" so backends that don't accept it (vector_rollout) are unaffected.
     policy_decode: Optional[str] = None
     policy_seed: Optional[int] = None
+    # Euler steps for the flow-matching head's ODE (flow_rollout). None = the
+    # checkpoint's own `num_inference_steps`, which is what the run trained and
+    # logged its metrics under; a value here is a deliberate sweep of the
+    # integration, which changes the policy without changing the weights.
+    policy_inference_steps: Optional[int] = None
     # Memory-length ablation. Expressed in SECONDS because that is the quantity
     # that stays meaningful: one policy step is gap*dt seconds, so a step count
     # silently changes duration the moment --dt or --gap moves -- the same trap
@@ -398,7 +403,16 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                      help="decode rule for a distributional policy head (bin_rollout, "
                           "ar_rollout); ignored by backends that don't accept it. Unset "
                           "means the backend's own default, which differs between them: "
-                          "argmax for bin_rollout, sample for ar_rollout")
+                          "argmax for bin_rollout, sample for ar_rollout. flow_rollout "
+                          "accepts only 'sample' -- it has one generation mode and "
+                          "deliberately no mean")
+    mdl.add_argument("--policy-inference-steps", type=int, default=None,
+                     help="Euler steps for the flow-matching head's ODE (flow_rollout "
+                          "only). Unset = the checkpoint's own num_inference_steps, i.e. "
+                          "the integration the run's own metrics were computed under. "
+                          "Setting it sweeps the integration: the same weights at 4 steps "
+                          "and at 10 are different policies, so it is reported in the eval "
+                          "log alongside the checkpoint")
     mdl.add_argument("--policy-memory-seconds", type=float, default=None,
                      help="MEMORY-LENGTH ABLATION. Drop rollout history (KV cache and "
                           "visual dedup DB) every this many seconds of simulated time, "

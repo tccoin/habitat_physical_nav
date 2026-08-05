@@ -75,12 +75,16 @@ def rollout_values(spec, raw_poses):
     # `cfg` stands in for RolloutConfig: `_PoseFeed` installs the marker on it,
     # and refuses to run against a config that could not render one.
     config = type("C", (), {"modality_marker": None})()
-    feed = _PoseFeed(type("P", (), {"_pose_spec": spec, "cfg": config})())
+    policy = type("P", (), {"_pose_spec": spec, "cfg": config})()
+    feed = _PoseFeed(policy)
     stub = type("S", (), {})()
     stub._raw_poses = []
     out = []
     for pose in raw_poses:
-        value = VectorRolloutPolicy.pose_values(stub, feed.step_kwargs(list(pose))["obs_pose"])
+        # `step_kwargs(policy, pose)`: the policy argument arrived with the pose-frame
+        # ablation, which needs `policy.pose_values` to corrupt the *relative* value.
+        kwargs = feed.step_kwargs(policy, list(pose))
+        value = VectorRolloutPolicy.pose_values(stub, kwargs["obs_pose"])
         out.append(value[0].tolist())
     return np.asarray(out, dtype=np.float64)
 

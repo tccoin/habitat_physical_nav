@@ -58,6 +58,9 @@ def main() -> None:
     parser.add_argument("--decode", default=None,
                         help="decode rule for a distributional head (bin_rollout, "
                              "ar_rollout); unset means the backend's own default")
+    parser.add_argument("--num-inference-steps", type=int, default=None,
+                        help="Euler steps for the flow-matching head's ODE (flow_rollout); "
+                             "unset means the checkpoint's own num_inference_steps")
     parser.add_argument("--context-reset-every", type=int, default=None,
                         help="memory-length ablation: drop rollout history (KV cache and "
                              "visual dedup DB) every N policy steps, keeping the system "
@@ -109,6 +112,8 @@ def main() -> None:
     # (vector_rollout) must see no change at all when these flags are absent.
     if args.decode is not None:
         kwargs["decode"] = args.decode
+    if args.num_inference_steps is not None:
+        kwargs["num_inference_steps"] = args.num_inference_steps
     if args.seed is not None:
         kwargs["seed"] = args.seed
     if args.context_reset_every is not None:

@@ -32,6 +32,7 @@ genuinely conflict), bridged over a unix socket — hence the two `--policy-*` f
 | **regression head** (continuous) | `--ckpt <dir>` |
 | **bin head** (discrete, per-slot) | `--ckpt <dir> --policy-backend bin_rollout --policy-decode sample --policy-seed 1000` |
 | **AR head** (autoregressive) | `--ckpt <dir> --policy-backend ar_rollout --policy-decode sample --policy-seed 1000` |
+| **flow-matching head** | `--ckpt <dir> --policy-backend flow_rollout --policy-seed 1000`. No `--policy-decode`: one generation mode, and no mean by design (averaging ODE samples *is* the creeping failure it removes). `--policy-inference-steps N` sweeps the Euler integration; unset uses the checkpoint's own. |
 | **image-blind control** | `--policy forward` or `--policy zero` |
 
 Two things are **not** flags in that table, because they are properties of the

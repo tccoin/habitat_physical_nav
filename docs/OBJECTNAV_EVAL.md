@@ -40,6 +40,16 @@ python scripts/eval_objectnav_policy.py \
     --policy-python /workspace/conda/envs/longnav_vlm/bin/python \
     --policy-sys-path /Projects/spatial_training/src
 
+# 3c. The flow-matching head. One generation mode, so no --policy-decode; the pose
+#     modality is read off the checkpoint, so no flag for that either.
+python scripts/eval_objectnav_policy.py \
+    --policy-backend flow_rollout --policy-seed 0 \
+    --ckpt /Projects/spatial_training/dump/pose_injection/run_v8_flow_planar_pose/checkpoint-400 \
+    --episodes .../val_mini --scene-root .../scene_datasets \
+    --output-dir dump/eval_flow_v8_400 --max-steps 200 --auto-stop --gpus 4,5,6,7 \
+    --policy-python /workspace/conda/envs/longnav_vlm/bin/python \
+    --policy-sys-path /Projects/spatial_training/src
+
 # 4. Recover the summary of a partial or crashed run, without re-running it.
 python scripts/eval_objectnav_policy.py --report dump/eval_ckpt2500/shards
 
@@ -123,8 +133,9 @@ Registered today:
 | `vector_rollout` (default) | turn-vector regression (`longnav.utils.vector_rollout`) | n/a — not distributional |
 | `bin_rollout` | discrete bins, one categorical per (tick, dimension) (`longnav.utils.bin_rollout`) | `argmax` (default) / `sample` / `mean` |
 | `ar_rollout` | autoregressive over ticks: one joint VQ code per tick, decoded sequentially through a small causal transformer (`longnav.utils.ar_action_head`) | `sample` (default) / `argmax` / `mean` |
+| `flow_rollout` | flow matching: the whole chunk generated jointly by integrating a learned velocity field from noise (t=1) down to data (t=0) (`longnav.utils.flow_matching_head`, loaded by `longnav.utils.flow_rollout`) | `sample` only — and that is a design decision, not a gap |
 
-All three reach the simulator through `VectorRolloutPolicy` unmodified, because
+All four reach the simulator through `VectorRolloutPolicy` unmodified, because
 each head's `normalizer` slot already answers `denormalize(...) -> (T, 3)`. The
 backend's whole job is loading the right model class, fixing the decode rule and
 seeding the per-episode sampling stream — which is why a new head of this family
@@ -142,6 +153,39 @@ rather than a chunk; the backend rejects it instead of sending a
 computed from a greedy-decoded prefix — the head's own docs call it
 reporting-only, not a deployable rule, and it is here for the same
 control-within-the-control the bin head kept it for.
+
+`flow_rollout` inverts the first of those traps and refuses the third. Its
+`.codec` **is** the normalizer-slot object (this head has no lookup table, so
+`model.codec is model.normalizer`), which is why `flow_rollout.seed_sampling`
+follows `bin_rollout`'s pattern rather than the AR backend's — with
+`codec.action_scales.device` where the bin head reads `codec.centroids.device`.
+And `FlowActionCodec.DECODES` is `("sample", "context")` with **no `"mean"`, on
+purpose**: averaging several ODE solutions is not a draw from the conditional,
+it is the conditional mean — the creeping failure this head exists to remove. So
+`--policy-decode mean` is rejected here rather than quietly approximated, and
+`"context"` is rejected for exactly the reason it is on the AR head. Do not add
+a mean, and do not average chunks at the call site.
+
+Two more things are specific to it:
+
+* **Seeding is unconditional.** The bin and AR backends reseed only under
+  `--policy-decode sample` because their other rules consume no randomness. This
+  head has one generation mode and it always draws `x_1 ~ N(0, I)`, so every
+  episode is reseeded from `--policy-seed + <episode index>`. Without it a
+  closed-loop number is not reproducible at all.
+* **The number of Euler steps is part of the policy.** It is a checkpoint field
+  (`FlowMatchingConfig.num_inference_steps`, restored by `from_pretrained`), so
+  by default an eval integrates the ODE the way the run that produced the
+  training metrics did. `--policy-inference-steps` sweeps it — the same weights
+  at 4 steps and at 10 are different policies — and `describe()` prints the value
+  that actually loaded, next to the `action_scales` that turn the field's
+  unit-scale output back into metres:
+
+```
+  [flow decode=sample seed_base=1000 n_ticks=10 memory=unlimited]
+  [flow ODE euler_steps=10 action_scales=(0.03, 0.03, 0.05)]
+  [flow field d_model=128 n_layers=4 n_heads=4 n_context_tokens=8 use_incoming_motion=False n_dims=3]
+```
 
 **A checkpoint that reads more than the image, or that can stop.** Neither is a
 new backend. Both are *properties of the checkpoint*, so both are switched on by
@@ -224,7 +268,7 @@ cannot perturb a run. A diagnostic that genuinely needs to *query* the simulator
 on the `TickRecord`, which keeps that rule intact.
 
 Because every head runs through this one suite — `vector_rollout`, `bin_rollout`,
-`ar_rollout` and whatever registers next — a probe added here is inherited by all of them and
+`ar_rollout`, `flow_rollout` and whatever registers next — a probe added here is inherited by all of them and
 its numbers are comparable across them by construction. That is the reason to
 put a diagnostic here rather than in the experiment that wanted it.
 
@@ -624,7 +668,8 @@ write-up in `/Projects/spatial_training/dump/eval_system/FINDINGS.md` §6.
 | `--navmesh` | **Which navmesh every distance is measured on** — see [Two navmeshes](#2-two-navmeshes-and-episodes-that-are-unwinnable-on-ours). `robot` (default) recomputes it for this robot's footprint; `dataset` uses the point-agent mesh shipped with the scene. It does *not* change how the robot moves. Recorded in every results file and printed per scene. |
 | `--snap-start` | Off by default: the start is navigable on the dataset's mesh, and snapping onto the robot's smaller mesh would silently move the agent away from the pose the episode specifies. |
 | `--auto-stop` | **Oracle termination.** Ends the episode on the control *tick* the agent first comes within `--success-distance` — the stop a policy with no termination head cannot make for itself. Off by default so `success` and `oracle_success` stay independent readings. At `--evaluate-every 1` this makes `success == oracle_success` by construction; it cuts the chunk short rather than running it out, because a policy that arrives on tick 1 and drifts back out by tick 5 would otherwise score below the oracle that had already fired. Above `--evaluate-every 1` arrival is noticed late, so the identity weakens exactly as the oracle metrics do. |
-| `--policy-decode` | Decode rule for a distributional head (`bin_rollout`, `ar_rollout`): `argmax` / `sample` / `mean`. Changes the policy as much as changing the checkpoint does — a sampled chunk and a mean chunk from the same weights behave nothing alike. Ignored by backends that do not accept it. Unset means the backend's own default, and those differ: `argmax` for `bin_rollout`, `sample` for `ar_rollout` (its codec's own default, and the only rule its design treats as an executable sequential policy). |
+| `--policy-decode` | Decode rule for a distributional head (`bin_rollout`, `ar_rollout`): `argmax` / `sample` / `mean`. Changes the policy as much as changing the checkpoint does — a sampled chunk and a mean chunk from the same weights behave nothing alike. Ignored by backends that do not accept it. Unset means the backend's own default, and those differ: `argmax` for `bin_rollout`, `sample` for `ar_rollout` (its codec's own default, and the only rule its design treats as an executable sequential policy). `flow_rollout` accepts **only** `sample`: it has one generation mode, and it deliberately has no mean because averaging ODE solutions *is* the creeping failure that head was built to remove. |
+| `--policy-inference-steps` | Euler steps for the flow-matching head's ODE (`flow_rollout` only). Unset means the checkpoint's own `num_inference_steps`, i.e. the integration its training metrics were computed under — so an eval agrees with the run's own numbers unless it says otherwise. Setting it is a deliberate sweep: the same weights at 4 steps and at 10 are different policies, and the value that ran is printed in the policy shard log. |
 | `--stop-head` | **Lets the checkpoint's own stop classifier end the episode.** Mutually exclusive with `--auto-stop` — the config raises rather than picking a precedence. `oracle_success`/`oracle_spl` are unaffected either way (they latch on ever reaching `--success-distance`), so they stay comparable to every auto-stop run; `success`/`spl` stop being pinned equal to them and start measuring the policy's own termination. Expect longer episodes: nothing ends them on arrival any more. |
 | `--stop-inference` / `--stop-threshold` / `--stop-temperature` | Runtime knobs on that classifier, unset meaning the checkpoint's own values. They are post-hoc scalars by design and do not change its AP or AUC. Each episode record carries the per-step `(probability, logit)` trace under `"stop"` whether or not the head is acting, so a threshold or temperature can be swept offline instead of by re-running the split. |
 | `--policy-seed` | Base seed for a backend's per-episode seeded sampling. Combined with an episode counter, so re-running an episode list reproduces itself and an episode's result does not depend on how many ran before it. |

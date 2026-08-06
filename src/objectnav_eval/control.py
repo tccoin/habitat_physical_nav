@@ -83,6 +83,39 @@ PID_PRESETS: Dict[str, Dict[str, float]] = {
         "aw_max": 25.0,
         "w_max": 2.5,
     },
+    # No limits at all -- the PID gains alone decide the twist.
+    #
+    # The argument for it: an action chunk is already a *ramped* trajectory.
+    # The model was trained on setpoints that encode their own acceleration
+    # profile, so a rate limiter downstream is not enforcing physics the chunk
+    # ignored, it is re-imposing a ramp on top of one that is already there,
+    # and the second ramp is the one the model never saw. Under that reading
+    # the limits are not a safety feature but a distortion, and the cleanest
+    # test is to remove them entirely.
+    #
+    # The risk it carries: the limits are also what bounds the response to a
+    # *large* tracking error. When the robot is wedged against geometry the
+    # setpoint keeps advancing while the pose does not, so `error_xy` grows
+    # without bound and `kp_pos * error_xy` with it. Nothing then caps the
+    # commanded speed. Watch `blocked_drive_frac` and the contact probe on any
+    # run using this, and treat a large jump in path length as suspect rather
+    # than as progress.
+    "unlimited": {
+        "v_max": float("inf"),
+        "a_max": float("inf"),
+        "w_max": float("inf"),
+        "aw_max": float("inf"),
+    },
+    # `unlimited` minus the failure mode above: the rate limits go, but the
+    # velocity ceilings stay at what the demonstrations actually reached, so a
+    # wedged robot cannot command an arbitrarily large twist. This is the one
+    # to prefer if `unlimited` tracks well but behaves badly in contact.
+    "unramped": {
+        "a_max": float("inf"),
+        "aw_max": float("inf"),
+        "v_max": 2.0,
+        "w_max": 2.5,
+    },
 }
 
 

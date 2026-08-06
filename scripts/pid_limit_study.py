@@ -75,7 +75,7 @@ def wrap(a):
     return (np.asarray(a) + np.pi) % (2 * np.pi) - np.pi
 
 
-def replay_chunk(chunk, preset, dt, gap):
+def replay_chunk(chunk, preset, dt, gap, overrides=None):
     """One observation's chunk, executed exactly as ``ChunkExecutor`` does it.
 
     Returns (commanded heading sweep, achieved heading sweep, saturation counts).
@@ -87,7 +87,7 @@ def replay_chunk(chunk, preset, dt, gap):
 
     anchor = np.zeros(3, dtype=np.float64)
     base = KinematicBase(anchor)
-    controller = PIDPoseController(base, build_pid_config(preset))
+    controller = PIDPoseController(base, build_pid_config(preset, overrides))
 
     n = min(gap, len(chunk))
     setpoints = np.stack([relative_to_pose(anchor, chunk[j]) for j in range(n)])
@@ -116,7 +116,16 @@ def main():
     p.add_argument("--episodes", type=int, default=40)
     p.add_argument("--dt", type=float, default=0.04)
     p.add_argument("--gap", type=int, default=5)
-    p.add_argument("--presets", default="baseline,demo_half,demo_matched")
+    p.add_argument("--presets", default="baseline,demo_half,demo_matched,unramped,unlimited")
+    p.add_argument("--sweep", default=None, metavar="FIELD=V1,V2,...",
+                   help="sweep one PID field across values, on top of --sweep-base. "
+                        "Answers 'what should the gains be' rather than 'do the limits "
+                        "bind' -- the two questions are separate and this script keeps "
+                        "them so")
+    p.add_argument("--sweep-base", default="unlimited",
+                   help="preset the sweep is layered on. Defaults to 'unlimited' "
+                        "because a gain sweep read through a saturating rate limiter "
+                        "measures the limiter, not the gain")
     p.add_argument("--turn-threshold", type=float, default=0.05,
                    help="rad of commanded sweep below which a chunk is not a turn; "
                         "the ratio is meaningless on chunks that barely rotate")
@@ -132,16 +141,11 @@ def main():
     print(f"{len(chunks)} chunks from {min(args.episodes, len(rows))} episodes, "
           f"dt={args.dt} gap={args.gap}\n")
 
-    header = (f"{'preset':<14}{'turn kept':>11}{'p10':>8}{'lag m':>9}"
-              f"{'aw sat':>9}{'w sat':>8}{'a sat':>8}")
-    print(header)
-    print("-" * len(header))
-    for preset in args.presets.split(","):
-        preset = preset.strip()
+    def row(label, preset, overrides=None):
         ratios, lags, sat, ticks = [], [], {"v": 0, "w": 0, "a": 0, "aw": 0}, 0
         for chunk in chunks:
             commanded, achieved, lag, counts, n = replay_chunk(
-                chunk, preset, args.dt, args.gap
+                chunk, preset, args.dt, args.gap, overrides
             )
             for key in sat:
                 sat[key] += counts[key]
@@ -150,11 +154,28 @@ def main():
             if commanded >= args.turn_threshold:
                 ratios.append(achieved / commanded)
         ratios = np.asarray(ratios)
-        print(f"{preset:<14}{ratios.mean():>10.3f} {np.percentile(ratios, 10):>7.3f} "
+        print(f"{label:<16}{ratios.mean():>10.3f} {np.percentile(ratios, 10):>7.3f} "
               f"{np.mean(lags):>8.4f} {sat['aw'] / ticks:>8.1%} "
               f"{sat['w'] / ticks:>7.1%} {sat['a'] / ticks:>7.1%}")
+        return len(ratios)
 
-    print(f"\nturning chunks: {len(ratios)}/{len(chunks)} "
+    header = (f"{'setting':<16}{'turn kept':>10}{'p10':>8}{'lag m':>9}"
+              f"{'aw sat':>9}{'w sat':>8}{'a sat':>8}")
+    print(header)
+    print("-" * len(header))
+    n_turning = 0
+    if args.sweep:
+        name, _, values = args.sweep.partition("=")
+        name = name.strip()
+        print(f"[sweeping {name} on top of preset '{args.sweep_base}']")
+        for value in values.split(","):
+            value = value.strip()
+            n_turning = row(f"{name}={value}", args.sweep_base, {name: value})
+    else:
+        for preset in args.presets.split(","):
+            n_turning = row(preset.strip(), preset.strip())
+
+    print(f"\nturning chunks: {n_turning}/{len(chunks)} "
           f"(commanded sweep >= {args.turn_threshold} rad)")
     print("'turn kept' = achieved / commanded heading sweep over the chunk, "
           "1.0 = perfect.\nNo geometry in this plant, so these are upper bounds.")

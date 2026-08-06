@@ -16,6 +16,38 @@ rest of the parent `habitat/` checkout — see `README.md` "Included files" /
 "Not included files". Don't casually add imports back to the parent repo's
 Python files.
 
+## The `continuous_demos` fork is retired — do not read or import it
+
+`/Projects/continuous_demos` was a live fork of this repo. Both sides were
+being committed to, and they had diverged 28 commits (here) against 29
+(there) from a shared root. It has been **merged back in and deprecated**;
+this repo is now the only one.
+
+Two things had already gone wrong because of it, and both are the reason this
+section exists rather than a git note:
+
+- `import continuous_demos` resolved to `/Projects/continuous_demos/src` via
+  an editable-install `.pth`, so any entry point that did not first
+  `sys.path.insert` this repo's `src/` silently ran the *other* checkout.
+  `scripts/eval_objectnav_policy.py` did insert it; an interactive session or
+  a new script would not have. Fixed by reinstalling (`pip install -e .`) from
+  here — verify with
+  `python -c "import continuous_demos,os;print(os.path.dirname(continuous_demos.__file__))"`.
+- `data/v2_25hz` was built by a builder that existed **only** in the fork
+  (`chunk_build.py`, `recording_metadata.py`, `--obs-stride-frames`), so the
+  corpus could not be rebuilt or extended from this repo at all. Those modules
+  are now here. A corpus built with the pre-merge builder here is missing eight
+  per-row metadata columns (`obs_interval`, `chunk_duration`,
+  `overlap_fraction`, `effective_obs_hz`, `v_max_mps`, `w_max_radps`,
+  `recording_schema_version`, `native_fps_source`) and is **not** comparable to
+  `v2_25hz`. Build corpora with this repo's
+  `scripts/build_action_chunk_episode_dataset.py` and nothing else.
+
+What still lives over there is **data, not code**: the recordings under
+`/Projects/continuous_demos/output_25hz`, which every corpus's `images` column
+references by absolute path. Moving them would invalidate `v2_25hz`, so they
+stay put for now. That directory is the only reason the path may still appear.
+
 ## Pipeline (in order)
 
 1. `replay_human_demo.py` — replay one episode of a `.json.gz` dataset through

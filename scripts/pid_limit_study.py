@@ -75,37 +75,52 @@ def wrap(a):
     return (np.asarray(a) + np.pi) % (2 * np.pi) - np.pi
 
 
-def replay_chunk(chunk, preset, dt, gap, overrides=None):
-    """One observation's chunk, executed exactly as ``ChunkExecutor`` does it.
+def replay_episode(chunks, preset, dt, gap, overrides=None, persist=True):
+    """A whole episode's chunk sequence, executed as ``ChunkExecutor`` does it.
 
-    Returns (commanded heading sweep, achieved heading sweep, saturation counts).
+    ``persist`` controls the one thing this script originally got wrong. The
+    executor holds ONE controller for the episode, so ``_prev_cmd`` -- the
+    anchor the rate limiter clamps against -- carries from each chunk into the
+    next. Rebuilding the controller per chunk silently restarts every chunk
+    from rest, which makes the ramp cost recur once per chunk instead of once
+    per turn and hugely overstates what the limits cost. ``persist=False``
+    reproduces that mistake, so the size of it stays measurable.
     """
     from continuous_demos.action_chunking import relative_to_pose
     from continuous_demos.pid_pose_controller import PIDPoseController, track_trajectory
 
     from objectnav_eval.control import build_pid_config
 
-    anchor = np.zeros(3, dtype=np.float64)
-    base = KinematicBase(anchor)
-    controller = PIDPoseController(base, build_pid_config(preset, overrides))
+    config = build_pid_config(preset, overrides)
+    base = KinematicBase(np.zeros(3))
+    controller = PIDPoseController(base, config)
 
-    n = min(gap, len(chunk))
-    setpoints = np.stack([relative_to_pose(anchor, chunk[j]) for j in range(n)])
-
+    out = []
     counts = {"v": 0, "w": 0, "a": 0, "aw": 0}
-    previous_setpoint = anchor
-    for setpoint in setpoints:
-        segment = track_trajectory(
-            base, controller, setpoint[None, :], dt=dt, initial_pose=previous_setpoint
-        )
-        for key in counts:
-            counts[key] += int(segment["saturation_counts"].get(key, 0))
-        previous_setpoint = setpoint
-
-    commanded = float(abs(wrap(setpoints[-1][2] - anchor[2])))
-    achieved = float(abs(wrap(base.pose[2] - anchor[2])))
-    lag = float(np.linalg.norm(base.pose[:2] - setpoints[-1][:2]))
-    return commanded, achieved, lag, counts, n
+    ticks = 0
+    for chunk in chunks:
+        if not persist:
+            controller = PIDPoseController(base, config)
+        # Every chunk re-anchors on the pose the robot actually reached, which
+        # is what the executor does -- the chunk is relative to *now*.
+        anchor = base.pose.copy()
+        n = min(gap, len(chunk))
+        setpoints = np.stack([relative_to_pose(anchor, chunk[j]) for j in range(n)])
+        previous_setpoint = anchor
+        for setpoint in setpoints:
+            segment = track_trajectory(
+                base, controller, setpoint[None, :], dt=dt, initial_pose=previous_setpoint
+            )
+            for key in counts:
+                counts[key] += int(segment["saturation_counts"].get(key, 0))
+            previous_setpoint = setpoint
+        ticks += n
+        out.append((
+            float(abs(wrap(setpoints[-1][2] - anchor[2]))),
+            float(abs(wrap(base.pose[2] - anchor[2]))),
+            float(np.linalg.norm(base.pose[:2] - setpoints[-1][:2])),
+        ))
+    return out, counts, ticks
 
 
 def main():
@@ -126,6 +141,10 @@ def main():
                    help="preset the sweep is layered on. Defaults to 'unlimited' "
                         "because a gain sweep read through a saturating rate limiter "
                         "measures the limiter, not the gain")
+    p.add_argument("--per-chunk-controller", action="store_true",
+                   help="rebuild the controller for every chunk. This is WRONG -- the "
+                        "executor keeps one per episode -- and is retained only to "
+                        "quantify how far it misleads")
     p.add_argument("--turn-threshold", type=float, default=0.05,
                    help="rad of commanded sweep below which a chunk is not a turn; "
                         "the ratio is meaningless on chunks that barely rotate")
@@ -135,24 +154,28 @@ def main():
 
     data = load_from_disk(args.dataset)
     rows = data[args.split] if hasattr(data, "keys") else data
-    chunks = []
-    for i in range(min(args.episodes, len(rows))):
-        chunks.extend(np.asarray(rows[i]["action_chunks"], dtype=np.float64))
-    print(f"{len(chunks)} chunks from {min(args.episodes, len(rows))} episodes, "
-          f"dt={args.dt} gap={args.gap}\n")
+    episodes = [np.asarray(rows[i]["action_chunks"], dtype=np.float64)
+                for i in range(min(args.episodes, len(rows)))]
+    total = sum(len(e) for e in episodes)
+    print(f"{total} chunks from {len(episodes)} episodes, dt={args.dt} gap={args.gap}")
+    print("controller persists across chunks within an episode, as ChunkExecutor "
+          "does\n" if not args.per_chunk_controller else
+          "controller REBUILT per chunk (the original defect, kept for comparison)\n")
 
     def row(label, preset, overrides=None):
         ratios, lags, sat, ticks = [], [], {"v": 0, "w": 0, "a": 0, "aw": 0}, 0
-        for chunk in chunks:
-            commanded, achieved, lag, counts, n = replay_chunk(
-                chunk, preset, args.dt, args.gap, overrides
+        for chunks in episodes:
+            per_chunk, counts, n = replay_episode(
+                chunks, preset, args.dt, args.gap, overrides,
+                persist=not args.per_chunk_controller,
             )
             for key in sat:
                 sat[key] += counts[key]
             ticks += n
-            lags.append(lag)
-            if commanded >= args.turn_threshold:
-                ratios.append(achieved / commanded)
+            for commanded, achieved, lag in per_chunk:
+                lags.append(lag)
+                if commanded >= args.turn_threshold:
+                    ratios.append(achieved / commanded)
         ratios = np.asarray(ratios)
         print(f"{label:<16}{ratios.mean():>10.3f} {np.percentile(ratios, 10):>7.3f} "
               f"{np.mean(lags):>8.4f} {sat['aw'] / ticks:>8.1%} "
@@ -175,7 +198,7 @@ def main():
         for preset in args.presets.split(","):
             n_turning = row(preset.strip(), preset.strip())
 
-    print(f"\nturning chunks: {n_turning}/{len(chunks)} "
+    print(f"\nturning chunks: {n_turning}/{total} "
           f"(commanded sweep >= {args.turn_threshold} rad)")
     print("'turn kept' = achieved / commanded heading sweep over the chunk, "
           "1.0 = perfect.\nNo geometry in this plant, so these are upper bounds.")

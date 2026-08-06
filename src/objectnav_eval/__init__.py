@@ -11,6 +11,7 @@ needs that a task does not:
     policies    -- what drives the robot                   (:mod:`.policies`)
     executor    -- how an action chunk becomes motion      (:mod:`.executor`)
     probes      -- diagnostics riding along the rollout    (:mod:`.probes`)
+    budget      -- what an episode is allowed to cost      (:mod:`.budget`)
     runner      -- one episode, start to metrics           (:mod:`.runner`)
     parallel    -- many episodes over many GPUs            (:mod:`.parallel`)
     reporting   -- JSONL records + the aggregate summary   (:mod:`.reporting`)

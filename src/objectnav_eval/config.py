@@ -10,10 +10,12 @@ option is forwarded correctly by construction.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Dict, List, Optional
 
+from .budget import BUDGET_MODES, DEFAULT_BUDGET_UNITS, DEFAULT_TIME_BACKSTOP_S
 from .control import PID_PRESETS
 
 # Execution cadence defaults, from the chunk config the current checkpoints were
@@ -43,6 +45,20 @@ class EvalConfig:
 
     # -- rollout ------------------------------------------------------------
     max_steps: int = 200
+    # WHICH CURRENCY THE EPISODE IS CAPPED IN. 'steps' (default) is the
+    # historical behaviour: --max-steps policy steps and nothing else.
+    # 'geometric' caps at --budget-units discrete-equivalent units of motion
+    # (0.25 m or 30 deg each), which is what classic ObjectNav's 500-step cap
+    # actually buys, plus a mandatory sim-time backstop. 'both' applies the step
+    # cap as well and reports whichever fired. See objectnav_eval/budget.py and
+    # docs/GEOMETRIC_BUDGET.md. The budget spent is recorded either way.
+    episode_budget: str = "steps"
+    budget_units: float = DEFAULT_BUDGET_UNITS
+    # The backstop that makes a geometric budget safe. Not optional: the budget
+    # is blind to a frozen agent and to one pushing into geometry, both of which
+    # spend nothing and would run to the loop bound. __post_init__ rejects a
+    # geometric rule without one.
+    budget_time_limit_s: float = DEFAULT_TIME_BACKSTOP_S
     gap: int = DEFAULT_GAP
     dt: float = DEFAULT_DT
     success_distance: float = 1.0
@@ -234,6 +250,63 @@ class EvalConfig:
             )
         if self.auto_stop_delay < 0:
             raise ValueError(f"--auto-stop-delay must be >= 0, got {self.auto_stop_delay}")
+        if self.episode_budget not in BUDGET_MODES:
+            raise ValueError(
+                f"--episode-budget must be one of {list(BUDGET_MODES)}, "
+                f"got {self.episode_budget!r}"
+            )
+        if self.budget_rule_active:
+            # Constructing the rule is the validation: it is the one place that
+            # knows a geometric budget without a sim-time backstop is not a
+            # configuration but a hang waiting for a frozen policy.
+            self.build_budget_rule()
+
+    # -- the episode budget --------------------------------------------------
+    @property
+    def budget_rule_active(self) -> bool:
+        """Is the geometric budget a termination rule (as opposed to a column)?"""
+        return self.episode_budget in ("geometric", "both")
+
+    def build_budget_rule(self):
+        """A fresh :class:`~objectnav_eval.budget.BudgetRule`, or None.
+
+        Fresh per call: the rule carries the episode's accumulator, so sharing
+        one across episodes would carry the previous episode's spend into the
+        next -- the same mistake as reusing a ``PathTracker``.
+        """
+        if not self.budget_rule_active:
+            return None
+        from .budget import BudgetRule, GeometricBudget
+
+        return BudgetRule(
+            budget=GeometricBudget(budget=float(self.budget_units)),
+            time_limit_s=float(self.budget_time_limit_s),
+        )
+
+    @property
+    def step_limit(self) -> int:
+        """How many policy steps the rollout loop may run.
+
+        Under ``steps``/``both`` this is ``--max-steps``, which is also a
+        termination rule. Under ``geometric`` the step cap is deliberately NOT a
+        termination rule -- capping in steps is the thing the geometric budget
+        exists to replace -- so the loop bound comes from the sim-time backstop
+        instead: the largest number of policy steps that backstop can possibly
+        allow. It is a safety bound, not a cap; the tick-level backstop fires
+        first, so exhausting it is unreachable in normal operation. Leaving
+        ``--max-steps`` in place here instead would let a default of 200 silently
+        bind before the budget ever did, and the run would report a geometric
+        cap it never applied.
+        """
+        if self.episode_budget != "geometric":
+            return int(self.max_steps)
+        seconds_per_step = max(1e-9, self.gap * self.dt)
+        # +1 so the bound is strictly past the backstop. Sim time is accumulated
+        # by repeated addition of `dt`, so a limit that lands exactly on a step
+        # boundary can come out a float epsilon short and let the loop end first
+        # -- which would report `max_steps` for an episode the backstop was
+        # about to end.
+        return max(1, int(math.ceil(self.budget_time_limit_s / seconds_per_step)) + 1)
 
     @property
     def stop_distance(self) -> float:
@@ -320,6 +393,31 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
 
     run = parser.add_argument_group("rollout")
     run.add_argument("--max-steps", type=int, default=200, help="policy steps per episode")
+    run.add_argument("--episode-budget", default="steps", choices=list(BUDGET_MODES),
+                     help="WHICH CURRENCY THE EPISODE IS CAPPED IN. 'steps' (default) "
+                          "is --max-steps and nothing else, the behaviour every result "
+                          "so far was produced under; it is gap-dependent, so runs at "
+                          "different observation rates are not comparable under it. "
+                          "'geometric' caps at --budget-units units of motion, one unit "
+                          "being 0.25 m driven or 30 deg turned -- the geometry of one "
+                          "classic ObjectNav discrete step, so 500 units is the "
+                          "benchmark's own 500-step cap measured on a continuous agent. "
+                          "It ALWAYS carries --budget-time-limit as a backstop, because "
+                          "a frozen agent and one pushing into a wall both spend nothing. "
+                          "'both' additionally keeps the step cap and reports whichever "
+                          "fired. The budget spent is recorded either way. See "
+                          "docs/GEOMETRIC_BUDGET.md")
+    run.add_argument("--budget-units", type=float, default=DEFAULT_BUDGET_UNITS,
+                     help="size of the geometric budget, in discrete-step equivalents "
+                          "(0.25 m or 30 deg each). 500 = the classic ObjectNav cap")
+    run.add_argument("--budget-time-limit", dest="budget_time_limit_s", type=float,
+                     default=DEFAULT_TIME_BACKSTOP_S,
+                     help="MANDATORY sim-time backstop for --episode-budget "
+                          "geometric/both, seconds. 300 s against a 500-unit budget "
+                          "implies a floor of 1.67 units/s; measured per-episode rates "
+                          "are p10 3.07-3.39 and the slowest episode observed was 0.83, "
+                          "so it ends a stuck episode without truncating a slow one. "
+                          "Ignored under --episode-budget steps")
     run.add_argument("--gap", type=int, default=DEFAULT_GAP,
                      help="control ticks executed per chunk, = the training observation "
                           "stride (5 ticks at 20 Hz = 4 Hz observations)")

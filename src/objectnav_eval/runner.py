@@ -32,6 +32,12 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
+from objectnav_eval.budget import (
+    TERMINATED_BUDGET,
+    TERMINATED_TIME,
+    GeometricBudget,
+    terminated_code,
+)
 from objectnav_eval.episodes import EvalEpisode
 from objectnav_eval.executor import ChunkExecutor, TickRecord
 from objectnav_eval.navmesh import robot_position_3d
@@ -99,6 +105,22 @@ class EpisodeRunner:
 
         start_metrics = task.reset(episode.episode, snap_to_navmesh=config.snap_start)
         ctx.executor.reset()
+        # The geometric budget is accumulated on EVERY run, whether or not it is
+        # the termination rule -- it costs one subtraction per tick and it is
+        # what lets a finished run be re-scored under a different cap instead of
+        # re-run (scripts/rescore_budget.py). `rule` is None unless the cap is
+        # active, and only then does anything terminate on it.
+        rule = (
+            config.build_budget_rule()
+            if hasattr(config, "build_budget_rule") else None
+        )
+        budget = rule.budget if rule is not None else GeometricBudget(
+            budget=float(getattr(config, "budget_units", float("inf")))
+        )
+        # Seeded with the spawn pose: without it the first chunk's motion is
+        # charged from wherever tick 1 landed and the episode starts one tick
+        # of travel in credit.
+        budget.reset(ctx.robot_sim.get_2d_pose())
         ctx.policy.reset(episode.object_category)
         for probe in ctx.probes:
             probe.reset(episode)
@@ -160,6 +182,7 @@ class EpisodeRunner:
         def on_tick(record: TickRecord) -> None:
             nonlocal distance, min_distance, first_reach_step, stop_step, path_at_min
             task.observe_pose(record.pose)
+            budget.observe(record.pose)
             for probe in ctx.probes:
                 probe.on_tick(record)
             if record.tick % config.evaluate_every == 0:
@@ -187,8 +210,43 @@ class EpisodeRunner:
                     )
                 )
 
+        # Which cap the episode budget rule fired on, set from inside the tick
+        # predicate below. None while the episode is still running.
+        cap_fired: Optional[str] = None
+        # The oracle's own mid-chunk cut, unchanged: it applies only when
+        # arrival is meant to END the episode. With a delay the window has just
+        # opened and the robot should keep driving through it.
+        oracle_cuts = bool(config.auto_stop) and not config.auto_stop_delay
+
+        def should_stop_tick(record: TickRecord) -> bool:
+            """Terminations the EPISODE owns, evaluated at the tick they happen.
+
+            Both callers cut mid-chunk deliberately -- an oracle that only fired
+            at chunk boundaries would let the robot arrive on tick 1 and drift
+            back out by tick 5, and a budget that only fired at chunk boundaries
+            would hand out up to ``gap`` ticks of free motion.
+
+            The oracle is checked first: if the agent arrived on the same tick
+            the budget ran out, the episode was won, and reporting it as a cap
+            would be wrong. Otherwise the cap answers, and the loop below reads
+            ``cap_fired`` to say which one.
+            """
+            nonlocal cap_fired
+            if oracle_cuts and stop_step is not None:
+                return True
+            if rule is not None:
+                cap_fired = rule.exceeded(record.sim_time)
+                if cap_fired is not None:
+                    return True
+            return False
+
+        # None when nothing wants a mid-chunk cut, which keeps the default
+        # configuration on exactly the code path it has always run.
+        stop_when = should_stop_tick if (oracle_cuts or rule is not None) else None
+
         try:
-            for step in range(config.max_steps):
+            for step in range(config.step_limit if hasattr(config, "step_limit")
+                              else config.max_steps):
                 rgb = self._render()
                 if config.record_video:
                     recorder.add(
@@ -247,20 +305,23 @@ class EpisodeRunner:
                 # `on_tick` runs first and sets `first_reach_step`, so the
                 # arriving tick is the one that stops it.
                 execution = ctx.executor.execute(
-                    chunk, step, on_tick=on_tick,
-                    stop_when=(
-                        # Cutting the chunk short is only right when arrival is
-                        # meant to END the episode. With a delay the window has
-                        # just opened and the robot should keep driving through
-                        # it, so the chunk runs out.
-                        (lambda _record: stop_step is not None)
-                        if config.auto_stop and not config.auto_stop_delay else None
-                    ),
+                    chunk, step, on_tick=on_tick, stop_when=stop_when,
                 )
                 for probe in ctx.probes:
                     probe.on_chunk(execution)
                 goal_probe.observe(distance)
 
+                if cap_fired is not None:
+                    # Ahead of the policy's own stop on purpose: the cap
+                    # physically truncated this chunk, so the episode ended at
+                    # that tick and the policy's declaration is about a chunk
+                    # that did not finish running. Reporting it as a clean
+                    # policy stop would credit a termination that never happened.
+                    terminated = {
+                        TERMINATED_BUDGET: "budget exhausted",
+                        TERMINATED_TIME: "sim time limit",
+                    }[cap_fired]
+                    break
                 if chunk.stop:
                     # Gated: the classifier only gets to end the episode where the
                     # oracle already agrees. Elsewhere its call is recorded as a
@@ -303,6 +364,7 @@ class EpisodeRunner:
             wall_seconds=time.perf_counter() - started, chunk=chunk,
             stop_trace=stop_trace, pose_trace=pose_trace,
             stop_suppressed=stop_suppressed, path_at_min=path_at_min,
+            budget=budget,
         )
 
     # ------------------------------------------------------------------
@@ -336,6 +398,7 @@ class EpisodeRunner:
         pose_trace: Optional[List[List[float]]] = None,
         stop_suppressed: int = 0,
         path_at_min: float = 0.0,
+        budget: Optional[GeometricBudget] = None,
     ) -> Dict[str, Any]:
         ctx = self.ctx
         record: Dict[str, Any] = {
@@ -407,10 +470,29 @@ class EpisodeRunner:
             ),
             first_reach_step=first_reach_step,
             terminated=terminated or "max steps",
+            # The same fact as `terminated`, as a stable code. `terminated` is
+            # left phrased exactly as it always was -- finished runs and the
+            # scripts that read them (sweep_stop_threshold.py) match on those
+            # strings -- so the canonical vocabulary lives beside it rather than
+            # replacing it. See budget.terminated_code.
+            terminated_by=terminated_code(terminated),
             video=str(recorder.path) if recorder.enabled else None,
             video_frames=int(recorder.frames),
             goal_distance=goal_probe.summary(),
         )
+        if budget is not None:
+            # Always present, like path_length_m: an episode's consumption in
+            # discrete-step equivalents, and the translation/rotation split
+            # (which is a finding, not bookkeeping -- policies spend ~50% of
+            # their budget turning against ~36% for human demonstrations).
+            record["budget"] = {
+                **budget.summary(),
+                "rule": getattr(ctx.config, "episode_budget", "steps"),
+                "units_per_sim_second": (
+                    budget.spent / ctx.executor.sim_time
+                    if ctx.executor.sim_time > 0 else float("nan")
+                ),
+            }
         for probe in ctx.probes:
             record[probe.name] = probe.summary()
         if chunk is not None and chunk.extra:

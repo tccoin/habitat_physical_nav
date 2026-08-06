@@ -25,6 +25,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
 
+from .budget import terminated_code
+
 RATE_KEYS = ["success", "oracle_success", "spl", "oracle_spl", "soft_spl", "npwpl"]
 DISTANCE_KEYS = [
     "distance_to_goal_m",
@@ -150,7 +152,16 @@ def summarize(
         ),
         skipped_by_reason=_counts(skipped, "reason_code"),
         terminated_by_reason=_counts(results, "terminated"),
+        # The same counts under the stable code vocabulary, derived rather than
+        # read, so a run that predates `terminated_by` aggregates alongside one
+        # that has it.
+        terminated_by_code=_counts(
+            [{"code": terminated_code(r.get("terminated"))} for r in results], "code"
+        ),
     )
+    budget = summarize_budget(results)
+    if budget:
+        summary["budget"] = budget
     tracking = summarize_tracking(results)
     if tracking:
         summary["tracking"] = tracking
@@ -173,6 +184,49 @@ def summarize(
         for category, rows in sorted(by_category.items(), key=lambda kv: str(kv[0]))
     }
     return summary
+
+
+def summarize_budget(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """The geometric budget across a run, whether or not it capped anything.
+
+    Reported as a mean over episodes plus the ``p50``/``p95`` of the per-episode
+    spend, because the question a cap has to answer is not "what does the
+    average episode cost" but "what fraction of episodes does this cap cut", and
+    the spend distribution is long-tailed (human demos: median 98 units,
+    p95 223.5).
+
+    ``episodes_over_budget`` counts episodes whose spend reached
+    ``--budget-units``. Under ``--episode-budget steps`` that is a counterfactual
+    -- nothing was truncated -- and it is exactly the number that says what
+    adopting the cap would have cost.
+    """
+    rows = [r["budget"] for r in results if isinstance(r.get("budget"), dict)]
+    rows = [row for row in rows if row.get("samples")]
+    if not rows:
+        return {}
+    units = np.asarray([float(row.get("units", np.nan)) for row in rows], dtype=float)
+    finite = units[np.isfinite(units)]
+    out: Dict[str, Any] = {
+        "episodes": len(rows),
+        "units_mean": _finite_mean(units),
+        "units_p50": float(np.percentile(finite, 50)) if len(finite) else float("nan"),
+        "units_p95": float(np.percentile(finite, 95)) if len(finite) else float("nan"),
+        "units_max": float(finite.max()) if len(finite) else float("nan"),
+        "translation_units_mean": _finite_mean(
+            [row.get("translation_units") for row in rows]
+        ),
+        "rotation_units_mean": _finite_mean([row.get("rotation_units") for row in rows]),
+        "rotation_fraction_mean": _finite_mean(
+            [row.get("rotation_fraction") for row in rows]
+        ),
+        "units_per_sim_second_mean": _finite_mean(
+            [row.get("units_per_sim_second") for row in rows]
+        ),
+        "budget_units": rows[0].get("budget_units"),
+        "episodes_over_budget": sum(1 for row in rows if row.get("exhausted")),
+        "rule": rows[0].get("rule", "steps"),
+    }
+    return out
 
 
 def summarize_tracking(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
@@ -289,6 +343,15 @@ def episode_line(record: Dict[str, Any]) -> Dict[str, Any]:
         "path_at_min_m": jsonable(record.get("path_at_min_m"), 2),
         "steps": record.get("steps"),
         "terminated": record.get("terminated"),
+        "terminated_by": (
+            record.get("terminated_by") or terminated_code(record.get("terminated"))
+        ),
+        # Discrete-step equivalents consumed (0.25 m or 30 deg each), and how
+        # much of that went on turning. Present on every run, capped or not.
+        "budget_units": jsonable((record.get("budget") or {}).get("units"), 1),
+        "budget_turn_frac": jsonable(
+            (record.get("budget") or {}).get("rotation_fraction"), 3
+        ),
         "undershoot": jsonable(tracking.get("undershoot_ratio_moving"), 3),
         "lag_m": jsonable(tracking.get("tracking_lag_mean_m"), 3),
         # Behaviour, not outcome: how much of the episode went nowhere, how much
@@ -412,6 +475,24 @@ def print_summary(
         f"  path length      {summary['path_length_m']:.2f} m over "
         f"{summary['steps']:.0f} policy steps"
     )
+    budget = summary.get("budget") or {}
+    if budget:
+        cap = budget.get("budget_units") or float("nan")
+        over = budget.get("episodes_over_budget", 0)
+        rule = budget.get("rule", "steps")
+        print(
+            f"  budget spent     {budget.get('units_mean', float('nan')):.1f} units mean "
+            f"(p50 {budget.get('units_p50', float('nan')):.1f}, "
+            f"p95 {budget.get('units_p95', float('nan')):.1f}); "
+            f"{budget.get('rotation_fraction_mean', float('nan')) * 100:.0f}% on rotation, "
+            f"{budget.get('units_per_sim_second_mean', float('nan')):.2f} units/s"
+        )
+        print(
+            f"                   {over}/{budget.get('episodes', 0)} episode(s) reach the "
+            f"{cap:.0f}-unit budget"
+            + ("" if rule != "steps" else "  (counterfactual: --episode-budget steps, "
+                                          "nothing was truncated)")
+        )
     if summary.get("terminated_by_reason"):
         reasons = ", ".join(
             f"{count}x {reason}"

@@ -394,9 +394,10 @@ Design in one line per module: `episodes` (registrable `EpisodeSource` →
 `EvalEpisode`), `navmesh`, `screening` (explicit reason codes), `policies`
 (`Observation` → `ActionChunk`), `bridge` (the sim↔model socket + the
 `PolicyBackend` interface new head types implement), `executor`, `probes`
-(`TrackingDiagnostic`), `task`, `runner`, `harness`, `parallel`, `reporting`,
-`config`. `tests/test_objectnav_eval.py` pins the pure logic and needs no
-simulator.
+(`TrackingDiagnostic`), `budget` (`GeometricBudget` + its mandatory sim-time
+backstop), `task`, `runner`, `harness`, `parallel`, `reporting`,
+`config`. `tests/test_objectnav_eval.py` and `tests/test_geometric_budget.py`
+pin the pure logic and need no simulator.
 
 Four things in here exist because getting them wrong produces plausible, wrong
 numbers rather than an error — they are the reason this is a package and not a
@@ -436,6 +437,21 @@ the collator and the rollout alike. A second, "equivalent" implementation here
 would not raise when it drifted; the model would read confident nonsense and the
 run would still print a number. `--stop-head` and `--auto-stop` are mutually
 exclusive (the config raises) because both terminate the episode.
+
+Sixth thing, `objectnav_eval/budget.py` and **`docs/GEOMETRIC_BUDGET.md`**: **an
+episode cap is a choice of currency, and the one we had is not the benchmark's.**
+Classic ObjectNav caps at 500 discrete steps of 0.25 m / 30 deg; our caps were in
+policy steps (`gap`-dependent, so runs at different observation rates are not
+comparable) or in seconds (which charge rotation 2.09x what a discrete budget
+does). `--episode-budget geometric` caps at `--budget-units` units of *motion*,
+one unit being one discrete step's geometry. Default OFF (`steps`), and the
+budget spent is recorded on every run either way so a finished run can be
+re-scored (`scripts/rescore_budget.py`) instead of re-run. The rule that matters:
+a geometric budget is blind to a frozen agent and to one pushing into geometry —
+both spend nothing — so it **always** carries a sim-time backstop and the config
+raises without one. Measured: 500 units is ~95 s of demonstration motion and
+~130-150 s of current-policy motion, against the 70 s cap every result before
+2026-08-06 ran under.
 
 `objectnav_eval/probes.py` carries the PID tracking diagnostic (commanded vs
 achieved displacement, lag, undershoot ratio, controller saturation). It is a

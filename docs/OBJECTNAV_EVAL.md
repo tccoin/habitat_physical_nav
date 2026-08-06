@@ -102,6 +102,7 @@ metric or diagnostic is an addition rather than an edit.
 | `bridge.py` | The sim↔model socket, and the `PolicyBackend` interface for head types. |
 | `executor.py` | `ActionChunk` → setpoints → PID-tracked motion, emitting `TickRecord`s. |
 | `probes.py` | Per-episode diagnostics: `TrackingDiagnostic`, and the behavioural probes `MotionTaxonomy` / `CollisionProbe` / `MotionCoherence`. |
+| `budget.py` | `GeometricBudget` / `BudgetRule`: what an episode is allowed to cost, in discrete-step equivalents. See [docs/GEOMETRIC_BUDGET.md](GEOMETRIC_BUDGET.md). |
 | `compare.py` | Paired comparison of two runs, and what this episode count can resolve. |
 | `task.py` | `RobotObjectNavTask`: the task layer with a live query height + a metric seam. |
 | `runner.py` | One episode: the rollout loop and the result record. |
@@ -687,6 +688,7 @@ write-up in `/Projects/spatial_training/dump/eval_system/FINDINGS.md` §6.
 
 | Flag | Why it matters |
 | --- | --- |
+| `--episode-budget` / `--budget-units` / `--budget-time-limit` | **Which currency the episode is capped in.** `steps` (default) is `--max-steps` and nothing else — historical behaviour, and `gap`-dependent, so runs at different observation rates are not comparable under it. `geometric` caps at `--budget-units` units of motion, one unit being 0.25 m driven or 30 deg turned: the geometry of one classic ObjectNav discrete step, so 500 units is the benchmark's own 500-step cap measured on a continuous agent. It always carries `--budget-time-limit` as a backstop (the budget is blind to a frozen agent and to one pushing into a wall, both of which spend nothing) and the config raises without one. `both` keeps the step cap too and reports whichever fired, as `terminated_by`. The budget spent is recorded on **every** run regardless, so a finished run can be re-scored under a different cap with `scripts/rescore_budget.py` rather than re-run. Full derivation, including why there is no scalar seconds↔units conversion, in [docs/GEOMETRIC_BUDGET.md](GEOMETRIC_BUDGET.md). |
 | `--gap` | Control ticks executed per chunk. Must equal the training observation stride, or the policy is evaluated at a speed it never saw. |
 | `--dt` | Control tick length. Must match the demonstrations' true control rate. |
 | `--success-distance` | Also the screening threshold for trivially-successful episodes. |

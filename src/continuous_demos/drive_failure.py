@@ -120,6 +120,13 @@ DRIVE_SPEED_MPS = 0.300
 TURN_RATE_RADPS = 0.600
 _MOTION_EPS = 1e-6
 
+#: A tick slower than this counts as a NEAR-STOP (see :func:`near_stop_runs`).
+#: Set just below the path controller's ``min_approach_linear_velocity`` of
+#: 0.1 m/s, which is the slowest speed it will deliberately hold while still
+#: making progress: anything under it is the base genuinely coming to rest
+#: rather than crawling towards a goal tolerance.
+NEAR_STOP_SPEED_MPS = 0.05
+
 
 @dataclass(frozen=True)
 class DriveFailureConfig:
@@ -225,6 +232,51 @@ def motion_composition(poses, fps: float) -> Dict[str, float]:
         "frac_frozen": float(frozen.mean()),
         "path_len_m": float(dxy.sum()),
     }
+
+
+def near_stop_runs(
+    poses,
+    fps: float,
+    speed_mps: float = NEAR_STOP_SPEED_MPS,
+    min_duration_s: float = 0.0,
+) -> List[float]:
+    """Durations (seconds) of the maximal runs of near-stationary ticks.
+
+    A tick is near-stationary when the base moved slower than ``speed_mps``;
+    consecutive such ticks form one run, and the returned list holds each run's
+    duration. Runs shorter than ``min_duration_s`` are dropped, which is how a
+    single-tick sag in speed is kept from being reported as the robot stopping.
+
+    Heading is deliberately ignored: this asks whether the base stopped
+    TRANSLATING, which is a different question from :func:`motion_composition`'s
+    (what is each tick *doing*) and is the one a phase-free replay raises. Such
+    a replay slaves heading to the direction of travel, so wherever the
+    demonstrated path doubles back the controller has to unwind through a
+    near-stop -- an organic consequence of the reversal, not a phase, and not
+    something anything special-cases. The claim that those stops are brief is
+    exactly what this measures.
+
+    The first pose contributes no tick (there is no interval before it), so a
+    sequence of ``n`` poses yields at most ``n - 1`` near-stationary ticks.
+    """
+    p = np.asarray(poses, dtype=np.float64)
+    if p.ndim != 2 or len(p) < 2 or fps <= 0:
+        return []
+    dxy = np.linalg.norm(np.diff(p[:, :2], axis=0), axis=1)
+    slow = dxy * fps < speed_mps
+
+    runs: List[float] = []
+    length = 0
+    for is_slow in slow:
+        if is_slow:
+            length += 1
+            continue
+        if length:
+            runs.append(length / fps)
+        length = 0
+    if length:
+        runs.append(length / fps)
+    return [d for d in runs if d >= min_duration_s]
 
 
 @dataclass

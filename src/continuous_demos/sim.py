@@ -208,6 +208,31 @@ class HabitatRobotSim:
                     # along the robot's forward (+x body) in habitat's -z-forward
                     # image convention, instead of pointing at the floor.
                     sensor_node.object.rotation = sensor_node.object.rotation = mn.Quaternion.rotation(mn.Rad(-math.pi/2), mn.Vector3(0, 1, 0))*mn.Quaternion.rotation(mn.Rad(-math.pi/2), mn.Vector3(0, 0, 1))
+                    # OPTIONAL rig yaw. A spec may declare `yaw_offset_rad` to
+                    # sit at a fixed yaw relative to the robot's forward -- that
+                    # is how continuous_demos.panoramic builds an N-camera ring
+                    # out of N copies of this one camera. The link frame is the
+                    # URDF's (x forward, y left, z up: the rotation above maps
+                    # camera-local -z onto link +x and camera-local +y onto link
+                    # +z), so the robot's up axis is link +z and a yaw is a
+                    # rotation about it, applied in the LINK frame -- hence the
+                    # left-multiply. Sign follows the planar control frame: a
+                    # positive offset turns the camera anticlockwise seen from
+                    # above, so camera heading = joint_th + yaw_offset_rad.
+                    #
+                    # Read here, off the spec, rather than applied once by
+                    # whoever built the rig: this method is re-run on every
+                    # reset() and after every scene switch (both of which
+                    # destroy and rebuild the sensor nodes), so the rig has to
+                    # be re-formed from its declaration each time. A spec
+                    # without the attribute -- every spec that predates this --
+                    # skips the multiply entirely and is untouched.
+                    yaw_offset = float(getattr(spec, "yaw_offset_rad", 0.0))
+                    if yaw_offset:
+                        sensor_node.object.rotation = (
+                            mn.Quaternion.rotation(mn.Rad(yaw_offset), mn.Vector3(0, 0, 1))
+                            * sensor_node.object.rotation
+                        )
                     # Ensure the sensor is exactly at the URDF link's origin
                     sensor_node.object.translation = mn.Vector3(0, 0, 0)
     

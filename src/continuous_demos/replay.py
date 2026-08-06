@@ -13,6 +13,7 @@ import numpy as np
 from PIL import Image
 
 from continuous_demos.sim import HabitatRobotSim
+from continuous_demos.panoramic import rgb_view
 from continuous_demos.controllers import (
     HolonomicControllerConfig,
     HolonomicRobotController,
@@ -57,6 +58,38 @@ MOVE_STALL_TICKS = 45
 MOVE_STALL_EPS = 0.05
 MOVE_STALL_MAX_SPEED = 0.02
 
+# The same rule's window for a PHASE-FREE replay (episode_io.demo_looking_slices
+# with phase_free=True), where it must be off. Everything above is an argument
+# about a phase, and a phase-free replay has exactly one:
+#
+#   * segmented -- bailing out of a stalled phase costs the tail of one short
+#     sub-path, and the phase that follows immediately re-anchors the controller
+#     on a fresh sub-path from the demonstration. The robot keeps going.
+#   * phase-free -- there is no phase that follows. Bailing out abandons the
+#     whole remaining demonstration, however much of it is left.
+#
+# So the two error directions are wildly asymmetric here, and the rule's 45-tick
+# (1.8 s) window is far too tight for the near-stops a phase-free replay
+# legitimately produces: heading is slaved to the direction of travel, so
+# wherever the demonstrated path doubles back the base must unwind through a
+# genuine stop. The rule cannot tell that from a dead phase.
+#
+# Measured over 60 randomly-drawn episodes of 17DRP5sb8fy replayed phase-free
+# both ways: the shipped window truncates 4 of them (6.7%) that otherwise reach
+# the demonstration's final position -- one at 1.71 m into a 16.5 m path -- and
+# the goal-reached rate is 83.3% with it against 90.0% without. Switching it off
+# costs 3,219 extra recorded ticks over those 60 episodes (+30% mean duration,
+# 2.1 s per episode), spent on episodes where the robot is genuinely stuck and
+# which the downstream goal check rejects anyway.
+#
+# NOT tuned to an intermediate window, and that is the obvious follow-up: with
+# the rule off, near-stop durations are bimodal -- median 0.38 s (the organic
+# reversals, which are brief exactly as expected) against a p90 of 14.1 s and a
+# max of 31.4 s (a stuck robot burning its local timeout). A window somewhere in
+# that gap would get both properties. Choosing it needs a bigger sample than was
+# run here, so this stays at the safe end.
+PHASE_FREE_STALL_TICKS = 0
+
 # Recording tick rate. Habitat advances physics only in whole multiples of its
 # fixed 0.008 s timestep, so an off-grid dt makes the physics time delivered per
 # tick alternate between two values and puts a ~24% ripple on a constant
@@ -84,7 +117,7 @@ def record_path(robot_sim: HabitatRobotSim, controller: HolonomicRobotController
             **step_args,
             dt=1.0 / fps
         )
-        rgb_frame = obs["color_sensor"][..., :3]
+        rgb_frame = rgb_view(obs)
         pose_2d = robot_sim.get_2d_pose()
         if debug_draw:
             bev_frame = controller.visualize_bev()
@@ -171,6 +204,14 @@ def _build_phases(num_actions, looking_slices):
     and tail -- becomes a ``move`` phase. Returns a list of
     ``(kind, start, end)`` tuples, ``kind in {'move', 'look'}``, that exactly
     covers ``[0, num_actions)`` in order.
+
+    The empty ``looking_slices`` case is not a special case but it is worth
+    naming, because it is the whole of the "phase-free" replay option
+    (``episode_io.demo_looking_slices(phase_free=True)``): with nothing to tile
+    around, the head-and-tail rule below emits the single phase
+    ``[("move", 0, num_actions)]`` -- one continuous pure-pursuit trajectory
+    over the entire demonstrated path, with the demo's recorded headings never
+    read at all.
 
     Note that a move phase's reference sub-path can be degenerate: the demos
     contain MOVE_FORWARDs the collection-time agent could not execute (it walked
@@ -333,7 +374,11 @@ def record_segmented_demo(
 
             robot_sim.step(**step_args, dt=1.0 / fps)
 
-            rgb_frame = obs["color_sensor"][..., :3]
+            # One frame, however many cameras the simulator was built with: a
+            # single forward image, or the rig's views concatenated into a
+            # panorama strip. The recorder does not branch on the rig because
+            # the rig is a property of the simulator, not a mode of the replay.
+            rgb_frame = rgb_view(obs)
             if debug_draw:
                 if kind == "move":
                     panel = move_controller.visualize_bev()

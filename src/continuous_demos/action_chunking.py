@@ -15,9 +15,11 @@ Vocabulary
 ------------------------------------------------------------------------
 * **native trajectory** -- the input: ``pose2d[0 .. N-1]``, one pose per
   frame, recorded at ``native_fps`` (whatever ``--fps`` was passed to
-  ``generate_pose2d_dataset.py``; NOT stored in the metadata JSONL, so it must
-  be supplied to every script here as an explicit argument that the caller
-  guarantees matches the generation run).
+  ``generate_pose2d_dataset.py``). That rate is stored in the metadata
+  JSONL's ``"recording"`` block and read back by
+  ``continuous_demos.recording_metadata.resolve_corpus_params``; only corpora
+  generated before that schema existed need it supplied by hand, and those
+  were all recorded at 30 Hz.
 * **observation** -- a single native-trajectory frame chosen to anchor a
   training example: its image, and its pose as the origin actions are made
   relative to. Observations are spaced ``obs_stride_frames`` native frames
@@ -38,10 +40,12 @@ starting at its observation. If ``chunk_duration < obs_interval``, the chunk
 runs out of actions *before* the next observation's chunk becomes available --
 an uncovered gap that makes synchronous chunk replay ill-defined. Requiring
 ``chunk_duration >= obs_interval`` guarantees every native frame is covered by
-at least one chunk; when it is strictly greater, consecutive chunks overlap
-(the default config -- 4 Hz observations, 10-action chunks, 20 Hz native data
--- covers 0.5s of chunk against a 0.25s observation interval, i.e. 2x /
-50% overlap).
+at least one chunk; when it is strictly greater, consecutive chunks overlap.
+Equivalently, in frames rather than seconds: ``action_chunk_len >=
+obs_stride_frames``, since both sides are just a count of native frames times
+the same ``dt_native``. At 25 Hz with ``obs_stride_frames = 5`` and
+``action_chunk_len = 10`` that is a 0.4 s chunk against a 0.2 s observation
+interval, i.e. 2x coverage / 50% overlap.
 
 ------------------------------------------------------------------------
 Relative-pose convention
@@ -143,8 +147,22 @@ class ChunkConfig:
         return 1.0 - (self.obs_interval / self.chunk_duration)
 
 
-def make_chunk_config(native_fps: float, obs_hz: float, action_chunk_len: int) -> ChunkConfig:
-    """Build and validate a :class:`ChunkConfig` from the three user-facing knobs.
+def make_chunk_config(
+    native_fps: float,
+    obs_hz: Optional[float] = None,
+    action_chunk_len: int = 10,
+    obs_stride_frames: Optional[int] = None,
+) -> ChunkConfig:
+    """Build and validate a :class:`ChunkConfig` from the user-facing knobs.
+
+    The observation spacing is given either as a rate (``obs_hz``, quantized to
+    the nearest whole number of native frames) or, since the stride is what the
+    arithmetic actually runs on, directly in frames (``obs_stride_frames``).
+    Exactly one of the two is required. Specifying the stride is the exact
+    form -- it is what makes a stride sweep mean the same thing at every
+    ``native_fps``, where a rate would quantize differently at each -- and it
+    makes ``obs_hz`` a reported consequence (``native_fps / stride``) rather
+    than a request that may not be satisfiable.
 
     Raises ``ValueError`` if ``chunk_duration < obs_interval`` (see the module
     docstring for why that would leave a coverage gap between chunks) or if
@@ -152,13 +170,25 @@ def make_chunk_config(native_fps: float, obs_hz: float, action_chunk_len: int) -
     """
     if native_fps <= 0:
         raise ValueError(f"native_fps must be positive, got {native_fps}")
-    if obs_hz <= 0:
+    if (obs_hz is None) == (obs_stride_frames is None):
+        raise ValueError(
+            "pass exactly one of obs_hz (a rate, quantized to whole native frames) or "
+            f"obs_stride_frames (the exact spacing), got obs_hz={obs_hz!r} "
+            f"obs_stride_frames={obs_stride_frames!r}"
+        )
+    if obs_hz is not None and obs_hz <= 0:
         raise ValueError(f"obs_hz must be positive, got {obs_hz}")
+    if obs_stride_frames is not None and obs_stride_frames < 1:
+        raise ValueError(f"obs_stride_frames must be >= 1, got {obs_stride_frames}")
     if action_chunk_len < 1:
         raise ValueError(f"action_chunk_len must be >= 1, got {action_chunk_len}")
 
     dt_native = 1.0 / native_fps
-    obs_stride_frames = max(1, round(native_fps / obs_hz))
+    if obs_stride_frames is None:
+        obs_stride_frames = max(1, round(native_fps / obs_hz))
+    else:
+        obs_stride_frames = int(obs_stride_frames)
+        obs_hz = native_fps / obs_stride_frames
     obs_interval = obs_stride_frames * dt_native
     chunk_duration = action_chunk_len * dt_native
 

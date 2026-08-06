@@ -5,7 +5,9 @@ This does NOT re-run the pure-pursuit replay. It reads trajectories already
 produced by ``generate_pose2d_dataset.py`` (``data/metadata/<scene>.jsonl``),
 resets the robot to the exact original spawn for each selected episode, then
 drives it with ``pid_pose_controller.PIDPoseController`` against the recorded
-``pose2d`` sequence (one setpoint per recorded frame, at the recording fps),
+``pose2d`` sequence (one setpoint per recorded frame, at the fps the shard's
+own ``recording`` block says it was recorded at -- see
+``continuous_demos.recording_metadata``),
 and reports standard trajectory-tracking error metrics: ADE, FDE, heading
 RMSE, max position error, max cross-track error, and controller-limit
 saturation rate.
@@ -37,6 +39,7 @@ from continuous_demos.episode_io import (
     load_demo_objectnav,
     resolve_scene_path,
 )
+from continuous_demos.recording_metadata import resolve_corpus_params
 from continuous_demos.tracking_eval import (
     compute_metrics,
     load_metadata_records,
@@ -50,7 +53,7 @@ def run_episode(
     controller: PIDPoseController,
     episode: Dict[str, Any],
     record: Dict[str, Any],
-    fps: int,
+    fps: float,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
     """Reset the robot to the exact pose the stored ``pose2d`` trajectory
     starts from, then track it.
@@ -92,7 +95,14 @@ def main() -> None:
     parser.add_argument("--metadata", required=True, help="Path to data/metadata/<scene>.jsonl.")
     parser.add_argument("--scene-root", default=None)
     parser.add_argument("--num-episodes", type=int, default=4)
-    parser.add_argument("--fps", type=int, default=30, help="Must match the fps the pose2d data was recorded at.")
+    parser.add_argument(
+        "--fps", type=float, default=None,
+        help="NOT normally needed: the rate the pose2d data was recorded at is read "
+             "from the shard's own 'recording' block. This is the explicit fallback "
+             "for shards generated before that schema existed, all of which were "
+             "recorded at 30 Hz -- pass --fps 30 for those. A value contradicting "
+             "what the shard records is an error, not an override.",
+    )
     parser.add_argument("--output-dir", default="data/pid_eval")
     parser.add_argument("--width", type=int, default=160)
     parser.add_argument("--height", type=int, default=120)
@@ -102,7 +112,19 @@ def main() -> None:
     plots_dir = output_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
 
-    metadata_records = load_metadata_records(Path(args.metadata))
+    # The control tick has to be the tick the data was recorded at, or every
+    # setpoint is fed to the PID at the wrong rate. Read it off the shard.
+    metadata_path = Path(args.metadata)
+    resolved = resolve_corpus_params(
+        metadata_path.parent,
+        assumed_native_fps=args.fps,
+        shard_paths=[metadata_path],
+        flag_name="--fps",
+    )
+    print(resolved.banner())
+    fps = resolved.params.native_fps
+
+    metadata_records = load_metadata_records(metadata_path)
     selected = select_episodes(metadata_records, args.num_episodes)
     print(f"Selected {len(selected)} episodes (of {len(metadata_records)}) by trajectory length:")
     for r in selected:
@@ -128,7 +150,7 @@ def main() -> None:
             print(f"  [skip] {ep_id}: scene mismatch ({episode['scene_id']} != {scene_id})")
             continue
 
-        actual, ref, result = run_episode(robot_sim, controller, episode, record, args.fps)
+        actual, ref, result = run_episode(robot_sim, controller, episode, record, fps)
         metrics = compute_metrics(actual, ref)
         metrics["episode_id"] = ep_id
         metrics["num_steps"] = result["num_steps"]

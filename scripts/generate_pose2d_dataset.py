@@ -37,12 +37,37 @@ Each JSONL line (one episode) has:
       "scene_id":      "mp3d/....glb",
       "goal_text":     "chair",            # object_category
       "rgb_paths":     ["<scene>/<ep>/frame_00000.png", ...],  # relative to image_root
-      "pose2d":        [[x, y, theta], ...]                    # aligned with rgb_paths
+      "pose2d":        [[x, y, theta], ...],                   # aligned with rgb_paths
+      "recording":     {"schema_version": 1, "native_fps": 25.0, ...},
+      "quality":       {"schema_version": 1, "success": true, "final_dist_m": ...}
     }
 
-Only demonstrations whose *final* replayed pose lands within a distance threshold
-(default 1 m) of the demonstration's reference final position are kept; the rest
-are logged and skipped.
+``recording`` is the block described in ``continuous_demos.recording_metadata``:
+how this corpus was recorded -- tick rate, the physics timestep that rate does
+or does not divide, the velocity caps in force while driving, and provenance.
+It is repeated on every record (cheap next to ``pose2d``) so a consumer never
+has to be *told* the frame rate, a shard survives being copied or concatenated,
+and a shard that was appended to across a parameter change is detectable rather
+than silently mixed. Consumers read it via
+``recording_metadata.resolve_corpus_params``; corpora written before the schema
+existed carry no such key and were all recorded at 30 Hz.
+
+``quality`` is the block described in ``continuous_demos.drive_failure``: how
+this episode actually went. It carries the outcome, the final-pose distance the
+goal check used (previously computed and thrown away, so a shipped corpus could
+not be audited at all), the escape/support signals, the reference-path tracking
+error, and the episode's motion composition.
+
+Two rejection rules run per episode, and both are recorded rather than just
+acted on:
+
+  * the **goal check** -- final replayed pose within ``--goal-threshold`` metres
+    of the demonstration's reference final position;
+  * the **escape check** -- the unactuated vertical joint ``joint_z`` must not
+    free-fall. This cannot be a tighter goal threshold: the base is a virtual
+    gantry, so a robot that has fallen out of the scene keeps tracking the
+    demonstration *perfectly* in ``pose2d`` and lands well inside the goal
+    threshold with a normal path length. See ``continuous_demos.drive_failure``.
 """
 
 import argparse
@@ -57,6 +82,19 @@ import imageio.v2 as imageio
 import numpy as np
 
 from continuous_demos.replay import record_segmented_demo
+from continuous_demos.drive_failure import (
+    QUALITY_KEY,
+    DriveFailureConfig,
+    EpisodeHealth,
+    EpisodeHealthMonitor,
+)
+from continuous_demos.recording_metadata import (
+    RecordingParams,
+    format_grid_note,
+    params_for_generation,
+    shard_params,
+)
+from continuous_demos.rotation_canonicalize import maybe_canonicalize
 from continuous_demos.episode_io import (
     DEFAULT_URDF_PATH,
     build_robot_sim,
@@ -102,6 +140,35 @@ def load_done_episode_ids(metadata_dir: Path, scene: str) -> set:
             if ep is not None:
                 done.add(ep)
     return done
+
+
+def assert_shard_is_appendable(jsonl_path: Path, params: RecordingParams) -> None:
+    """Refuse to append records to a shard that was recorded differently.
+
+    Generation is resumable and appends, so without this check a rerun after a
+    parameter change (the 30 Hz -> 25 Hz move being exactly the case that
+    motivated all of this) would leave one shard holding two time bases with
+    nothing to mark the boundary. Aborting is deliberate: it is an operator
+    error about the whole ``--output-dir``, not a per-episode failure, and the
+    fix is a fresh output dir rather than anything this script can do.
+    """
+    existing = shard_params(jsonl_path) if jsonl_path.exists() else None
+    if existing is None:
+        if jsonl_path.exists() and jsonl_path.stat().st_size > 0:
+            raise RuntimeError(
+                f"{jsonl_path} already holds records with no 'recording' block, i.e. from a "
+                f"generation that predates the schema (those were all recorded at 30 Hz). "
+                f"Appending {params.native_fps:g} Hz records to it would produce a shard with "
+                "two time bases and no way to tell which record is which. Write to a fresh "
+                "--output-dir."
+            )
+        return
+    if not existing.agrees_with(params):
+        raise RuntimeError(
+            f"{jsonl_path} was recorded with {existing.consistency_view()} but this run is "
+            f"{params.consistency_view()}. Resuming would mix two generations in one shard. "
+            "Write to a fresh --output-dir."
+        )
 
 
 def load_failed_episode_ids(log_file: Path) -> set:
@@ -157,13 +224,27 @@ def replay_one_episode(
     episode: Dict[str, Any],
     fps: int,
     max_steps: Optional[int],
-) -> Tuple[List[np.ndarray], List[np.ndarray], np.ndarray]:
-    """Replay a single episode and return ``(frames, poses, path_3d)``.
+    failure_config: Optional[DriveFailureConfig] = None,
+    canonicalize_rotation: bool = False,
+) -> Tuple[List[np.ndarray], List[np.ndarray], np.ndarray, EpisodeHealth, Optional[dict]]:
+    """Replay a single episode and return ``(frames, poses, path_3d, health)``.
 
     ``frames[i]`` and ``poses[i]`` are aligned 1:1 (one planar pose per RGB
     frame). ``path_3d`` is the reference demo path, used for the goal check.
+    ``health`` is the per-episode quality record built by
+    :class:`~continuous_demos.drive_failure.EpisodeHealthMonitor` -- including
+    whether the robot fell out of the world, which no planar quantity can show.
     """
     path_3d, path_headings, actions = extract_demo(episode, max_steps=max_steps)
+    # OFF by default. When on, every maximal run of pure TURN_LEFT/TURN_RIGHT is
+    # replaced by the shortest run with the same covered heading range, start
+    # heading and end heading -- redundant re-glancing at a scene the robot has
+    # not moved through. Editing the ACTION sequence rather than the recorded
+    # frames is what keeps this seam-free; see rotation_canonicalize and
+    # dump/rotation_blunders/FINDINGS.md. A no-op on 99.17% of runs.
+    path_3d, path_headings, actions, canon = maybe_canonicalize(
+        path_3d, path_headings, actions, canonicalize_rotation
+    )
     looking_slices = find_looking_slices(actions)
 
     robot_sim.reset(
@@ -172,6 +253,9 @@ def replay_one_episode(
         snap_to_navmesh=False,
         vertical_offset=None,
     )
+    # Constructed after reset() so its spawn-height baseline is the episode's
+    # own spawn, not wherever the previous episode left the robot.
+    monitor = EpisodeHealthMonitor(robot_sim, fps=fps, config=failure_config)
     frames, poses = record_segmented_demo(
         robot_sim,
         path_3d,
@@ -180,8 +264,15 @@ def replay_one_episode(
         timeout=60,
         fps=fps,
         debug_draw=False,
+        health_monitor=monitor,
     )
-    return frames, poses, path_3d
+    return (
+        frames,
+        poses,
+        path_3d,
+        monitor.finish(poses),
+        canon.as_dict() if canon is not None else None,
+    )
 
 
 def save_episode_frames(
@@ -211,7 +302,7 @@ def generate(
     scene_root: Optional[str] = None,
     width: int = 640,
     height: int = 480,
-    fps: int = 30,
+    fps: int = 25,
     max_length: Optional[int] = None,
     max_steps: Optional[int] = None,
     goal_threshold: float = 1.0,
@@ -219,6 +310,8 @@ def generate(
     image_ext: str = "png",
     log_file: Optional[Path] = None,
     max_episodes: Optional[int] = None,
+    failure_config: Optional[DriveFailureConfig] = None,
+    canonicalize_rotation: bool = False,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     if image_root is None:
@@ -237,6 +330,7 @@ def generate(
     n_failed = 0
     n_resumed = 0  # episodes skipped because a prior run already handled them
     processed = 0
+    n_rejected: Dict[str, int] = defaultdict(int)  # rejections, by rule
 
     # Resume support: episodes already completed (per-scene JSONL shards, read
     # lazily below) or previously failed (the log) are skipped. Load the failed
@@ -291,6 +385,24 @@ def generate(
 
             jsonl_path = metadata_dir / f"{scene}.jsonl"
             try:
+                # Probe the recording parameters off the live simulator (the
+                # physics timestep in particular is asked, not assumed) and
+                # stamp them onto every record this scene writes. Inside the
+                # try so the appendability check below cannot leak the sim.
+                recording = params_for_generation(
+                    fps,
+                    robot_sim,
+                    image_width=width,
+                    image_height=height,
+                    image_ext=image_ext,
+                    goal_threshold_m=goal_threshold,
+                    urdf=urdf_path,
+                    generator="generate_pose2d_dataset.py",
+                )
+                print(f"  recording: {format_grid_note(recording)}")
+                recording_blob = recording.as_dict()
+                assert_shard_is_appendable(jsonl_path, recording)
+
                 # Append so records from prior runs are preserved (resume).
                 with open(jsonl_path, "a", encoding="utf-8") as jf:
                     for idx, episode in scene_episodes:
@@ -305,8 +417,10 @@ def generate(
                         ep_dir_name = sanitize(ep_id)
 
                         try:
-                            frames, poses, path_3d = replay_one_episode(
-                                robot_sim, episode, fps=fps, max_steps=max_steps
+                            frames, poses, path_3d, health, canon = replay_one_episode(
+                                robot_sim, episode, fps=fps, max_steps=max_steps,
+                                failure_config=failure_config,
+                                canonicalize_rotation=canonicalize_rotation,
                             )
                         except Exception as exc:
                             print(f"  [ep {idx} / {ep_id}] replay error: {exc}")
@@ -322,20 +436,43 @@ def generate(
                             continue
 
                         # Goal check: final replayed pose vs reference final position.
+                        # Note this passes for a robot that fell out of the world --
+                        # the gantry keeps tracking the demo perfectly once nothing
+                        # touches it, so 17 of 23 measured escapes land inside this
+                        # threshold. That is why the health monitor's escape check
+                        # below is a separate, non-planar test on joint_z rather than
+                        # a tighter threshold on this one.
                         final_xy = np.asarray(poses[-1][:2], dtype=float)
                         target_xy = reference_final_xy(path_3d)
                         dist = float(np.linalg.norm(final_xy - target_xy))
+                        health.final_dist_m = dist
+                        health.goal_threshold_m = float(goal_threshold)
                         if dist > goal_threshold:
-                            print(
-                                f"  [ep {idx} / {ep_id}] FAIL final-pose dist "
-                                f"{dist:.2f}m > {goal_threshold:.2f}m -- skipping"
-                            )
-                            log.write(
-                                f"{idx}\t{ep_id}\t{scene}\t"
-                                f"final pose {dist:.3f}m from goal (> {goal_threshold}m)\n"
-                            )
+                            health.success = False
+                            health.outcome = "goal"
+
+                        if not health.success:
+                            reason = {
+                                "goal": (f"final pose {dist:.3f}m from goal "
+                                         f"(> {goal_threshold}m)"),
+                                "escaped": (
+                                    f"left the world: joint_z free-falling for "
+                                    f"{health.fall_run_s:.2f}s at up to "
+                                    f"{health.max_fall_speed_mps:.1f}m/s, "
+                                    f"{health.max_drop_m:.2f}m below spawn"
+                                ),
+                                "ref_miss": (
+                                    f"off its reference path by > "
+                                    f"{health.ref_miss_flag_m:g}m for "
+                                    f"{health.ref_miss_worst_run_s:.2f}s"
+                                ),
+                            }.get(health.outcome, health.outcome)
+                            print(f"  [ep {idx} / {ep_id}] FAIL ({health.outcome}) {reason}"
+                                  " -- skipping")
+                            log.write(f"{idx}\t{ep_id}\t{scene}\t{reason}\n")
                             log.flush()
                             n_failed += 1
+                            n_rejected[health.outcome] += 1
                             continue
 
                         rgb_paths = save_episode_frames(
@@ -352,21 +489,31 @@ def generate(
                             "goal_text": episode.get("object_category", ""),
                             "rgb_paths": rgb_paths,
                             "pose2d": pose2d,
+                            "recording": recording_blob,
+                            QUALITY_KEY: health.as_dict(),
                         }
+                        # Only written when the flag is on, so records produced
+                        # with it off are byte-identical to what they were.
+                        if canon is not None:
+                            record["rotation_canonicalized"] = canon
                         jf.write(json.dumps(record) + "\n")
                         jf.flush()
                         n_ok += 1
                         print(
                             f"  [ep {idx} / {ep_id}] OK  {len(frames)} frames, "
-                            f"final-pose dist {dist:.2f}m"
+                            f"final-pose dist {dist:.2f}m, ref-miss p95 "
+                            f"{(health.ref_miss_p95_m or 0.0):.2f}m, "
+                            f"drive/turn {(health.frac_drive or 0):.0%}/"
+                            f"{(health.frac_turn or 0):.0%}"
                         )
             finally:
                 robot_sim.sim.close(destroy=True)
 
+    breakdown = ", ".join(f"{k}={v}" for k, v in sorted(n_rejected.items())) or "none"
     print(
         f"\nDone. {n_ok} episode(s) written, {n_failed} skipped/failed, "
         f"{n_resumed} skipped (already done/failed on a prior run). "
-        f"Log: {log_file}"
+        f"Rejections by rule: {breakdown}. Log: {log_file}"
     )
 
 
@@ -390,7 +537,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--width", type=int, default=640, help="Render width.")
     parser.add_argument("--height", type=int, default=480, help="Render height.")
-    parser.add_argument("--fps", type=int, default=30, help="Replay/record FPS.")
+    parser.add_argument(
+        "--fps", type=int, default=25,
+        help="Replay/record FPS. MUST sit on habitat's fixed 0.008s Bullet "
+             "physics grid, or every saturated tick's displacement alternates "
+             "between two values (see HabitatRobotSim.step). The only integer "
+             "rates whose period is a whole multiple of 0.008s are 125, 25, 5 "
+             "and 1 Hz -- 25 Hz (dt=0.04s = 5 physics steps) is the only "
+             "usable one. The previous 30 Hz default was off-grid and produced "
+             "a 24%% per-tick velocity ripple. Whatever is passed here is "
+             "written into every metadata record's 'recording' block, so "
+             "consumers never have to be told it again.",
+    )
     parser.add_argument(
         "--max-length", type=int, default=None,
         help="Skip episodes whose reference_replay is longer than this (pre-filter).",
@@ -420,6 +578,55 @@ def parse_args() -> argparse.Namespace:
         "--max-episodes", type=int, default=None,
         help="Optional cap on total episodes processed (for quick testing).",
     )
+    parser.add_argument(
+        "--fall-speed-mps", type=float, default=DriveFailureConfig.fall_speed_mps,
+        help="Downward joint_z velocity (m/s) that counts as falling. joint_z is "
+             "the unactuated vertical joint: in the world the floor pins it, "
+             "outside the world it is gravity, so this is a direct measurement "
+             "of the failure rather than a proxy for it.",
+    )
+    parser.add_argument(
+        "--fall-duration-s", type=float, default=DriveFailureConfig.fall_duration_s,
+        help="Reject an episode whose joint_z falls that fast for this long "
+             "continuously. Over 2,227 replayed episodes the longest such run in "
+             "a healthy episode is 0.56s and the shortest in an escaped one is "
+             "1.6s; the 1.0s default sits in the empty gap between them for "
+             "23/23 true positives and 0 false positives.",
+    )
+    parser.add_argument(
+        "--reject-ref-miss-s", type=float, default=None,
+        help="Additionally reject an episode that stays more than "
+             "--ref-miss-flag-m off its reference path for this long. OFF by "
+             "default: sustained tracking error measures demonstration QUALITY, "
+             "not validity, and it cannot see an escape at all (an escaped robot "
+             "tracks its path better than a healthy one). The statistic is "
+             "recorded on every episode either way, so a cut can be chosen from "
+             "the measured distribution.",
+    )
+    parser.add_argument(
+        "--no-canonicalize-rotation", dest="canonicalize_rotation",
+        action="store_false", default=True,
+        help="Disable rotation canonicalisation, which is ON by default. "
+             "Canonicalisation replaces every maximal run of pure "
+             "TURN_LEFT/TURN_RIGHT with the shortest run covering the same "
+             "heading range and ending on the same heading, BEFORE replay. It "
+             "removes human re-glancing -- rotation that collected no new view, "
+             "because the robot had not moved -- without touching monotone "
+             "scans, single out-and-back glances, or any non-turn action. "
+             "Measured over all 56 train scenes: 99.17%% of rotation runs are "
+             "already minimal and returned untouched, 78.7%% of episodes are "
+             "unaffected entirely, and it removes 0.42%% of actions and 1.28%% "
+             "of all rotation. The mean is small but the tail is not: the worst "
+             "10%% of affected episodes carry 73.5%% of the waste, and those are "
+             "exactly the demonstrations that teach dithering. Optimality is "
+             "proved by exhaustive search and the corpus-wide checks found 0 "
+             "violations in 2,353,082 runs. See dump/rotation_blunders/FINDINGS.md.",
+    )
+    parser.add_argument(
+        "--ref-miss-flag-m", type=float, default=DriveFailureConfig.ref_miss_flag_m,
+        help="Reference-path miss counted as 'not following the path' when "
+             "reporting (and optionally acting on) sustained tracking error.",
+    )
     return parser.parse_args()
 
 
@@ -440,6 +647,13 @@ def main() -> None:
         image_ext=args.image_ext,
         log_file=args.log_file,
         max_episodes=args.max_episodes,
+        canonicalize_rotation=args.canonicalize_rotation,
+        failure_config=DriveFailureConfig(
+            fall_speed_mps=args.fall_speed_mps,
+            fall_duration_s=args.fall_duration_s,
+            ref_miss_flag_m=args.ref_miss_flag_m,
+            reject_ref_miss_s=args.reject_ref_miss_s,
+        ),
     )
 
 

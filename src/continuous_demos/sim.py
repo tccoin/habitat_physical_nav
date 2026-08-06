@@ -1,4 +1,5 @@
 import math
+import warnings
 import numpy as np
 import habitat_sim
 from typing import Dict, List, Any, Optional
@@ -57,7 +58,11 @@ class HabitatRobotSim:
         urdf_path: str, 
         sensor_setup: Dict[str, List[habitat_sim.sensor.SensorSpec]], 
         fixed_base: bool = False,
-        max_substep_dt: float = 1.0 / 120.0  # high frequency for accurate kinematic integration
+        # Must be a whole multiple/divisor of habitat's fixed Bullet timestep
+        # (0.008 s) or each step_world() call spans a variable number of physics
+        # steps -- see step() for the full aliasing story. 0.008 makes one
+        # substep == exactly one physics step.
+        max_substep_dt: float = 0.008
     ):
         self.urdf_path = urdf_path
         self.sensor_setup = sensor_setup
@@ -80,7 +85,14 @@ class HabitatRobotSim:
         # 2. Initialize simulator
         self.sim = habitat_sim.Simulator(self.cfg)
 
-        # 3. Setup the robot and attach sensors
+        # 3. Setup the robot and attach sensors.
+        # NOTE: do NOT clear self.robot afterwards. _setup_robot_and_sensors()
+        # adds a new articulated object from the URDF whenever self.robot is
+        # None, and reset() calls it on every episode -- so blanking the handle
+        # here made the first reset() instantiate a SECOND robot and leave the
+        # first one in the physics world forever as an orphaned dynamic
+        # multibody at the origin. That orphan was the dominant source of
+        # order-dependence between episodes (see reset()).
         self._setup_robot_and_sensors()
 
     def _build_cfg(self, scene_id: Optional[str] = None):
@@ -217,11 +229,59 @@ class HabitatRobotSim:
         goes straight to joint_th. twist_frame="world" applies [v_x, v_y]
         directly in that planar world frame; a (theta0, w) tuple integrates the
         heading across substeps (used by the pure-pursuit virtual heading).
+
+        TIMESTEP QUANTIZATION -- read before changing ``dt``.
+        Habitat/Bullet advances world time only in whole multiples of a fixed
+        internal physics timestep (``sim.get_physics_time_step()``, 0.008 s
+        here), carrying the sub-step remainder in an internal accumulator. So a
+        control tick of duration ``dt`` delivers ``floor(dt/0.008)`` physics
+        steps on most ticks and one more whenever the accumulator rolls over.
+        Unless ``dt`` is an exact integer multiple of 0.008, the physics time
+        actually delivered per tick therefore ALTERNATES between two values,
+        and a constant commanded velocity produces a rippling per-tick
+        displacement even though the mean is correct.
+
+        Measured: ``dt = 1/30`` (0.03333 s = 4.1667 steps) delivered 0.032 s on
+        50/60 ticks and 0.040 s on 10/60 -- a 24% peak-to-peak ripple, which at
+        the controller's v_max = 2.0 m/s and max_vw = 2.0 rad/s quantized every
+        saturated tick to exactly 0.064 or 0.080 (m and rad alike). Subdividing
+        more finely does NOT help: the ripple is a property of ``dt`` vs the
+        physics grid, not of ``max_substep_dt`` (measured identical 24.01%
+        ripple for max_substep_dt of 1/120, 0.008 and 0.004).
+
+        The only fix is an on-grid ``dt``. Integer frame rates whose period is a
+        whole multiple of 0.008 s are 1/(n*0.008) for n = 1, 5, 25, 125, i.e.
+        125, 25, 5 and 1 Hz -- so 25 Hz (dt = 0.04 s = 5 physics steps) is the
+        only usable recording rate that is exactly on the grid. Hence the 25 Hz
+        default in ``generate_pose2d_dataset.py``. A ``dt`` off the grid still
+        runs, but warns once.
         """
+        # Align substepping to the simulator's fixed physics timestep so that
+        # one substep == one physics step and the velocity command written
+        # before each substep is integrated for exactly the duration intended.
+        fixed_dt = self.sim.get_physics_time_step()
+        if not getattr(self, "_warned_off_grid_dt", False):
+            n_phys = dt / fixed_dt
+            if abs(n_phys - round(n_phys)) > 1e-6:
+                self._warned_off_grid_dt = True
+                warnings.warn(
+                    f"HabitatRobotSim.step(dt={dt!r}) is not an integer multiple "
+                    f"of the fixed physics timestep ({fixed_dt}); physics time "
+                    f"delivered per tick will alternate between "
+                    f"{math.floor(n_phys) * fixed_dt:.4f}s and "
+                    f"{math.ceil(n_phys) * fixed_dt:.4f}s, so a constant "
+                    f"commanded velocity will show a "
+                    f"{100.0 * (math.ceil(n_phys) - math.floor(n_phys)) / n_phys:.0f}% "
+                    "per-tick ripple. Use an on-grid rate (e.g. 25 Hz -> "
+                    "dt=0.04) to record uniform motion.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
         # Determine substepping
         num_steps = max(1, math.ceil(dt / self.max_substep_dt))
         substep_dt = dt / num_steps
-        
+
         v_x_cmd, v_y_cmd, omega_cmd = chassis_twist
         
         for step_idx in range(num_steps):
@@ -260,7 +320,61 @@ class HabitatRobotSim:
             
     def get_obs(self) -> dict:# Return standard observation dictionary
         return self.sim.get_sensor_observations(self.agent_id)
-    
+
+    # Height (metres) the robot is parked at while its collision caches are
+    # flushed. Habitat's Bullet world uses btDbvtBroadphase (a dynamic AABB
+    # tree, no world bounds), so any coordinate is legal; 10 km up is outside
+    # every habitat scene's AABB, which is what makes the broadphase drop the
+    # robot's overlapping pairs.
+    _PARK_HEIGHT_M = 1.0e4
+
+    def _flush_physics_contact_state(self) -> None:
+        """Drop Bullet's cached collision state for the robot.
+
+        ``habitat_sim.Simulator.reset()`` restores articulated-object
+        *kinematics* -- joint positions, velocities and forces, and the root
+        transform -- but it does not touch Bullet's collision caches. The
+        broadphase overlapping-pair cache and the ``btPersistentManifold`` for
+        each pair (its cached contact points, their slot ordering, and the
+        warm-start impulses on them) survive the teleport into the next
+        episode. Measured on MP3D 17DRP5sb8fy: 6 overlapping pairs / 2 active
+        contact points at the end of an episode, still 6 / 2 immediately after
+        ``sim.reset()``.
+
+        That residue does not move the robot at spawn -- the first ticks of the
+        next episode are bit-identical either way -- but it changes the order
+        and the warm-start seeds of the contact constraints the solver sees,
+        so as soon as the robot touches geometry the Gauss-Seidel solve lands
+        on a slightly different answer (first observed divergence ~1e-7 rad/s
+        in ``joint_th``) and the trajectory then diverges chaotically. That is
+        how a stateless, image-blind policy could run the same episode two
+        different ways depending on what preceded it.
+
+        Bullet exposes no "clear the caches" call through habitat's bindings,
+        but the broadphase drops a pair as soon as the two AABBs stop
+        overlapping. So: park the robot far outside the scene, run one
+        collision pass (pairs go to 0), and put it back. The pairs are then
+        rebuilt from scratch on the next ``step_world``, exactly as they are in
+        a freshly constructed simulator. Costs ~1 ms.
+        """
+        if self.robot is None:
+            return
+        here = self.robot.translation
+        self.robot.translation = mn.Vector3(0.0, self._PARK_HEIGHT_M, 0.0)
+        self.sim.perform_discrete_collision_detection()
+        self.robot.translation = here
+        # Rebuild the pairs at the pose the episode actually starts from, so
+        # the collision state the first step_world() sees is a function of the
+        # spawn pose alone.
+        self.sim.perform_discrete_collision_detection()
+
+    # Tried and rejected: destroying and re-creating every joint motor at reset,
+    # to drop the impulse Bullet warm-starts each btMultiBodyJointMotor from.
+    # remove_joint_motor()/create_joint_motor() do not round-trip faithfully --
+    # with them in place the recorded trajectory of a replay differed from tick
+    # ZERO (up to 0.005 m), i.e. the rebuild perturbs the spawn itself, where
+    # the leak it targets only shows up later. Net worse, so not done.
+
     def reset(
         self,
         scene_id: Optional[str] = None,
@@ -271,13 +385,57 @@ class HabitatRobotSim:
         home_joint_positions: Optional[Dict[str, float]] = None,
         scene_dataset_config: Optional[str] = None,
     ) -> dict:
+        """Return the simulator to a start-of-episode state.
 
+        CONTRACT: after reset(), the outcome of an episode must not depend on
+        what ran before it in this simulator. That is what makes it legitimate
+        to reuse one simulator across every episode of a scene, as
+        ``generate_pose2d_dataset.py`` and the evaluation harnesses do. It was
+        previously violated, in two independent ways, and the violation was
+        measurable: replaying one demonstration after three other episodes
+        moved its recorded path by up to 0.040 m relative to replaying it
+        alone. Steps 1b and 5 below are what restore the contract; do not drop
+        either of them for speed. They cost ~1 ms per episode, against ~2 s to
+        rebuild the simulator instead.
+
+        It is not a complete guarantee. What survives is the order in which
+        Bullet's broadphase reports the robot's contacts, which no habitat
+        binding can reset -- see dump/sim_reset_fix/FINDINGS.md and
+        tests/test_sim_reset_isolation.py.
+        """
         # 1. Handle Scene Changes and Graph Rebuild
         if scene_id is not None and scene_id != self.cfg.sim_cfg.scene_id:
             self._reconfigure_scene(scene_id, scene_dataset_config)
         else:
             self.sim.reset()
             self._setup_robot_and_sensors()
+
+        # 1b. Re-home the robot's own dynamic state explicitly. sim.reset()
+        # already zeroes joint positions/velocities/forces -- but only via
+        # resetStateFromSceneInstanceAttr(), which silently no-ops for an
+        # articulated object that has no scene-instance attributes. Doing it
+        # here makes reset() self-sufficient, and clear_joint_states() also
+        # clears the multibody's constraint forces and link velocities (which
+        # nothing else does) and handles spherical joints correctly. This is
+        # what re-homes the passive suspension joints joint_z/pitch/roll.
+        if self.robot is not None:
+            self.robot.clear_joint_states()
+            self.robot.root_linear_velocity = mn.Vector3(0.0, 0.0, 0.0)
+            self.robot.root_angular_velocity = mn.Vector3(0.0, 0.0, 0.0)
+            # Bullet's deactivation ("sleep") timers are the other thing that
+            # survives sim.reset(). btMultiBody accumulates m_sleepTimer while
+            # the body is nearly still and sleeps once it passes m_sleepTimeout;
+            # each link collider likewise accumulates m_deactivationTime. An
+            # episode that ends stationary -- which is exactly what a
+            # goal-reached replay does -- therefore hands the next episode a
+            # part-elapsed timer, and the robot falls asleep sooner than it
+            # would in a fresh simulator. Nothing re-arms them: the kinematic
+            # setters above only wake the body when it is ALREADY asleep, so a
+            # merely drowsy body keeps its timer. Assigning awake unconditionally
+            # calls setActive(true), which zeroes both. (Measured as a no-op on
+            # the replay workload -- the demos never idle long enough to bank a
+            # sleep timer -- but it is genuinely leaked state and it is free.)
+            self.robot.awake = True
 
         # 2. Seed the base yaw (joint_th) from the requested orientation.
         # Goal: joint_th = the requested facing as a heading in the planar control
@@ -335,10 +493,14 @@ class HabitatRobotSim:
                     # Instantly update the kinematic state
                     l_id = self.robot.existing_joint_motor_ids[m_id]
                     pos_offset = self.robot.get_link_joint_pos_offset(l_id)
-                    # joint_name = self.robot.get_link_joint_name(l_id)
-                    print(f"homing joint '{j_name}' to {pos_target} (motor_id={m_id}, link_id={l_id}, pos_offset={pos_offset})")
                     joint_positions[pos_offset] = pos_target
             self.robot.joint_positions = joint_positions
+
+        # 5. Purge the physics residue of the previous episode. This runs LAST,
+        # once the spawn pose is final, so the collision state handed to the
+        # first step_world() is a function of the spawn pose and nothing else.
+        # See _flush_physics_contact_state().
+        self._flush_physics_contact_state()
                     
                     # # Update the motor target so it doesn't try to snap back
                     # settings = self.robot.get_joint_motor_settings(m_id)

@@ -46,8 +46,20 @@ replays). **`sim.py` was not modified.**
 
 Rather than re-running the pure-pursuit replay, this reads back trajectories
 **already generated and already validated as physically plausible** by
-`generate_pose2d_dataset.py` (`data/metadata/17DRP5sb8fy.jsonl`, `pose2d` at
-30 fps) and asks: can a much simpler PID controller track them?
+`generate_pose2d_dataset.py` and asks: can a much simpler PID controller track
+them?
+
+The shard used (`metadata/17DRP5sb8fy.jsonl`) is a **pre-schema corpus
+recorded at 30 Hz** — off habitat's fixed 0.008 s physics grid, so every
+saturated tick in it carries the ~24% velocity ripple described in
+`sim.py::step`, and the numbers below inherit that. The pipeline now records
+at 25 Hz (`dt = 0.04 s` = exactly 5 physics steps) and writes the rate into
+the metadata, so `eval_pid_tracking.py` reads it and needs no flag; this old
+shard has no such field and must be told, once: `--fps 30`. The controller
+limits actually in force while the data was recorded are **2.0 m/s and
+2.0 rad/s (114.6 deg/s)** — not the 1.28/73 or 1.92/110 of earlier findings
+docs, both of which were `0.064/dt` for a wrong `dt`, i.e. artifacts of the
+ripple's lower mode rather than real caps.
 
 5 episodes were selected deterministically by trajectory length (229 to 1664
 steps, i.e. ~8s to ~55s of demo) to cover short/medium/long variety.
@@ -111,8 +123,8 @@ generated artifacts, so these aren't checked in.)
 ## Step-response check (single-setpoint regulation, not just on-trajectory tracking)
 
 The 5-episode validation above always tracks a *feasible* reference — spawned
-exactly on `pose2d[0]`, with consecutive setpoints only `v_max * dt` ≈ 0.07 m
-apart, so the feedback loop is always correcting a near-zero error. That's
+exactly on `pose2d[0]`, with consecutive setpoints only `v_max * dt` ≈ 0.067 m
+apart on this 30 Hz shard (0.08 m on a 25 Hz corpus), so the feedback loop is always correcting a near-zero error. That's
 the trajectory-tracking case, but it doesn't exercise the single-step
 "position control" case the task also names (and that a VLA/RL caller
 commanding one target pose at a time will always hit): servoing to a

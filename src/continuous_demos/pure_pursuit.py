@@ -121,8 +121,8 @@ class PurePursuitController:
             next_velocity_ref = np.array([v_ref, w_ref])
             
         else:
-            # decide accel or decel
-            is_accel = self._decide_accel_or_decel(current_idx)
+            # decide accel or decel (braking distance depends on the current speed)
+            is_accel = self._decide_accel_or_decel(current_idx, current_velocity)
             # calc dynamic window and optimal next velocity
             next_velocity_ref = self._calc_optimal_velocity_considering_dynamic_window(
                 current_velocity, regulated_v, curvature, is_accel
@@ -246,15 +246,42 @@ class PurePursuitController:
         regulated_v = max(regulated_v, self.config.regulated_linear_scaling_min_speed)
         return regulated_v
 
-    def _decide_accel_or_decel(self, current_idx: np.intp) -> bool:
-        """Determines if the robot should accelerate or decelerate based on distance to goal vs braking distance."""
+    def _decide_accel_or_decel(self, current_idx: np.intp, current_velocity: np.ndarray) -> bool:
+        """Should the robot still be accelerating, or has it reached its braking point?
+
+        Braking distance is computed from the speed the robot is ACTUALLY at, and
+        it is the *discrete* stopping distance: the controller sheds at most
+        ``a_max * dt`` of speed per control tick, so coming to rest from ``v``
+        takes ``n = ceil(v / (a_max*dt))`` ticks and covers
+        ``dt * sum(v - k*a_max*dt for k in 0..n-1)``. The continuous
+        ``v**2/(2*a_max)`` underestimates that by about ``v*dt/2``, which at a
+        0.04 s tick and 2 m/s is 4 cm of overshoot per move phase.
+
+        This previously used ``v_max**2 / (2*a_max)``, a constant that never
+        referenced the current speed -- 0.667 m for the default config. Because
+        the test is ``goal_distance > decel_distance``, every move phase whose
+        whole reference path was shorter than that constant was classified as
+        "decelerating" from its very first tick, while still at rest. The
+        dynamic-window search then picks its lowest-velocity candidate, which at
+        v = 0 is v = 0, so the robot never moved at all and sat out the phase's
+        entire timeout. Braking from the current speed makes the predicate true at
+        rest (braking distance is 0 when v is 0), so a short path accelerates,
+        travels, and brakes on approach like any other.
+        """
         goal_distance = self._path_distances[-1] - self._path_distances[current_idx]
-        decel_distance = (self.config.v_max ** 2) / (2 * self.config.a_max)
-        
-        if goal_distance > decel_distance:
-            return True
-        else:
-            return False
+        v = abs(float(current_velocity[0]))
+        decel_distance = self._discrete_stopping_distance(v)
+
+        return bool(goal_distance > decel_distance)
+
+    def _discrete_stopping_distance(self, v: float) -> float:
+        """Distance covered coming to rest from ``v`` at ``a_max``, in whole ticks."""
+        dv = self.config.a_max * self.config.dt
+        if v <= 0.0 or dv <= 0.0:
+            return 0.0
+        n = math.ceil(v / dv)
+        # dt * sum_{k=0}^{n-1} (v - k*dv), all terms non-negative by choice of n
+        return self.config.dt * (n * v - dv * n * (n - 1) / 2.0)
 
     def _calc_optimal_velocity_considering_dynamic_window(self, current_velocity: np.ndarray, regulated_v: float, curvature: float, is_accel: bool) -> np.ndarray:
         """Intersects the curvature constraint with the dynamic window limits to find optimal reachable velocities."""

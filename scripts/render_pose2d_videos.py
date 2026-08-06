@@ -25,6 +25,8 @@ from typing import Any, Dict, List, Optional
 import imageio.v2 as imageio
 import numpy as np
 
+from continuous_demos.recording_metadata import resolve_corpus_params
+
 
 def scene_name(scene_id: str) -> str:
     """Short, filesystem-safe scene name, e.g. ``mp3d/17DRP5sb8fy.glb`` -> ``17DRP5sb8fy``."""
@@ -83,7 +85,7 @@ def render_video(
     record: Dict[str, Any],
     image_root: Path,
     videos_root: Path,
-    fps: int,
+    fps: float,
 ) -> Optional[Path]:
     """Write one episode's frames to a video; return the output path (or None)."""
     scene = scene_name(record["scene_id"])
@@ -142,7 +144,13 @@ def parse_args() -> argparse.Namespace:
         "--all", action="store_true",
         help="Render every episode present in the JSONLs.",
     )
-    parser.add_argument("--fps", type=int, default=30, help="Output video FPS.")
+    parser.add_argument(
+        "--fps", type=float, default=None,
+        help="Output video FPS. Defaults to the rate the corpus records having been "
+             "recorded at, so playback is real-time; a hardcoded default here plays "
+             "a 25 Hz corpus 20%% fast. Pass 30 for pre-schema corpora (which store "
+             "no rate), or any value to deliberately speed up / slow down playback.",
+    )
     return parser.parse_args()
 
 
@@ -158,6 +166,14 @@ def main() -> None:
     metadata_dir = args.metadata_dir or (args.output_dir / "metadata")
     videos_root = args.output_dir / "videos"
 
+    # Play back at the rate the data was recorded at, read from the corpus
+    # itself (see continuous_demos.recording_metadata); --fps overrides, and
+    # is required for pre-schema corpora, which record no rate.
+    fps = args.fps
+    if fps is None:
+        fps = resolve_corpus_params(metadata_dir, flag_name="--fps").params.native_fps
+        print(f"Video fps: {fps:g} (from the corpus's recording block)")
+
     records = load_records(metadata_dir)
     selected = select_records(
         records, args.episode_index, args.episode_id, args.all
@@ -169,7 +185,7 @@ def main() -> None:
     print(f"Rendering {len(selected)} episode(s) to {videos_root} ...")
     n_ok = 0
     for record in selected:
-        if render_video(record, image_root, videos_root, args.fps) is not None:
+        if render_video(record, image_root, videos_root, fps) is not None:
             n_ok += 1
     print(f"\nDone. {n_ok}/{len(selected)} video(s) written under {videos_root}.")
 

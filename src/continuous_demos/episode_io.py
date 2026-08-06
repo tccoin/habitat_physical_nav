@@ -160,23 +160,38 @@ def build_robot_sim(
 # these are the in-place re-orientations that make up "looking" behavior.
 _LOCOMOTION_ACTIONS = {"MOVE_FORWARD", "STOP"}
 
-def find_looking_slices(actions: list[str]) -> list[tuple[int, int]]:
+def find_looking_slices(
+    actions: list[str],
+    min_run: int = 3,
+    peek_reversals: bool = True,
+) -> list[tuple[int, int]]:
     """Identify non-overlapping ``[start, end)`` action-index slices of "looking".
 
-    An index slice is "looking" if it is a maximal run of non-locomotion actions
-    (anything that is not ``MOVE_FORWARD`` or ``STOP`` -- i.e. ``TURN_LEFT``,
-    ``TURN_RIGHT``, ``LOOK_UP``, ``LOOK_DOWN``) that is either:
+    A candidate slice is a *maximal* run of non-locomotion actions -- anything
+    that is not ``MOVE_FORWARD`` or ``STOP``, i.e. ``TURN_LEFT``, ``TURN_RIGHT``,
+    ``LOOK_UP``, ``LOOK_DOWN``. A run is returned if it is at least ``min_run``
+    actions long, or (when ``peek_reversals`` is set) if it is exactly 2 actions
+    forming a left/right reversal. Returned slices are non-overlapping and in
+    ascending order.
 
-      * a **panoramic scan** -- a run of ``>= 3`` such actions; or
-      * a **peek** -- a run of exactly 2 actions that is a left/right reversal
-        (``TURN_LEFT`` then ``TURN_RIGHT`` or vice versa).
+    The defaults are the shipped rule: a **panoramic scan** of ``>= 3`` actions,
+    or a **peek** of exactly 2 that reverses direction. Because both patterns are
+    derived from *maximal* runs a scan always takes precedence over a peek
+    (``[L, R, R, R]`` is one 4-action scan, never a peek plus leftovers), and
+    that holds for any ``min_run``.
 
-    Both patterns are derived from *maximal* runs, so a scan always takes
-    precedence over a peek: e.g. ``[..., L, R, R, R, ...]`` yields a single
-    4-action scan, never an ``L, R`` peek plus leftovers. Runs of length 1, and
-    length-2 runs that are not L/R reversals (e.g. ``L, L`` or ``LOOK_UP,
-    LOOK_DOWN``), are not looking behavior. Returned slices are non-overlapping
-    and in ascending order.
+    Runs below the threshold are not dropped from the replay; they are swallowed
+    by the surrounding move phase, where they become zero-arc-length corners that
+    pure pursuit rounds off -- measured at 0.14 control ticks per 30-degree turn,
+    i.e. not executed as rotation at all. Whether that is a defect depends
+    entirely on what those runs *are*, and the answer is: mostly not looking.
+    ``dump/rotation_segmentation/FINDINGS.md`` classifies them with a
+    course-deviation discriminator and finds 87.5% of sub-threshold runs are
+    path-following re-aims -- the human turning because the corridor is not
+    aligned to the 30-degree action grid. Executing those in place would shatter
+    a fast, correct DWPP glide into a stutter of in-place rotations. Lowering
+    ``min_run`` was measured and **rejected**; see that document before touching
+    it. ``min_run`` is a parameter only so the arms of that A/B stay reproducible.
     """
     slices: list[tuple[int, int]] = []
     n = len(actions)
@@ -190,9 +205,13 @@ def find_looking_slices(actions: list[str]) -> list[tuple[int, int]]:
         while j < n and actions[j] not in _LOCOMOTION_ACTIONS:
             j += 1
         run_len = j - i
-        if run_len >= 3:
-            slices.append((i, j))  # panoramic scan (takes precedence)
-        elif run_len == 2 and {actions[i], actions[i + 1]} == {"TURN_LEFT", "TURN_RIGHT"}:
+        if run_len >= min_run:
+            slices.append((i, j))
+        elif (
+            peek_reversals
+            and run_len == 2
+            and {actions[i], actions[i + 1]} == {"TURN_LEFT", "TURN_RIGHT"}
+        ):
             slices.append((i, j))  # peek: left-then-right or right-then-left
         i = j
     return slices

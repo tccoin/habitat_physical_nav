@@ -6,6 +6,7 @@ import numpy as np
 
 from continuous_demos.replay import record_segmented_demo, record_path
 from continuous_demos.controllers import HolonomicRobotController
+from continuous_demos.rotation_canonicalize import maybe_canonicalize
 from continuous_demos.episode_io import (
     DEFAULT_URDF_PATH,
     build_robot_sim,
@@ -67,6 +68,7 @@ def replay_episode(
     max_steps: Optional[int] = None,
     urdf_path: str = str(DEFAULT_URDF_PATH),
     debug_draw: bool = False,
+    canonicalize_rotation: bool = False,
 ) -> None:
     data = load_demo_objectnav(dataset_path)
     episode = resolve_episode(data["episodes"], episode_index, episode_id)
@@ -75,6 +77,16 @@ def replay_episode(
     # path_3d[m] and path_headings[m] are the demo position/heading at path point
     # m; actions[j] carries the robot from path point j to j+1 (see extract_demo).
     path_3d, path_headings, actions = extract_demo(episode, max_steps=max_steps)
+    # OFF by default; see rotation_canonicalize and dump/rotation_blunders.
+    path_3d, path_headings, actions, canon = maybe_canonicalize(
+        path_3d, path_headings, actions, canonicalize_rotation
+    )
+    if canon is not None and canon.touched:
+        print(
+            f"Canonicalised {canon.runs_altered}/{canon.runs} rotation runs: "
+            f"-{canon.actions_removed} actions, "
+            f"-{canon.rotation_deg_removed:.0f} deg of {canon.rotation_deg_before:.0f}"
+        )
     # "looking" slices live in action-index space, which maps directly onto path
     # segments: a slice [a, b) covers path points a..b (see record_segmented_demo).
     looking_slices = find_looking_slices(actions)
@@ -143,6 +155,16 @@ def main() -> None:
         help="URDF to use for the robot replay.",
     )
     parser.add_argument("--debug-draw", action="store_true", help="Render path and axes overlays during replay.")
+    parser.add_argument(
+        "--no-canonicalize-rotation", dest="canonicalize_rotation",
+        action="store_false", default=True,
+        help="Disable rotation canonicalisation, which is ON by default so that "
+             "what you debug here matches what the generator produces. "
+             "Canonicalisation replaces every maximal run of pure "
+             "TURN_LEFT/TURN_RIGHT with the shortest run covering the same "
+             "heading range and ending on the same heading, before replay. See "
+             "continuous_demos.rotation_canonicalize.",
+    )
     args = parser.parse_args()
 
     replay_episode(
@@ -157,6 +179,7 @@ def main() -> None:
         max_steps=args.max_steps,
         urdf_path=args.urdf_path,
         debug_draw=args.debug_draw,
+        canonicalize_rotation=args.canonicalize_rotation,
     )
 
 

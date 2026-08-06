@@ -10,6 +10,8 @@ import json
 import math
 
 import numpy as np
+import dataclasses
+
 import pytest
 
 from objectnav_eval.config import EvalConfig
@@ -1127,3 +1129,95 @@ def test_memory_seconds_converts_with_the_control_rate():
     assert EvalConfig(policy_memory_seconds=7.0, dt=0.05, gap=5).context_reset_every == 28
     # 35 * 5 * 0.04 == 28 * 5 * 0.05 == 7.0 s
     assert EvalConfig(policy_memory_seconds=0.01, dt=0.04, gap=5).context_reset_every == 1
+
+
+# --------------------------------------------------------------------------
+# Inference controller limits (control.py)
+#
+# The point of this block is that "baseline" stays a fixed thing. The
+# demo_matched preset exists precisely because we suspect the baseline limits
+# are wrong, so the temptation to "just fix the defaults" is real -- and doing
+# that would retroactively relabel every run already on disk.
+# --------------------------------------------------------------------------
+
+def test_baseline_matches_the_shipped_dataclass_defaults():
+    """PID_BASELINE is the record of what past runs used, not a second opinion."""
+    pid_module = pytest.importorskip("continuous_demos.pid_pose_controller")
+    from objectnav_eval.control import PID_BASELINE
+
+    defaults = pid_module.PIDPoseControllerConfig()
+    for name, expected in PID_BASELINE.items():
+        assert getattr(defaults, name) == pytest.approx(expected), name
+    # And nothing was added to the dataclass that the snapshot does not know
+    # about -- otherwise a new limit could drift unrecorded.
+    declared = {f.name for f in dataclasses.fields(defaults)}
+    assert declared == set(PID_BASELINE)
+
+
+def test_baseline_preset_changes_nothing():
+    from objectnav_eval.control import PID_BASELINE, describe_pid, resolve_pid_settings
+
+    assert resolve_pid_settings("baseline") == PID_BASELINE
+    assert resolve_pid_settings(None) == PID_BASELINE
+    assert describe_pid(resolve_pid_settings("baseline")) == "baseline"
+
+
+def test_demo_matched_raises_only_the_angular_limits():
+    """The measured mismatch is angular; touching the linear side would confound it."""
+    from objectnav_eval.control import PID_BASELINE, resolve_pid_settings
+
+    settings = resolve_pid_settings("demo_matched")
+    assert settings["aw_max"] > PID_BASELINE["aw_max"] * 10
+    assert settings["w_max"] > PID_BASELINE["w_max"] * 0  # present and finite
+    for untouched in ("a_max", "v_max", "kp_pos", "kd_pos", "kp_th", "kd_th"):
+        assert settings[untouched] == PID_BASELINE[untouched], untouched
+
+
+def test_overrides_accept_an_explicit_unit():
+    """`aw_max=400` and `aw_max=deg:400` differ by 57x; the prefix makes it sayable."""
+    import math
+
+    from objectnav_eval.control import resolve_pid_settings
+
+    assert resolve_pid_settings(None, {"aw_max": "deg:400"})["aw_max"] == pytest.approx(
+        math.radians(400.0)
+    )
+    assert resolve_pid_settings(None, {"aw_max": "rad:100"})["aw_max"] == pytest.approx(100.0)
+    assert resolve_pid_settings(None, {"aw_max": 100})["aw_max"] == pytest.approx(100.0)
+    # An override beats the preset it is layered on.
+    assert resolve_pid_settings("demo_matched", {"aw_max": 7})["aw_max"] == pytest.approx(7.0)
+
+
+def test_unknown_preset_and_unknown_field_are_errors_not_silent_no_ops():
+    from objectnav_eval.control import resolve_pid_settings
+
+    with pytest.raises(ValueError, match="unknown PID preset"):
+        resolve_pid_settings("aggressive")
+    with pytest.raises(ValueError, match="unknown PID field"):
+        resolve_pid_settings(None, {"aw_maxx": 100})
+
+
+def test_pid_set_flag_reaches_the_config_and_is_validated_at_parse_time():
+    import argparse
+
+    from objectnav_eval.config import add_arguments, config_from_args
+
+    parser = add_arguments(argparse.ArgumentParser())
+    args = parser.parse_args(
+        ["--episodes", "x", "--pid-preset", "demo_matched", "--pid-set", "a_max=12"]
+    )
+    config = config_from_args(args)
+    assert config.pid_preset == "demo_matched"
+    assert config.pid_overrides == {"a_max": "12"}
+
+    bad = parser.parse_args(["--episodes", "x", "--pid-set", "nope=1"])
+    with pytest.raises(ValueError, match="unknown PID field"):
+        config_from_args(bad)
+
+
+def test_pid_choice_survives_the_shard_round_trip():
+    """A worker that silently dropped this would run different physics than asked."""
+    from objectnav_eval.config import EvalConfig
+
+    original = EvalConfig(pid_preset="demo_matched", pid_overrides={"w_max": "rad:2.5"})
+    assert EvalConfig.from_dict(original.to_dict()) == original

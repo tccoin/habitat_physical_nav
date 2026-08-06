@@ -54,9 +54,25 @@ def build_scene_simulator(episode: EvalEpisode, config: Any):
 
 
 def _build_runner(robot_sim, scene_id: str, config: Any, policy) -> EpisodeRunner:
-    from continuous_demos.pid_pose_controller import (
-        PIDPoseController,
-        PIDPoseControllerConfig,
+    from continuous_demos.pid_pose_controller import PIDPoseController
+
+    from .control import build_pid_config
+
+    pid_config = build_pid_config(
+        getattr(config, "pid_preset", "baseline"),
+        getattr(config, "pid_overrides", None),
+    )
+
+    # Printed for the same reason the navmesh choice is: it changes what the
+    # robot can execute, and a run that silently used different limits than the
+    # one it is being compared against is unreadable after the fact.
+    from .control import describe_pid, resolve_pid_settings
+
+    print(
+        "    pid             "
+        f"{getattr(config, 'pid_preset', 'baseline')} "
+        f"({describe_pid(resolve_pid_settings(getattr(config, 'pid_preset', 'baseline'), getattr(config, 'pid_overrides', None)))})",
+        flush=True,
     )
 
     return EpisodeRunner(
@@ -72,7 +88,7 @@ def _build_runner(robot_sim, scene_id: str, config: Any, policy) -> EpisodeRunne
             ),
             executor=ChunkExecutor(
                 robot_sim,
-                PIDPoseController(robot_sim, PIDPoseControllerConfig()),
+                PIDPoseController(robot_sim, pid_config),
                 dt=config.dt,
                 gap=config.gap,
                 collect_contacts=config.collision_probe,

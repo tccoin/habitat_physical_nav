@@ -1221,3 +1221,28 @@ def test_pid_choice_survives_the_shard_round_trip():
 
     original = EvalConfig(pid_preset="demo_matched", pid_overrides={"w_max": "rad:2.5"})
     assert EvalConfig.from_dict(original.to_dict()) == original
+
+
+def test_dataset_navmesh_is_the_default():
+    """Pinned because the alternative fails silently, not loudly.
+
+    Every run before 2026-08-06 used --navmesh robot, which was the default.
+    On that mesh the robot is a physics body that is not constrained to the
+    mesh, so snap_point can resolve its proxy across an island boundary and
+    the metric starts measuring a different goal instance partway through an
+    episode -- oracle_spl 1.000 on a trajectory that never approached the
+    goal it is credited with. Nothing raises. A default is the only place to
+    fix that, so the default is asserted rather than assumed.
+    """
+    import argparse
+
+    from objectnav_eval.config import EvalConfig, add_arguments, config_from_args
+
+    assert EvalConfig().navmesh == "dataset"
+    parser = add_arguments(argparse.ArgumentParser())
+    assert config_from_args(parser.parse_args(["--episodes", "x"])).navmesh == "dataset"
+    # 'robot' stays reachable -- it answers a real question (where the robot
+    # fits), it just cannot be trusted for a reported number.
+    assert config_from_args(
+        parser.parse_args(["--episodes", "x", "--navmesh", "robot"])
+    ).navmesh == "robot"

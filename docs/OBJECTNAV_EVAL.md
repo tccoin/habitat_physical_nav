@@ -315,7 +315,7 @@ did either would report a very different, and much worse, number.
 Both meshes are available, and neither is correct in general — they answer
 different questions, so the run records and prints which it used.
 
-| | `--navmesh robot` (default) | `--navmesh dataset` |
+| | `--navmesh robot` | `--navmesh dataset` (**default**) |
 | --- | --- | --- |
 | footprint | r=0.28 m, h=1.0 m — this robot | r=0.1 m point agent |
 | connectivity | fragmented; 28% of HM3D `val` screened `goal_unreachable` | connected; screening nearly never fires |
@@ -339,6 +339,32 @@ The dataset mesh removes the detours and the island screening, at the cost of
 assuming a robot that fits through gaps this one does not — goals it calls
 reachable may be unreachable in fact, and those episodes become honest failures
 rather than screened-out ones.
+
+**`dataset` is the default, and `robot` should not be used for any number you
+intend to report.** That is a change: every run before 2026-08-06 used `robot`,
+because it was the default and this section described both meshes as merely
+answering different questions. They do — but only one of them answers its
+question *consistently*, and the section above understated how badly the other
+fails.
+
+The robot mesh's failure is not only that it overstates distance. The robot is
+not constrained to the mesh, so `snap_point` (`objectnav.py:154-157`, unbounded
+and island-unconstrained) can resolve the agent's proxy **across an island
+boundary**. On `wcojb4TFT35:0#26` a 4.4 cm real step moved the proxy 2.73 m,
+`distance_to_goal` fell 6.193 -> 1.189 in one tick, and the metric spent the
+rest of the episode measuring a *different bed instance* — one the robot navmesh
+calls unreachable from the start. 168 of 320 ticks violated the 1-Lipschitz
+bound. Scored on the dataset mesh the same trajectory has **zero** violations.
+
+`detour_ratio` is the cheap signal and it is recorded per episode: on the
+`sample101` set the median is 1.39, **28.6% of episodes exceed 2x and 15.7%
+exceed 3x**. That is the scale of the distortion, and it is an order of
+magnitude more episodes than the outright-impossible ones a
+`start - min <= path_at_min` check catches.
+
+The dataset mesh has its own bias — it assumes a robot that fits through gaps
+this one does not, so it understates difficulty. But that bias is *stable*: it
+does not change which goal is being measured partway through an episode.
 
 **Runs using different `--navmesh` values are not comparable.** Switching it
 changes every geodesic, SPL's denominator, and which episodes are screened.

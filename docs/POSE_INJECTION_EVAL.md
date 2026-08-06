@@ -274,7 +274,12 @@ Matching `dump/eval_system/ar_v2` exactly, so the oracle numbers are comparable:
 
 ```
 --dt 0.04 --gap 5 --max-steps 350 --success-distance 1.0
---fresh-sim-per-episode --navmesh robot --evaluate-every 1
+--fresh-sim-per-episode --navmesh robot --evaluate-every 1   # NOTE: --navmesh robot
+# Every number in this document was produced on the ROBOT navmesh, which is no
+# longer the default -- see docs/OBJECTNAV_EVAL.md 'Which one to measure on'.
+# It overstates geodesics and, worse, lets snap_point switch which goal instance
+# is being measured mid-episode. These numbers are internally consistent with
+# each other and NOT comparable with anything run on --navmesh dataset.
 --policy-decode sample --policy-seed 1000  (seed 0)
 episode set: dump/eval_system/episode_sets/hm3d_val_n41.txt   (41 episodes)
 ```

@@ -67,11 +67,12 @@ class EvalConfig:
     # agent has already arrived, `oracle_success`/`oracle_spl` are untouched by
     # it -- they latched at the moment the window opened.
     auto_stop_delay: int = 0
-    # Which navmesh every distance is measured on: 'robot' (recomputed for
+    # Which navmesh every distance is measured on: 'dataset' (the point-agent
+    # mesh shipped with the scene) or 'robot' (recomputed for
     # r=0.28 h=1.0) or 'dataset' (the point-agent mesh shipped with the
     # scene, what published ObjectNav numbers use). Changes what the metrics
     # mean, not how the robot moves. See navmesh.apply_navmesh_choice.
-    navmesh: str = "robot"
+    navmesh: str = "dataset"
     snap_start: bool = False
     screen_trivial: bool = True
     live_height: bool = True
@@ -349,19 +350,28 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                           "--stop-requires-oracle) can declare for itself. The window "
                           "opens only once the agent has arrived, so oracle_success and "
                           "oracle_spl already latched and are unaffected")
-    run.add_argument("--navmesh", default="robot", choices=["robot", "dataset"],
-                     help="WHICH NAVMESH THE METRICS ARE MEASURED ON. 'robot' "
-                          "(default) recomputes it for this robot's footprint "
+    run.add_argument("--navmesh", default="dataset", choices=["dataset", "robot"],
+                     help="WHICH NAVMESH THE METRICS ARE MEASURED ON. 'dataset' "
+                          "(default) uses the point-agent mesh shipped with the "
+                          "scene. IT IS THE DEFAULT BECAUSE 'robot' PRODUCES WRONG "
+                          "NUMBERS THAT LOOK RIGHT, not because it is more faithful "
+                          "to this robot -- it is not. 'robot' recomputes the mesh "
+                          "for this robot's footprint "
                           "(r=0.28 m, h=1.0 m) -- honest about where the robot fits, "
                           "but fragmented: it screens out 28%% of HM3D val as "
                           "goal-unreachable, and where it routes around something the "
                           "physics body can drive through it overstates the distance "
-                          "and can pin SPL at 1.000. 'dataset' uses the point-agent "
-                          "mesh shipped with the scene -- connected, comparable with "
-                          "published ObjectNav numbers, no absurd jumps, but it "
-                          "understates difficulty by assuming a robot that fits "
-                          "through gaps this one does not. Does NOT change how the "
-                          "robot moves; it is a physics body either way")
+                          "and can pin SPL at 1.000. Worse, the robot is not "
+                          "constrained to that mesh, so snap_point can resolve its "
+                          "proxy across an island boundary and the metric silently "
+                          "starts measuring a DIFFERENT goal instance mid-episode "
+                          "(2.73 m of proxy jump for 4.4 cm of real motion, on "
+                          "wcojb4TFT35:0#26). 'dataset' understates difficulty by "
+                          "assuming a robot that fits through gaps this one does "
+                          "not -- a bias, but a stable one that does not vary "
+                          "within an episode. Neither changes how the robot moves; "
+                          "it is a physics body either way. Runs using different "
+                          "values are NOT comparable")
     run.add_argument("--snap-start", action="store_true",
                      help="snap the spawn onto the robot navmesh instead of using the "
                           "episode's start position verbatim")

@@ -38,9 +38,37 @@ Each JSONL line (one episode) has:
       "goal_text":     "chair",            # object_category
       "rgb_paths":     ["<scene>/<ep>/frame_00000.png", ...],  # relative to image_root
       "pose2d":        [[x, y, theta], ...],                   # aligned with rgb_paths
-      "recording":     {"schema_version": 1, "native_fps": 25.0, ...},
+      "recording":     {"schema_version": 2, "native_fps": 25.0, ...},
       "quality":       {"schema_version": 1, "success": true, "final_dist_m": ...}
     }
+
+------------------------------------------------------------------------
+``--panoramic N``: one file per tick, N views inside it
+------------------------------------------------------------------------
+With ``--panoramic N`` (N > 1) each saved frame is the rig's N views
+**concatenated horizontally into a single strip**, not N files. So a frame is
+``(height, N * width, 3)`` and ``rgb_paths`` still holds exactly one path per
+tick.
+
+That is the whole reason for the choice. ``rgb_paths[i]`` <-> ``pose2d[i]`` is
+a 1:1 invariant that ``action_chunking.build_observation_records`` enforces (it
+raises on a length mismatch) and that every build script and the
+``images``-column trainer format depend on; N files per tick would either break
+it or force an ``images`` column of lists-of-lists through
+``action_chunking`` and four build scripts. The strip also *is* the frame the
+recorder rendered (``panoramic.rgb_view``), so nothing re-derives the view
+order on the way to disk, and it is one inode per tick rather than N -- which
+over ~40k episodes x hundreds of ticks x 5 is a real filesystem cost.
+
+Cutting it back up is exact and needs no guessing, because the recording block
+describes it: ``num_cameras``, ``frame_width``, ``image_width`` (still the
+PER-CAMERA width), ``view_strip_order`` (camera indices left to right) and
+``view_yaw_offsets_deg``. ``RecordingParams.view_slice(i)`` returns the column
+range of the i-th view.
+
+A consumer that predates all this does not silently read a strip as one view:
+``resolve_corpus_params`` refuses a multi-camera corpus unless the caller
+passes ``allow_multiview=True``, and every consumer funnels through it.
 
 ``recording`` is the block described in ``continuous_demos.recording_metadata``:
 how this corpus was recorded -- tick rate, the physics timestep that rate does
@@ -81,7 +109,16 @@ from typing import Any, Dict, List, Optional, Tuple
 import imageio.v2 as imageio
 import numpy as np
 
-from continuous_demos.replay import record_segmented_demo
+from continuous_demos.replay import (
+    MOVE_STALL_TICKS,
+    PHASE_FREE_STALL_TICKS,
+    record_segmented_demo,
+)
+from continuous_demos.corpus_guard import (
+    assert_corpus_marker_agrees,
+    assert_output_dir_is_safe,
+    assert_shard_is_appendable,
+)
 from continuous_demos.drive_failure import (
     QUALITY_KEY,
     DriveFailureConfig,
@@ -89,17 +126,15 @@ from continuous_demos.drive_failure import (
     EpisodeHealthMonitor,
 )
 from continuous_demos.recording_metadata import (
-    RecordingParams,
     format_grid_note,
     params_for_generation,
-    shard_params,
 )
 from continuous_demos.rotation_canonicalize import maybe_canonicalize
 from continuous_demos.episode_io import (
     DEFAULT_URDF_PATH,
     build_robot_sim,
+    demo_looking_slices,
     extract_demo,
-    find_looking_slices,
     find_scene_dataset_config,
     load_demo_objectnav,
     resolve_scene_path,
@@ -140,35 +175,6 @@ def load_done_episode_ids(metadata_dir: Path, scene: str) -> set:
             if ep is not None:
                 done.add(ep)
     return done
-
-
-def assert_shard_is_appendable(jsonl_path: Path, params: RecordingParams) -> None:
-    """Refuse to append records to a shard that was recorded differently.
-
-    Generation is resumable and appends, so without this check a rerun after a
-    parameter change (the 30 Hz -> 25 Hz move being exactly the case that
-    motivated all of this) would leave one shard holding two time bases with
-    nothing to mark the boundary. Aborting is deliberate: it is an operator
-    error about the whole ``--output-dir``, not a per-episode failure, and the
-    fix is a fresh output dir rather than anything this script can do.
-    """
-    existing = shard_params(jsonl_path) if jsonl_path.exists() else None
-    if existing is None:
-        if jsonl_path.exists() and jsonl_path.stat().st_size > 0:
-            raise RuntimeError(
-                f"{jsonl_path} already holds records with no 'recording' block, i.e. from a "
-                f"generation that predates the schema (those were all recorded at 30 Hz). "
-                f"Appending {params.native_fps:g} Hz records to it would produce a shard with "
-                "two time bases and no way to tell which record is which. Write to a fresh "
-                "--output-dir."
-            )
-        return
-    if not existing.agrees_with(params):
-        raise RuntimeError(
-            f"{jsonl_path} was recorded with {existing.consistency_view()} but this run is "
-            f"{params.consistency_view()}. Resuming would mix two generations in one shard. "
-            "Write to a fresh --output-dir."
-        )
 
 
 def load_failed_episode_ids(log_file: Path) -> set:
@@ -226,6 +232,7 @@ def replay_one_episode(
     max_steps: Optional[int],
     failure_config: Optional[DriveFailureConfig] = None,
     canonicalize_rotation: bool = False,
+    phase_free: bool = False,
 ) -> Tuple[List[np.ndarray], List[np.ndarray], np.ndarray, EpisodeHealth, Optional[dict]]:
     """Replay a single episode and return ``(frames, poses, path_3d, health)``.
 
@@ -245,7 +252,9 @@ def replay_one_episode(
     path_3d, path_headings, actions, canon = maybe_canonicalize(
         path_3d, path_headings, actions, canonicalize_rotation
     )
-    looking_slices = find_looking_slices(actions)
+    # With --no-phases there are no looking slices, so the whole demonstration
+    # replays as a single move phase (see episode_io.demo_looking_slices).
+    looking_slices = demo_looking_slices(actions, phase_free=phase_free)
 
     robot_sim.reset(
         robot_translation=path_3d[0].copy(),
@@ -265,6 +274,12 @@ def replay_one_episode(
         fps=fps,
         debug_draw=False,
         health_monitor=monitor,
+        # The stall rule bails out of a phase that has stopped progressing,
+        # which is safe only because a later phase re-anchors the controller.
+        # A phase-free replay has one phase, so bailing out abandons the rest
+        # of the demonstration -- measured at 6.7% of episodes silently
+        # truncated. See replay.PHASE_FREE_STALL_TICKS.
+        move_stall_ticks=PHASE_FREE_STALL_TICKS if phase_free else MOVE_STALL_TICKS,
     )
     return (
         frames,
@@ -312,7 +327,13 @@ def generate(
     max_episodes: Optional[int] = None,
     failure_config: Optional[DriveFailureConfig] = None,
     canonicalize_rotation: bool = False,
+    num_cameras: int = 1,
+    phase_free: bool = False,
+    adopt_existing_corpus: bool = False,
 ) -> None:
+    # Before anything is created: this must not be writing into its own input,
+    # or into a corpus some other run owns. See continuous_demos.corpus_guard.
+    assert_output_dir_is_safe(output_dir, dataset_path, image_root=image_root)
     output_dir.mkdir(parents=True, exist_ok=True)
     if image_root is None:
         image_root = output_dir / "images"
@@ -370,6 +391,7 @@ def generate(
                     width=width,
                     height=height,
                     urdf_path=urdf_path,
+                    num_cameras=num_cameras,
                 )
             except Exception as exc:  # scene unresolved / sim build failed
                 print(f"  ! Skipping scene {scene}: {exc}")
@@ -398,9 +420,17 @@ def generate(
                     goal_threshold_m=goal_threshold,
                     urdf=urdf_path,
                     generator="generate_pose2d_dataset.py",
+                    num_cameras=num_cameras,
+                    phase_free=phase_free,
                 )
                 print(f"  recording: {format_grid_note(recording)}")
+                print(f"  recorded as: {recording.describe_rig()}")
                 recording_blob = recording.as_dict()
+                # Whole-directory guard, before the per-shard one: does this
+                # output directory already belong to a different generation?
+                assert_corpus_marker_agrees(
+                    output_dir, metadata_dir, recording, adopt_existing_corpus
+                )
                 assert_shard_is_appendable(jsonl_path, recording)
 
                 # Append so records from prior runs are preserved (resume).
@@ -421,6 +451,7 @@ def generate(
                                 robot_sim, episode, fps=fps, max_steps=max_steps,
                                 failure_config=failure_config,
                                 canonicalize_rotation=canonicalize_rotation,
+                                phase_free=phase_free,
                             )
                         except Exception as exc:
                             print(f"  [ep {idx} / {ep_id}] replay error: {exc}")
@@ -579,6 +610,38 @@ def parse_args() -> argparse.Namespace:
         help="Optional cap on total episodes processed (for quick testing).",
     )
     parser.add_argument(
+        "--panoramic", type=int, default=1, metavar="N",
+        help="Number of RGB cameras evenly spaced around the base, sharing the "
+             "one camera's intrinsics. Default 1 = the shipped single forward "
+             "camera. With N > 1 each saved frame is the N views CONCATENATED "
+             "HORIZONTALLY into one strip (so rgb_paths stays one path per "
+             "tick, aligned 1:1 with pose2d); N, the strip's left-to-right "
+             "camera order and each camera's yaw are all written into the "
+             "recording block, so a consumer never has to guess how to cut it "
+             "up. At the configured hfov of 79 degrees, N=5 covers the full "
+             "360 with 7 degrees of neighbour overlap.",
+    )
+    parser.add_argument(
+        "--no-phases", dest="phase_free", action="store_true",
+        help="Replay each demonstration as ONE continuous pure-pursuit "
+             "trajectory over its full 2D path instead of alternating move / "
+             "turn-in-place / look phases. Recorded rotation and action "
+             "properties are discarded, LOOK_UP/LOOK_DOWN included, and "
+             "heading is slaved to the direction of travel. Also switches the "
+             "move-stall rule off (replay.PHASE_FREE_STALL_TICKS), which is "
+             "required: with one phase there is nothing to bail out to and the "
+             "rule silently truncates 6.7%% of episodes. OFF by default; "
+             "independent of --panoramic.",
+    )
+    parser.add_argument(
+        "--adopt-existing-corpus", action="store_true",
+        help="Permit writing into an --output-dir that already holds metadata "
+             "shards but no corpus marker, i.e. a corpus written before the "
+             "marker existed. OFF by default so that a mistyped path cannot "
+             "silently append episodes to a finished corpus that other "
+             "datasets reference by absolute path.",
+    )
+    parser.add_argument(
         "--fall-speed-mps", type=float, default=DriveFailureConfig.fall_speed_mps,
         help="Downward joint_z velocity (m/s) that counts as falling. joint_z is "
              "the unactuated vertical joint: in the world the floor pins it, "
@@ -648,6 +711,9 @@ def main() -> None:
         log_file=args.log_file,
         max_episodes=args.max_episodes,
         canonicalize_rotation=args.canonicalize_rotation,
+        num_cameras=args.panoramic,
+        phase_free=args.phase_free,
+        adopt_existing_corpus=args.adopt_existing_corpus,
         failure_config=DriveFailureConfig(
             fall_speed_mps=args.fall_speed_mps,
             fall_duration_s=args.fall_duration_s,

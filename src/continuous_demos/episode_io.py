@@ -18,6 +18,7 @@ from habitat_sim.utils.settings import default_sim_settings
 
 from continuous_demos import ASSETS_DIR
 from continuous_demos.sim import HabitatRobotSim
+from continuous_demos.panoramic import rgb_sensor_setup
 from continuous_demos.replay import hab_quat_to_heading
 
 
@@ -129,7 +130,18 @@ def build_robot_sim(
     width: int,
     height: int,
     urdf_path: str,
+    num_cameras: int = 1,
 ) -> HabitatRobotSim:
+    """Build the pipeline's simulator: this scene, this robot, this camera.
+
+    ``num_cameras`` is the size of the camera rig and defaults to 1 -- the
+    single forward ``"color_sensor"`` with ``hfov`` :data:`panoramic.
+    CAMERA_HFOV_DEG` that every replay has ever used. Larger values add yawed
+    copies of that same camera around the base; see
+    :mod:`continuous_demos.panoramic` for the geometry and the uuids, and note
+    that with a rig the observation no longer has a ``"color_sensor"`` key at
+    all (read it with ``panoramic.rgb_view``).
+    """
     sim_settings = default_sim_settings.copy()
     sim_settings["scene"] = str(scene_path)
     sim_settings["window_width"] = width
@@ -140,12 +152,7 @@ def build_robot_sim(
     if scene_dataset_config is not None:
         sim_settings["scene_dataset_config_file"] = scene_dataset_config
 
-    color_sensor_spec = habitat_sim.sensor.CameraSensorSpec()
-    color_sensor_spec.uuid = "color_sensor"
-    color_sensor_spec.sensor_type = habitat_sim.sensor.SensorType.COLOR
-    color_sensor_spec.resolution = [height, width]
-    color_sensor_spec.hfov = 79
-    sensor_setup = {"base_camera_link": [color_sensor_spec]}
+    sensor_setup = rgb_sensor_setup(width, height, num_cameras=num_cameras)
 
     robot_sim = HabitatRobotSim(
         sim_settings=sim_settings,
@@ -215,6 +222,49 @@ def find_looking_slices(
             slices.append((i, j))  # peek: left-then-right or right-then-left
         i = j
     return slices
+
+def demo_looking_slices(
+    actions: list[str],
+    phase_free: bool = False,
+    **kwargs,
+) -> list[tuple[int, int]]:
+    """The looking slices to replay a demo with -- or none at all.
+
+    This is the whole of the "phase-free" option, and it is a one-line function
+    on purpose. ``record_segmented_demo`` tiles the action timeline with move
+    phases in the *gaps between* looking slices, so handing it an empty list
+    asks for exactly one move phase spanning the entire demonstration: one
+    continuous pure-pursuit trajectory over the full 2D path, heading slaved to
+    the look-ahead tangent, no in-place rotation anywhere. There is no second
+    controller, no new phase kind and no branch inside the recorder -- the
+    move-phase machinery already does this, it has simply never been given the
+    whole path before.
+
+    What that discards is the point of the option. A demonstration's recorded
+    ROTATION and its action properties are used *only* to build looking slices
+    and the per-slice heading trajectory; with no slices, neither is read, so
+    the replay is a function of the demonstrated POSITIONS alone. In
+    particular ``LOOK_UP``/``LOOK_DOWN`` vanish rather than being emulated,
+    which costs nothing physically -- they only ever moved the demo agent's
+    camera pitch, which this pipeline has never reproduced (``hab_quat_to_
+    heading`` keeps yaw only), so the rendered pitch is neutral throughout
+    either way.
+
+    Why one might want it: measured over 4,000 training episodes, 44.4% of
+    control ticks are turn-in-place and 72% of all heading change happens at
+    zero translation. That is a human compensating for a 79-degree window, not
+    navigation, and it is inherited by anything trained on the replays.
+    ``phase_free`` removes the behaviour; a panoramic rig
+    (:mod:`continuous_demos.panoramic`) removes the reason for it. They are
+    independent options and either is useful without the other.
+
+    ``phase_free=False`` (the default) is the shipped behaviour: delegate to
+    :func:`find_looking_slices`, to which ``kwargs`` (``min_run``,
+    ``peek_reversals``) are passed through.
+    """
+    if phase_free:
+        return []
+    return find_looking_slices(actions, **kwargs)
 
 def extract_demo(
     episode: Any, max_steps: Optional[int] = None

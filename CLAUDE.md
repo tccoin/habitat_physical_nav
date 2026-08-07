@@ -267,10 +267,18 @@ isn't the simulator lives in sibling modules under `src/continuous_demos/`:
   `replay_human_demo.py`, `generate_pose2d_dataset.py`, and
   `eval_pid_tracking.py` (`load_demo_objectnav`, `resolve_scene_path`,
   `find_scene_dataset_config`, `build_robot_sim`, `extract_demo`,
-  `find_looking_slices`, `DEFAULT_URDF_PATH`). Pulled out of
-  `replay_human_demo.py` specifically so scripts stop importing from other
+  `find_looking_slices`, `demo_looking_slices`, `DEFAULT_URDF_PATH`). Pulled out
+  of `replay_human_demo.py` specifically so scripts stop importing from other
   scripts — a script should only ever be a `scripts/` entry point, never an
   import target.
+- `panoramic.py` — the camera rig: uuids, yaw offsets, strip order, coverage
+  arithmetic, and `rgb_sensor_setup` / `rgb_view`. See "Two replay options"
+  below.
+- `corpus_guard.py` — the refusals that stop a generation run writing where it
+  must not: `assert_output_dir_is_safe` (never into its own input or a
+  `$HABITAT_PROTECTED_ROOTS` path), `assert_shard_is_appendable` (per shard) and
+  `assert_corpus_marker_agrees` (per output directory). All three are hard
+  errors; see the module docstring for why a warning would be worthless.
 - `pid_pose_controller.py` — the PID global-pose/trajectory tracker (see
   `docs/PID_TRACKING_REPORT.md`), independent of the pure-pursuit stack above.
 - `objectnav.py` / `objectnav_dataset.py` — the ObjectNav task layer (below).
@@ -278,6 +286,53 @@ isn't the simulator lives in sibling modules under `src/continuous_demos/`:
   The "keep this folder standalone" rule targets the parent repo's loose Python
   files; habitat-lab is an installed package and is a deliberate dependency
   here.
+
+## Two replay options (`--panoramic N`, `--no-phases`) — both default OFF
+
+Available on `replay_human_demo.py` and `generate_pose2d_dataset.py`, and via
+`PANORAMIC` / `PHASE_FREE` on `batch_gen.bash`. Independent; all four
+combinations work. With both off the pipeline is bit-identical to before —
+verified against a pristine worktree through both entry points (same
+full-precision poses, byte-identical rendered frames).
+
+- **`--panoramic N`** puts N copies of the shipped camera around the base,
+  evenly spaced in yaw. Camera 0 is forward and the index runs **clockwise seen
+  from above** (`psi_k = -2*pi*k/N`); `scripts/panoramic_check.py` proves that
+  in pixels. The configured hfov is **79°** (`episode_io.build_robot_sim`), so
+  N=5 covers 360° with 7° of neighbour overlap. The yaw rides on the sensor
+  *spec* (`spec.yaw_offset_rad`), which is how the rig survives `reset()` and
+  scene switches — `_setup_robot_and_sensors` re-reads it each time it
+  re-parents the sensors. Render cost at 640×480: 2.57 ms/observation at N=1,
+  12.68 at N=5.
+- **`--no-phases`** replays a demonstration as one continuous pure-pursuit
+  trajectory over its full path. It is *one line* —
+  `episode_io.demo_looking_slices(actions, phase_free=True)` returns `[]`, and
+  `record_segmented_demo` already tiles move phases into the gaps *between*
+  looking slices, so no slices means one move phase over everything. No new
+  controller, no new phase kind, no branch in the recorder. Recorded rotation
+  and action properties are read only to build slices and per-slice headings, so
+  with none the replay is a function of the demonstrated positions alone and
+  `LOOK_UP`/`LOOK_DOWN` vanish (camera pitch was never reproduced anyway).
+  It **must** also set `replay.PHASE_FREE_STALL_TICKS = 0`: the move-stall rule
+  is safe only because another phase re-anchors the controller, and with one
+  phase it silently truncates 6.7% of episodes.
+
+Two consequences worth knowing before reading a panoramic corpus:
+
+- Each saved frame is the N views **concatenated horizontally into one strip**,
+  so `rgb_paths` stays one path per tick (the 1:1 alignment with `pose2d` that
+  `action_chunking` enforces). `recording.num_cameras` / `frame_width` /
+  `view_strip_order` / `view_yaw_offsets_deg` describe how to cut it up, and
+  `RecordingParams.view_slice(i)` does the arithmetic.
+- `recording_metadata.resolve_corpus_params` **refuses** a multi-camera corpus
+  unless the caller passes `allow_multiview=True`. Every consumer funnels
+  through it, so a script written before rigs existed fails loudly instead of
+  training on a picture five times too wide. `render_pose2d_videos.py` and
+  `eval_pid_tracking.py` opt in (one plays frames as-is, the other never opens
+  an image); the image-consuming build path deliberately does not.
+- Against a rig, `objectnav_eval` needs `--sensor-uuid color_sensor_0` — its
+  default `color_sensor` does not exist once N > 1 (deliberately: a `KeyError`
+  beats one arbitrary fifth of the field of view).
 
 `scripts/sim_debug_drive.py` holds `sim.py`'s former manual/debug entry points
 (`main()`/`test_rotation_controller()`) — ad hoc driving scripts, not part of

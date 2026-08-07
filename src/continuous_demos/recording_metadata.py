@@ -89,7 +89,14 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 #:
 #: 1 -- first version. native_fps/dt_native/physics timing, effective velocity
 #:      caps, render size, goal threshold, URDF, generator + code commit.
-SCHEMA_VERSION = 1
+#: 2 -- the recording is no longer necessarily one forward camera replaying a
+#:      phase-segmented demonstration. Adds ``num_cameras`` / ``phase_free``
+#:      (both consistency-checked, both defaulting to exactly what version 1
+#:      always meant, so a version-1 shard reads as a single-camera segmented
+#:      corpus and stays appendable) plus the self-description a consumer needs
+#:      to cut a panorama strip back into views: ``frame_width``,
+#:      ``view_strip_order``, ``view_yaw_offsets_deg``.
+SCHEMA_VERSION = 2
 
 #: Top-level key the parameter block lives under in each JSONL record.
 RECORDING_KEY = "recording"
@@ -127,15 +134,57 @@ REPLAY_MOVE_MAX_VW_RADPS = 2.0
 #: identical across every record of a corpus. Provenance fields (commit,
 #: generator, render size) are deliberately excluded: a resumed run on a newer
 #: commit is fine, a resumed run at a different tick rate is not.
+#: ``num_cameras`` and ``phase_free`` are here, and not with the provenance,
+#: because they change what a record MEANS rather than how it was produced: one
+#: makes every ``rgb_paths`` entry a strip of N views instead of one image, the
+#: other changes what the trajectories are. Mixing either into an existing shard
+#: produces a corpus that is wrong in a way nothing downstream can detect --
+#: which is the entire reason they are recorded at all.
 CONSISTENCY_KEYS: Tuple[str, ...] = (
     "native_fps",
     "dt_native",
     "physics_timestep",
     "v_max_mps",
     "w_max_radps",
+    "num_cameras",
+    "phase_free",
 )
 
 _FLOAT_TOL = 1e-9
+
+
+def _values_agree(a: Any, b: Any) -> bool:
+    """Equality for one consistency field, across the types they come in.
+
+    JSON round-trips tuples to lists and has no integer/float distinction, so a
+    value written as ``(3, 4, 0)`` comes back as ``[3, 4, 0]`` and ``1`` may
+    come back as ``1.0``. Compare by meaning, not by type.
+    """
+    if a is None or b is None:
+        return a is b
+    if isinstance(a, bool) or isinstance(b, bool):
+        return bool(a) is bool(b)
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return abs(float(a) - float(b)) <= _FLOAT_TOL
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        return list(a) == list(b)
+    return a == b
+
+
+def format_disagreements(
+    diffs: Sequence[Tuple[str, Any, Any]], mine: str = "existing", theirs: str = "this run"
+) -> str:
+    """Render :meth:`RecordingParams.disagreements` as one line per field.
+
+    Named columns rather than two dicts: the reader has to be told which knob
+    moved and what it moved from and to, not handed both states to diff.
+    """
+    if not diffs:
+        return "    (no disagreement)"
+    width = max(len(key) for key, _, _ in diffs)
+    return "\n".join(
+        f"    {key:<{width}}  {mine} = {a!r}   {theirs} = {b!r}" for key, a, b in diffs
+    )
 
 
 class RecordingParamsError(RuntimeError):
@@ -148,6 +197,18 @@ class MissingRecordingParams(RecordingParamsError):
 
 class InconsistentRecordingParams(RecordingParamsError):
     """Records within one corpus disagree about how they were recorded."""
+
+
+class MultiViewCorpusError(RecordingParamsError):
+    """A multi-camera corpus reached a consumer that only understands one view.
+
+    The default, and deliberately so. Every frame of a panoramic corpus is N
+    views concatenated into one strip, so a consumer that treats it as a single
+    image does not fail -- it trains, or scores, or renders, on a picture five
+    times too wide, and reports a plausible number. That is the failure mode
+    the whole ``recording`` block exists to prevent, so the read path refuses
+    by default and a consumer has to say ``allow_multiview=True`` to opt in.
+    """
 
 
 @dataclass(frozen=True)
@@ -174,6 +235,31 @@ class RecordingParams:
             wrongly twice (1.28/73 and 1.92/110 were both ``0.064/dt`` for a
             wrong ``dt``, i.e. artifacts of the ripple's lower mode).
 
+    What was recorded (schema_version >= 2, consistency-checked):
+        num_cameras: size of the camera rig. ``1`` is one forward camera and is
+            what every version-1 corpus is. Greater than 1 means each file
+            named in ``rgb_paths`` is the rig's N views CONCATENATED
+            HORIZONTALLY into one strip -- see ``view_strip_order`` for which
+            view sits where, and :mod:`continuous_demos.panoramic` for why the
+            strip rather than N files per frame.
+        phase_free: whether the demonstrations were replayed as one continuous
+            trajectory over the full path (``True``) or as the alternating
+            move / turn-in-place / look phases (``False``, the shipped
+            behaviour). It changes what the trajectories ARE, not merely how
+            they were rendered, so it can never be mixed into a shard.
+
+    Self-description of a multi-view frame (set only when num_cameras > 1):
+        frame_width: true width of a file on disk, pixels
+            (``num_cameras * image_width``). ``image_width`` remains the
+            PER-CAMERA width, i.e. the ``--width`` the run was given.
+        view_strip_order: camera indices left to right within the strip, so
+            view ``i`` of the strip occupies columns
+            ``[i * image_width, (i + 1) * image_width)`` and is camera
+            ``view_strip_order[i]``.
+        view_yaw_offsets_deg: each camera's yaw relative to the robot's
+            forward, degrees, in CAMERA-INDEX order (not strip order).
+            Anticlockwise positive, so the values are <= 0 for increasing index.
+
     Provenance (not consistency-checked):
         image_width / image_height / image_ext: what the frames on disk are.
         goal_threshold_m: the final-pose filter every kept episode passed.
@@ -196,6 +282,14 @@ class RecordingParams:
     urdf: Optional[str] = None
     generator: Optional[str] = None
     code_commit: Optional[str] = None
+    # Defaults are exactly what schema_version 1 always meant, so a version-1
+    # record read through from_dict() describes itself correctly and compares
+    # equal to a modern single-camera segmented run.
+    num_cameras: int = 1
+    phase_free: bool = False
+    frame_width: Optional[int] = None
+    view_strip_order: Optional[Tuple[int, ...]] = None
+    view_yaw_offsets_deg: Optional[Tuple[float, ...]] = None
     schema_version: int = SCHEMA_VERSION
     #: Free-text marker set only for params the caller *assumed* rather than
     #: read (see :func:`legacy_params`). Never written by the generator.
@@ -208,20 +302,47 @@ class RecordingParams:
     @classmethod
     def from_dict(cls, blob: Dict[str, Any]) -> "RecordingParams":
         known = {f for f in cls.__dataclass_fields__}  # tolerate newer writers
-        return cls(**{k: v for k, v in blob.items() if k in known})
+        kept = {k: v for k, v in blob.items() if k in known}
+        # JSON has no tuples; restore them so a round-tripped block compares
+        # equal to the one that was written.
+        for key in ("view_strip_order", "view_yaw_offsets_deg"):
+            if isinstance(kept.get(key), list):
+                kept[key] = tuple(kept[key])
+        return cls(**kept)
 
-    def consistency_view(self) -> Dict[str, float]:
+    def consistency_view(self) -> Dict[str, Any]:
         return {k: getattr(self, k) for k in CONSISTENCY_KEYS}
 
+    def disagreements(
+        self, other: "RecordingParams"
+    ) -> List[Tuple[str, Any, Any]]:
+        """Every consistency field these two disagree on: ``(field, mine, theirs)``.
+
+        Returned rather than merely counted so a caller can say WHICH knob was
+        changed and to what. "These do not agree" plus a dump of both dicts
+        leaves the reader diffing seven numbers by eye at the exact moment they
+        are least inclined to.
+        """
+        return [
+            (key, getattr(self, key), getattr(other, key))
+            for key in CONSISTENCY_KEYS
+            if not _values_agree(getattr(self, key), getattr(other, key))
+        ]
+
     def agrees_with(self, other: "RecordingParams") -> bool:
-        for key in CONSISTENCY_KEYS:
-            a, b = getattr(self, key), getattr(other, key)
-            if a is None or b is None:
-                if a is not b:
-                    return False
-            elif abs(float(a) - float(b)) > _FLOAT_TOL:
-                return False
-        return True
+        return not self.disagreements(other)
+
+    def describe_rig(self) -> str:
+        """One phrase for what was recorded, as opposed to how fast."""
+        replay = "phase-free" if self.phase_free else "segmented"
+        if self.num_cameras == 1:
+            return f"1 camera, {replay}"
+        order = tuple(self.view_strip_order or ())
+        return (
+            f"{self.num_cameras} cameras concatenated into a "
+            f"{self.frame_width or '?'}px strip (left-to-right camera order "
+            f"{order}), {replay}"
+        )
 
     def describe(self) -> str:
         grid = "on-grid" if self.on_physics_grid else "OFF-GRID (velocity ripple)"
@@ -229,9 +350,33 @@ class RecordingParams:
             f"schema_version={self.schema_version} native_fps={self.native_fps:g} "
             f"dt_native={self.dt_native:.6g}s physics_timestep={self.physics_timestep:g}s "
             f"({self.physics_steps_per_tick:g} steps/tick, {grid}) "
-            f"v_max={self.v_max_mps:g}m/s w_max={self.w_max_radps:g}rad/s"
+            f"v_max={self.v_max_mps:g}m/s w_max={self.w_max_radps:g}rad/s "
+            f"[{self.describe_rig()}]"
             + (f" [{self.assumed_note}]" if self.assumed_note else "")
         )
+
+    # -- multi-view helpers ------------------------------------------------
+    @property
+    def is_multiview(self) -> bool:
+        return int(self.num_cameras) > 1
+
+    def view_slice(self, view_position: int) -> Tuple[int, int]:
+        """Column range ``[lo, hi)`` of the ``view_position``-th view in a strip.
+
+        ``view_position`` indexes the strip LEFT TO RIGHT; the camera it belongs
+        to is ``view_strip_order[view_position]``. This is the one place the
+        slicing arithmetic lives, so no consumer re-derives it from a width it
+        guessed.
+        """
+        if not self.is_multiview:
+            raise ValueError("single-camera corpus: the frame is already one view")
+        if self.image_width is None:
+            raise ValueError("corpus does not record image_width; cannot slice views")
+        n = int(self.num_cameras)
+        if not 0 <= view_position < n:
+            raise IndexError(f"view_position {view_position} outside 0..{n - 1}")
+        width = int(self.image_width)
+        return view_position * width, (view_position + 1) * width
 
 
 # ---------------------------------------------------------------------------
@@ -306,14 +451,39 @@ def params_for_generation(
     pure_pursuit_config: Any = None,
     rotation_config: Any = None,
     physics_timestep: Optional[float] = None,
+    num_cameras: int = 1,
+    phase_free: bool = False,
 ) -> RecordingParams:
-    """Assemble the block a generator stamps onto every record it writes."""
+    """Assemble the block a generator stamps onto every record it writes.
+
+    ``num_cameras`` / ``phase_free`` describe WHAT was recorded and are
+    consistency-checked; the multi-view self-description is derived from
+    ``num_cameras`` here, once, rather than by each caller.
+    """
     if native_fps <= 0:
         raise ValueError(f"native_fps must be positive, got {native_fps}")
     dt_native = 1.0 / float(native_fps)
     step = float(physics_timestep) if physics_timestep else probe_physics_timestep(robot_sim)
     steps_per_tick = dt_native / step
     v_max, w_max = resolve_velocity_limits(pure_pursuit_config, rotation_config)
+
+    num_cameras = int(num_cameras)
+    frame_width = strip_order = yaw_offsets = None
+    if num_cameras > 1:
+        # Imported lazily: this module is pure metadata and is read in
+        # environments that never build a rig.
+        from continuous_demos import panoramic
+
+        strip_order = tuple(panoramic.strip_order(num_cameras))
+        yaw_offsets = tuple(
+            round(math.degrees(psi), 6)
+            for psi in panoramic.signed_yaw_offsets(num_cameras)
+        )
+        if image_width is not None:
+            frame_width = int(image_width) * num_cameras
+    elif image_width is not None:
+        frame_width = int(image_width)
+
     return RecordingParams(
         native_fps=float(native_fps),
         dt_native=dt_native,
@@ -329,6 +499,11 @@ def params_for_generation(
         urdf=Path(urdf).name if urdf else None,
         generator=generator,
         code_commit=current_code_commit(),
+        num_cameras=num_cameras,
+        phase_free=bool(phase_free),
+        frame_width=frame_width,
+        view_strip_order=strip_order,
+        view_yaw_offsets_deg=yaw_offsets,
         schema_version=SCHEMA_VERSION,
     )
 
@@ -416,6 +591,7 @@ def resolve_corpus_params(
     *,
     shard_paths: Optional[Sequence[Path]] = None,
     flag_name: str = "--native-fps",
+    allow_multiview: bool = False,
 ) -> ResolvedRecording:
     """Establish, once, how a corpus was recorded. See the module docstring.
 
@@ -424,6 +600,15 @@ def resolve_corpus_params(
     It is *only* a fallback for a corpus that does not record its own rate; if
     the corpus does record one and the two disagree, that is an error rather
     than an override.
+
+    ``allow_multiview`` must be set by any consumer that is prepared for
+    ``num_cameras > 1`` -- i.e. for every ``rgb_paths`` entry to name a strip of
+    N concatenated views rather than one image. It defaults to ``False`` so that
+    a consumer written before rigs existed raises :class:`MultiViewCorpusError`
+    rather than quietly treating five views as one; being the single read path
+    every consumer already funnels through, this protects all of them without
+    any of them being edited. See :meth:`RecordingParams.view_slice` for the
+    slicing a consumer that opts in will want.
     """
     paths = list(shard_paths) if shard_paths is not None else _shard_paths(Path(metadata_dir))
     if not paths:
@@ -454,9 +639,11 @@ def resolve_corpus_params(
         for path, params in with_params[1:]:
             if not params.agrees_with(head):
                 raise InconsistentRecordingParams(
-                    f"Shards disagree about how they were recorded: {head_path.name} has "
-                    f"{head.consistency_view()} but {path.name} has "
-                    f"{params.consistency_view()}. Do not build across them."
+                    f"Shards disagree about how they were recorded:\n"
+                    + format_disagreements(
+                        params.disagreements(head), mine=path.name, theirs=head_path.name
+                    )
+                    + "\nDo not build across them."
                 )
         if assumed_native_fps is not None and abs(float(assumed_native_fps) - head.native_fps) > _FLOAT_TOL:
             raise InconsistentRecordingParams(
@@ -465,6 +652,17 @@ def resolve_corpus_params(
                 "The recorded value is authoritative; drop the flag. If you genuinely "
                 "believe the recorded value is wrong, fix the corpus rather than "
                 "overriding it here."
+            )
+        if head.is_multiview and not allow_multiview:
+            raise MultiViewCorpusError(
+                f"{metadata_dir} was recorded with {head.num_cameras} cameras: every "
+                f"file named in rgb_paths is {head.num_cameras} views concatenated into "
+                f"a {head.frame_width or '?'}px-wide strip (left-to-right camera order "
+                f"{tuple(head.view_strip_order or ())}), not one image. This consumer "
+                "has not declared that it understands that, so it is being stopped "
+                "rather than allowed to read a strip as a single view. Teach it to "
+                "slice with RecordingParams.view_slice() and pass "
+                "allow_multiview=True, or point it at a single-camera corpus."
             )
         return ResolvedRecording(
             params=head,
@@ -514,11 +712,12 @@ def check_record_consistency(
             "but the corpus was resolved from a caller-supplied --native-fps. The shard was "
             "appended to across the schema change."
         )
-    if not params.agrees_with(resolved.params):
+    diffs = params.disagreements(resolved.params)
+    if diffs:
         raise InconsistentRecordingParams(
-            f"{where or 'a record'} was recorded with {params.consistency_view()}, but the "
-            f"corpus resolved to {resolved.params.consistency_view()}. The shard mixes two "
-            "generations; do not build across it."
+            f"{where or 'a record'} disagrees with the rest of the corpus:\n"
+            + format_disagreements(diffs, mine="this record", theirs="corpus")
+            + "\nThe shard mixes two generations; do not build across it."
         )
 
 

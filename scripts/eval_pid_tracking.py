@@ -120,6 +120,10 @@ def main() -> None:
         assumed_native_fps=args.fps,
         shard_paths=[metadata_path],
         flag_name="--fps",
+        # allow_multiview: this replays recorded pose2d trajectories through the
+        # PID controller and never opens an image, so the size of the camera rig
+        # cannot affect any number it reports.
+        allow_multiview=True,
     )
     print(resolved.banner())
     fps = resolved.params.native_fps

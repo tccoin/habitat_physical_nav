@@ -4,7 +4,9 @@ Three things live here because getting any of them wrong silently invalidates
 every metric downstream:
 
 1. :func:`robot_position_3d` -- the robot's position is **not**
-   ``robot.translation``.
+   ``robot.translation``. (Now re-exported from
+   ``continuous_demos.robot_pose``, along with :func:`navmesh_height`, which is
+   the height a pathfinder query must actually be issued at.)
 2. :func:`dataset_pathfinder` -- the shipped navmesh has a different filename
    suffix per dataset, and a naive ``str.replace`` no-ops on one of them.
 3. :func:`resolve_scene` -- HM3D needs the episode's own scene-dataset config,
@@ -22,6 +24,19 @@ from typing import Any, Optional, Sequence, Tuple
 import numpy as np
 
 import habitat_sim
+
+# Re-exported, not redefined: ``continuous_demos.robot_pose`` is the single definition of
+# where the robot is. This module and ``continuous_demos.drive_failure`` each used to
+# carry their own copy of it. ``robot_height`` keeps its old name here because callers in
+# this package spell it that way.
+from continuous_demos.robot_pose import (  # noqa: F401
+    navmesh_height,
+    planar_to_habitat,
+    robot_height_m as robot_height,
+    robot_navmesh_position,
+    robot_position_3d,
+    urdf_vertical_offset,
+)
 
 from objectnav_eval.episodes import EvalEpisode
 
@@ -107,51 +122,6 @@ def _dataset_navmesh_path(scene_path: Path) -> Optional[Path]:
         if nav.suffix == ".navmesh" and nav.exists():
             return nav
     return None
-
-
-def robot_position_3d(robot_sim) -> np.ndarray:
-    """The robot's habitat-frame ``[x, y, z]`` position.
-
-    NOT ``robot.translation``: the base link is fixed at the spawn point and the
-    robot moves through its world prismatic joints, so ``translation`` never
-    changes during an episode. The live planar position comes from
-    ``get_2d_pose()`` -- ``[X, Y, theta]`` with ``X = habitat_x`` and
-    ``Y = -habitat_z`` -- and the vertical is the base translation plus the
-    passive ``joint_z``. Reading ``translation`` directly pins every goal
-    distance to the spawn, which looks like a policy that never makes progress.
-    """
-    x, y_planar, _theta = robot_sim.get_2d_pose()
-    return np.array([x, robot_height(robot_sim), -y_planar], dtype=np.float32)
-
-
-def robot_height(robot_sim) -> float:
-    """Habitat-world ``y`` of the robot base, tracking vertical motion."""
-    height = float(robot_sim.robot.translation[1])
-    try:
-        height += float(robot_sim.get_joint_state("joint_z"))
-    except (ValueError, KeyError):
-        pass  # passive joint without a motor; the base height is close enough
-    return height
-
-
-def urdf_vertical_offset(robot_sim) -> float:
-    """The lift ``HabitatRobotSim.reset`` adds so the model rests on the floor.
-
-    ``robot.translation[1]`` is the navmesh-level spawn height *plus* this, so
-    subtracting it recovers the height goals and view points are expressed at.
-    """
-    aabb = robot_sim.robot.root_scene_node.cumulative_bb
-    return float(-aabb.min.y) if aabb.min.y < 0 else 0.0
-
-
-def navmesh_height(robot_sim) -> float:
-    """Navmesh-level habitat ``y`` of the robot, live.
-
-    ``translation[1] - vertical_offset`` is the spawn height and never changes;
-    ``joint_z`` is the prismatic vertical travel since then. Their sum is the
-    height a geodesic query should be issued at.
-    """
-    return robot_height(robot_sim) - urdf_vertical_offset(robot_sim)
 
 
 # ---------------------------------------------------------------------------

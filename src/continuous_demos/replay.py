@@ -98,6 +98,31 @@ PHASE_FREE_STALL_TICKS = 0
 # generate_pose2d_dataset.py's default, and the stall-window and rotation-gain
 # defaults above are expressed in ticks at this rate.
 RECORD_FPS = 25
+
+# ---------------------------------------------------------------------------
+# The move phase's driving parameters, named rather than inlined.
+# ---------------------------------------------------------------------------
+# These four were literals inside `record_segmented_demo` / `record_path`. They are
+# named here, at their existing values and with no behaviour change, because a second
+# recorder (`continuous_demos.pointnav_episode`) drives the same controllers with the
+# same limits and must not be able to drift from these. Importing them is what makes
+# the drift impossible, rather than merely unlikely -- the alternative was a comment
+# in two files asking the reader to keep them equal.
+#
+# `MOVE_MAX_VW` is mirrored by `recording_metadata.REPLAY_MOVE_MAX_VW_RADPS`, which is
+# what gets stamped into every corpus's `w_max_radps`; `tests/test_replay_constants.py`
+# pins them equal, so a change here that is not carried across shows up as a failing
+# test rather than as a corpus whose recorded limit is not the limit it was driven at.
+MOVE_HEADING_GAIN = 3.0  #: `heading_alignment_gain` while path-following.
+MOVE_MAX_VW = 2.0  #: `max_vw` (rad/s) while path-following.
+
+#: Assumed traversal speed when sizing a move phase's local timeout, in m/s. Not a
+#: velocity limit -- purely the denominator of `ceil(path_length / this + 0.5)`.
+LOCAL_TIMEOUT_MPS = 0.5
+
+#: Roll/pitch beyond this many degrees means the machine is on its side; the recorder
+#: abandons the episode rather than recording a camera pointing at the floor.
+TIPPED_OVER_DEG = 45.0
 # ---------------------------------------------------------------------------
 
 def record_path(robot_sim: HabitatRobotSim, controller: HolonomicRobotController, path_3d, timeout=10, fps=RECORD_FPS, debug_draw=True):
@@ -132,7 +157,7 @@ def record_path(robot_sim: HabitatRobotSim, controller: HolonomicRobotController
         if controller.is_goal_reached() and robot_sim.is_stationary(lin_vel_threshold=0.01, ang_vel_threshold=0.01):
             print("Goal reached!")
             break
-        if robot_sim.is_tipped_over(angle_threshold_degrees=45.0):
+        if robot_sim.is_tipped_over(angle_threshold_degrees=TIPPED_OVER_DEG):
             print("Robot tipped over! Stopping simulation.")
             break
     return frames, poses
@@ -193,6 +218,13 @@ def _is_stalled(path_progress, speeds, stall_ticks: int, stall_eps: float,
     if stall_max_speed is None:
         return True
     return max(speeds[-stall_ticks:]) < stall_max_speed
+
+
+#: Public name for :func:`_is_stalled`. The rule and its calibration belong to this
+#: module, so a second recorder importing it gets the same predicate rather than a
+#: reimplementation that agrees until it does not. The private name is kept for the
+#: existing call sites below.
+is_stalled = _is_stalled
 
 
 def _build_phases(num_actions, looking_slices):
@@ -348,7 +380,9 @@ def record_segmented_demo(
         if kind == "move":
             move_controller.reset()
             move_controller.set_hab_path3(path_3d[p : q + 1])
-            local_timeout = int(np.ceil(move_controller.controller._path_distances[-1] / 0.5 + 0.5))
+            local_timeout = int(np.ceil(
+            move_controller.controller._path_distances[-1] / LOCAL_TIMEOUT_MPS + 0.5
+        ))
         else:
             look_controller.reset()
             look_controller.set_heading_trajectory(
@@ -365,7 +399,9 @@ def record_segmented_demo(
 
             if kind == "move":
                 step_args = move_controller.step(
-                    dt=1.0 / fps, heading_alignment_gain=3.0, max_vw=2.0
+                    dt=1.0 / fps,
+                    heading_alignment_gain=MOVE_HEADING_GAIN,
+                    max_vw=MOVE_MAX_VW,
                 )
                 if debug_draw:
                     move_controller.draw_path()
@@ -428,7 +464,7 @@ def record_segmented_demo(
                 if _is_stalled(path_progress, speeds, move_stall_ticks,
                                move_stall_eps, move_stall_max_speed):
                     break
-            if robot_sim.is_tipped_over(angle_threshold_degrees=45.0):
+            if robot_sim.is_tipped_over(angle_threshold_degrees=TIPPED_OVER_DEG):
                 # print("Robot tipped over! Stopping simulation.")
                 return frames, poses
         if len(frames) >= timeout * fps:

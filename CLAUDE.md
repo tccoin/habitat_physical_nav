@@ -43,10 +43,18 @@ section exists rather than a git note:
   `v2_25hz`. Build corpora with this repo's
   `scripts/build_action_chunk_episode_dataset.py` and nothing else.
 
-What still lives over there is **data, not code**: the recordings under
-`/Projects/continuous_demos/output_25hz`, which every corpus's `images` column
-references by absolute path. Moving them would invalidate `v2_25hz`, so they
-stay put for now. That directory is the only reason the path may still appear.
+What still lives over there is **data, not code**: the recordings. They are
+reached through **`recordings/` in this repo**, a symlink to wherever they
+physically sit (currently
+`/Projects/DEPRECATED_DO_NOT_USE_continuous_demos/output_25hz`).
+
+Use the symlink, never the physical path. Every corpus's `images` column stores
+**absolute** paths, so the physical location being renamed silently breaks every
+dataset built from it -- which is exactly what happened on 2026-08-07: the
+directory was renamed to `DEPRECATED_DO_NOT_USE_*`, every corpus's paths went
+stale, and both live training runs died mid-step on a `FileNotFoundError`. The
+corpora were repathed onto `recordings/` and the symlink now absorbs any future
+rename: repoint it and everything keeps working.
 
 ## Pipeline (in order)
 
@@ -72,6 +80,34 @@ stay put for now. That directory is the only reason the path may still appear.
    against a `.json.gz` dataset; the executable proof behind
    `REPLAY_DATA_FORMAT.md`. Re-run this on any new dataset shard before
    trusting the alignment recipe.
+
+### PointNav generation — a second front end onto the same pipeline
+
+`generate_pointnav_dataset.py` (+ `batch_generate_pointnav.py` for a large run) produces
+the *same raw corpus layout* from **no input demonstrations**: sample a start and a chain
+of goals on the robot navmesh, plan a shortest path to each, turn in place onto it, drive
+it with the same DWPP stack. Steps 3-4 above read the result unchanged.
+`pointnav_debug_episode.py` renders one episode with a navmesh top-down HUD or the path
+projected into the RGB, and is the gate before generating anything.
+
+Full design in **`docs/POINTNAV_GENERATION.md`**. The four things worth knowing before
+touching it:
+
+- A drive-time segment failure **rolls back** rather than killing the episode: the failed
+  ticks are *erased* and the robot is physically returned, so `goal2d` stays
+  piecewise-constant. Relabelling the excursion under the next goal would teach a policy
+  that goals move when you fail. The health monitor is therefore per-segment.
+- `recording.task` is consistency-checked, and **`None` means objectnav**. The ObjectNav
+  generator must keep stamping `None`: every corpus written before schema 3 reads back as
+  `None`, and stamping the string would make the whole `v2_25hz` lineage unappendable.
+- `HabitatRobotSim.draw_path` / `draw_axes` **do not appear in sensor observations** --
+  habitat's `DebugLineRender` only draws in the interactive viewer's pass (measured: 0
+  pixels changed, against 1771 for `navmesh_visualization`). `replay.record_path`'s
+  `debug_draw` lines have therefore never been in a recorded frame. Use
+  `viewport_overlay.py`, which projects instead.
+- Rejections cluster **per scene** (3 of the first 18 HM3D scenes gave 29 of 40), because
+  some scenes' navmesh is optimistic for a 0.28 m robot. Raising `--segment-rollbacks`
+  spends more time there rather than recovering episodes.
 
 Separately, `eval_pid_tracking.py` validates a different, simpler action
 interface: `src/continuous_demos/pid_pose_controller.py`'s PID-based global

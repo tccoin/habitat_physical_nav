@@ -305,6 +305,8 @@ def build_observation_records(
     chunk_config: ChunkConfig,
     spacing_config: Optional[SpacingConfig] = None,
     rng: Optional[np.random.Generator] = None,
+    goal2d: Optional[Sequence[Sequence[float]]] = None,
+    segment_index: Optional[Sequence[int]] = None,
 ) -> List[Dict[str, Any]]:
     """Slide an observation window over one episode's native trajectory.
 
@@ -327,6 +329,27 @@ def build_observation_records(
     (0-indexed last valid frame is ``N - 1``). Trailing frames that can't
     anchor a full chunk are silently dropped -- there is no padding.
 
+    ``goal2d`` and ``segment_index`` are the PointNav corpus's extra per-tick arrays and
+    are optional in exactly the way that matters: when both are ``None`` the emitted
+    records have **precisely** today's key set, so an ObjectNav build is unchanged rather
+    than merely equivalent. When given they must be the same length ``N``, and each
+    record gains
+
+        "obs_goal":        goal2d[idx]        -- the goal at the ANCHOR frame
+        "segment_index":   segment_index[idx]
+        "crosses_segment": whether the chunk's tail belongs to the next goal
+
+    ``obs_goal`` is deliberately the goal at ``idx`` and never at ``idx + length``: the
+    image was rendered at ``idx``, and taking the goal from the chunk's tail would
+    condition the model on which goal it is *about to* be given.
+
+    ``crosses_segment`` marks a chunk that spans a goal change. Such a chunk is
+    physically valid -- the robot never teleports -- but not supervisorily valid, because
+    its tail is motion toward the next goal while the conditioning shows the current one.
+    At ``action_chunk_len=10`` and ``obs_stride_frames=5`` that is one observation per
+    boundary, roughly 1% of a chained episode. The flag is emitted always; whether to drop
+    those rows is the builder's ``--boundary-policy``.
+
     ``spacing_config`` controls how far apart consecutive observations land
     (see the module docstring's "Variable observation spacing" section);
     defaults to fixed-stride spacing (``obs_stride_frames`` apart every time,
@@ -344,6 +367,9 @@ def build_observation_records(
     n = len(pose2d)
     if len(rgb_paths) != n:
         raise ValueError(f"pose2d ({n}) and rgb_paths ({len(rgb_paths)}) length mismatch")
+    for name, extra in (("goal2d", goal2d), ("segment_index", segment_index)):
+        if extra is not None and len(extra) != n:
+            raise ValueError(f"pose2d ({n}) and {name} ({len(extra)}) length mismatch")
 
     if spacing_config is None:
         spacing_config = SpacingConfig(mode="fixed")
@@ -358,15 +384,21 @@ def build_observation_records(
     while idx + length <= n - 1:
         anchor = pose2d[idx]
         chunk = [pose_to_relative(anchor, pose2d[idx + j]) for j in range(1, length + 1)]
-        records.append(
-            {
-                "obs_index": obs_index,
-                "frame_index": idx,
-                "image": rgb_paths[idx],
-                "obs_pose": [float(v) for v in anchor],
-                "action_chunk": [c.tolist() for c in chunk],
-            }
-        )
+        record = {
+            "obs_index": obs_index,
+            "frame_index": idx,
+            "image": rgb_paths[idx],
+            "obs_pose": [float(v) for v in anchor],
+            "action_chunk": [c.tolist() for c in chunk],
+        }
+        if goal2d is not None:
+            record["obs_goal"] = [float(v) for v in goal2d[idx]]
+        if segment_index is not None:
+            record["segment_index"] = int(segment_index[idx])
+            record["crosses_segment"] = bool(
+                int(segment_index[idx + length]) != int(segment_index[idx])
+            )
+        records.append(record)
         obs_index += 1
         idx += sample_gap_frames(rng, spacing_config, chunk_config)
     return records

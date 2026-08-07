@@ -96,7 +96,10 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 #:      corpus and stays appendable) plus the self-description a consumer needs
 #:      to cut a panorama strip back into views: ``frame_width``,
 #:      ``view_strip_order``, ``view_yaw_offsets_deg``.
-SCHEMA_VERSION = 2
+#: 3 -- the recording is no longer necessarily an ObjectNav demonstration. Adds
+#:      ``task`` (consistency-checked), whose ``None`` default *means* objectnav
+#:      -- see the field's own note for why it is not the string.
+SCHEMA_VERSION = 3
 
 #: Top-level key the parameter block lives under in each JSONL record.
 RECORDING_KEY = "recording"
@@ -137,9 +140,12 @@ REPLAY_MOVE_MAX_VW_RADPS = 2.0
 #: ``num_cameras`` and ``phase_free`` are here, and not with the provenance,
 #: because they change what a record MEANS rather than how it was produced: one
 #: makes every ``rgb_paths`` entry a strip of N views instead of one image, the
-#: other changes what the trajectories are. Mixing either into an existing shard
-#: produces a corpus that is wrong in a way nothing downstream can detect --
-#: which is the entire reason they are recorded at all.
+#: other changes what the trajectories are. ``task`` is here for the same reason
+#: and is the strongest case of the three: half ObjectNav demonstrations and half
+#: PointNav shortest-path rollouts, in a corpus whose entire purpose is to be
+#: imitated, is a mixture nothing downstream can see. Mixing any of them into an
+#: existing shard produces a corpus that is wrong in a way nothing downstream can
+#: detect -- which is the entire reason they are recorded at all.
 CONSISTENCY_KEYS: Tuple[str, ...] = (
     "native_fps",
     "dt_native",
@@ -148,6 +154,7 @@ CONSISTENCY_KEYS: Tuple[str, ...] = (
     "w_max_radps",
     "num_cameras",
     "phase_free",
+    "task",
 )
 
 _FLOAT_TOL = 1e-9
@@ -248,6 +255,17 @@ class RecordingParams:
             behaviour). It changes what the trajectories ARE, not merely how
             they were rendered, so it can never be mixed into a shard.
 
+    What was recorded (schema_version >= 3, consistency-checked):
+        task: which navigation task these demonstrations are of, e.g.
+            ``"pointnav"``. **``None`` means ObjectNav**, and the ObjectNav
+            generator must keep passing ``None`` rather than the string --
+            ``as_dict`` drops ``None``, so a schema-1 or schema-2 shard reads
+            back as ``task=None`` and stays appendable by its own generator. If
+            ObjectNav ever started stamping ``"objectnav"``, every corpus
+            written before this field existed would become unappendable, which
+            is a strictly worse trade than one field whose default carries
+            meaning. Read it through :attr:`task_name` for display.
+
     Self-description of a multi-view frame (set only when num_cameras > 1):
         frame_width: true width of a file on disk, pixels
             (``num_cameras * image_width``). ``image_width`` remains the
@@ -290,10 +308,21 @@ class RecordingParams:
     frame_width: Optional[int] = None
     view_strip_order: Optional[Tuple[int, ...]] = None
     view_yaw_offsets_deg: Optional[Tuple[float, ...]] = None
+    #: schema_version >= 3. None *means* "objectnav" -- see the class docstring.
+    task: Optional[str] = None
     schema_version: int = SCHEMA_VERSION
     #: Free-text marker set only for params the caller *assumed* rather than
     #: read (see :func:`legacy_params`). Never written by the generator.
     assumed_note: Optional[str] = None
+
+    @property
+    def task_name(self) -> str:
+        """The task these demonstrations are of, with ``None`` resolved.
+
+        For display and for anything that wants a string. The *stored* value stays
+        ``None`` for ObjectNav; see the class docstring for why that matters.
+        """
+        return self.task or "objectnav"
 
     def as_dict(self) -> Dict[str, Any]:
         """JSON-ready dict, with ``None``-valued optional fields dropped."""
@@ -336,13 +365,15 @@ class RecordingParams:
         """One phrase for what was recorded, as opposed to how fast."""
         replay = "phase-free" if self.phase_free else "segmented"
         if self.num_cameras == 1:
-            return f"1 camera, {replay}"
-        order = tuple(self.view_strip_order or ())
-        return (
-            f"{self.num_cameras} cameras concatenated into a "
-            f"{self.frame_width or '?'}px strip (left-to-right camera order "
-            f"{order}), {replay}"
-        )
+            rig = "1 camera"
+        else:
+            order = tuple(self.view_strip_order or ())
+            rig = (
+                f"{self.num_cameras} cameras concatenated into a "
+                f"{self.frame_width or '?'}px strip (left-to-right camera order "
+                f"{order})"
+            )
+        return f"{self.task_name}, {rig}, {replay}"
 
     def describe(self) -> str:
         grid = "on-grid" if self.on_physics_grid else "OFF-GRID (velocity ripple)"
@@ -453,12 +484,18 @@ def params_for_generation(
     physics_timestep: Optional[float] = None,
     num_cameras: int = 1,
     phase_free: bool = False,
+    task: Optional[str] = None,
 ) -> RecordingParams:
     """Assemble the block a generator stamps onto every record it writes.
 
-    ``num_cameras`` / ``phase_free`` describe WHAT was recorded and are
+    ``num_cameras`` / ``phase_free`` / ``task`` describe WHAT was recorded and are
     consistency-checked; the multi-view self-description is derived from
     ``num_cameras`` here, once, rather than by each caller.
+
+    Leave ``task`` at ``None`` for ObjectNav. That is not a placeholder -- ``None``
+    is the recorded value for every corpus written before the field existed, and
+    stamping the string instead would make all of them unappendable. See
+    :class:`RecordingParams`.
     """
     if native_fps <= 0:
         raise ValueError(f"native_fps must be positive, got {native_fps}")
@@ -501,6 +538,7 @@ def params_for_generation(
         code_commit=current_code_commit(),
         num_cameras=num_cameras,
         phase_free=bool(phase_free),
+        task=task,
         frame_width=frame_width,
         view_strip_order=strip_order,
         view_yaw_offsets_deg=yaw_offsets,

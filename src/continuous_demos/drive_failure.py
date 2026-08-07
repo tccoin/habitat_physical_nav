@@ -106,6 +106,11 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
+# Re-exported, not redefined: ``robot_pose`` is the single definition of where the robot
+# is, and this module and ``objectnav_eval.navmesh`` each used to carry their own copy.
+# Still importable from here because the escape detector below is its oldest caller.
+from continuous_demos.robot_pose import robot_height_m  # noqa: F401
+
 #: Bumped when the meaning of a field changes or a field consumers rely on is
 #: added. Absent from a record means the record predates per-episode quality
 #: metadata entirely -- such a corpus cannot be audited and must be regenerated.
@@ -156,27 +161,6 @@ class DriveFailureConfig:
     fall_duration_s: float = 1.0
     ref_miss_flag_m: float = 1.0
     reject_ref_miss_s: Optional[float] = None
-
-
-def robot_height_m(robot_sim) -> float:
-    """The robot's true habitat-frame height (metres).
-
-    NOT ``robot.translation[1]``: the base link is pinned at the spawn point by
-    ``fixed_base=True`` and the machine moves through its joints, so that
-    component never changes during an episode -- measured identical to 1e-9 for a
-    robot driving on the navmesh and for one spawned 30 m outside the scene. The
-    live vertical is the base translation plus the passive suspension prismatic
-    ``joint_z``. Same recipe as
-    ``data_scripts/eval_objectnav_policy.py::robot_position_3d`` in the
-    spatial_training repo; reading ``translation`` alone pins every height -- and
-    every goal distance -- to the spawn.
-    """
-    height = float(robot_sim.robot.translation[1])
-    try:
-        height += float(robot_sim.get_joint_state("joint_z"))
-    except Exception:
-        pass  # passive joint without a motor: the base height is what we have
-    return height
 
 
 def vertical_velocity_mps(robot_sim) -> float:

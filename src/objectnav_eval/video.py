@@ -42,42 +42,40 @@ def annotate(rgb: np.ndarray, state: OverlayState) -> np.ndarray:
 
     image = np.ascontiguousarray(rgb).copy()
     height, width = image.shape[:2]
-    cv2.rectangle(image, (0, 0), (width, 34), (0, 0, 0), -1)
     goal = state.goal or "?"
-    cv2.putText(
-        image,
-        f"step {state.step:>3}  t={state.sim_time:6.2f}s  goal: {goal}",
-        (8, 23),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (255, 255, 255),
-        1,
-        cv2.LINE_AA,
-    )
+    left = f"step {state.step:>3}  t={state.sim_time:6.2f}s  goal: {goal}"
     closer = np.isfinite(state.distance) and state.distance <= state.start_distance
     colour = (120, 255, 160) if closer else (140, 160, 255)
     distance = f"{state.distance:5.2f}" if np.isfinite(state.distance) else "  inf"
     start = f"{state.start_distance:5.2f}" if np.isfinite(state.start_distance) else "inf"
-    cv2.putText(
-        image,
-        f"dist {distance} m  (start {start})",
-        (width - 285, 23),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        colour,
-        1,
-        cv2.LINE_AA,
-    )
+    right = f"dist {distance} m  (start {start})"
+
+    # Measured rather than the fixed `width - 285` this used to assume. That constant is
+    # right at 640 px and wrong at anything narrower: at 480 the two strings overlap into
+    # unreadable mush, which is exactly the width a quick debug render uses. When they
+    # still will not fit side by side the distance drops to its own row instead.
+    (left_w, _), _ = cv2.getTextSize(left, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+    (right_w, _), _ = cv2.getTextSize(right, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+    stacked = left_w + right_w + 24 > width
+    bar_h = 60 if stacked else 34
+    cv2.rectangle(image, (0, 0), (width, bar_h), (0, 0, 0), -1)
+
+    cv2.putText(image, left, (8, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                (255, 255, 255), 1, cv2.LINE_AA)
+    right_pos = (8, 49) if stacked else (max(8, width - right_w - 8), 23)
+    cv2.putText(image, right, right_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.6, colour, 1,
+                cv2.LINE_AA)
     if state.is_observation:
         # Marks the frames the policy actually acts on; the rest are
         # intermediate control ticks, present so playback is real time. Its own
         # row, clear of the right-aligned distance readout.
-        cv2.circle(image, (14, 50), 5, (80, 200, 255), -1)
-        cv2.putText(image, "obs", (26, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+        cv2.circle(image, (14, bar_h + 16), 5, (80, 200, 255), -1)
+        cv2.putText(image, "obs", (26, bar_h + 21), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                     (80, 200, 255), 1, cv2.LINE_AA)
     if state.reached:
-        cv2.putText(image, "REACHED", (width - 285, 60), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8, (120, 255, 160), 2, cv2.LINE_AA)
+        (reached_w, _), _ = cv2.getTextSize("REACHED", cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+        cv2.putText(image, "REACHED", (max(8, width - reached_w - 8), bar_h + 26),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (120, 255, 160), 2, cv2.LINE_AA)
     if state.extra:
         cv2.putText(image, state.extra, (8, height - 12), cv2.FONT_HERSHEY_SIMPLEX,
                     0.5, (200, 200, 200), 1, cv2.LINE_AA)

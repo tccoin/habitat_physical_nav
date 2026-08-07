@@ -84,6 +84,20 @@ def add_chunking_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
              "contradicts what a corpus records is an error, not an override.",
     )
 
+    group.add_argument(
+        "--boundary-policy",
+        choices=("drop", "keep"),
+        default="drop",
+        help=(
+            "what to do with an action chunk that spans a goal change in a chained "
+            "PointNav episode. Such a chunk is physically valid -- the robot never "
+            "teleports -- but its tail is motion toward the NEXT goal while the "
+            "conditioning shows the current one. `drop` costs about 1%% of rows at "
+            "clen=10/stride=5; `keep` is the ablation. No effect on a corpus without "
+            "segments."
+        ),
+    )
+
     latency = parser.add_argument_group("observation spacing distribution (inference latency)")
     latency.add_argument(
         "--obs-spacing-mode", default="fixed", choices=["fixed", "uniform", "poisson"],
@@ -195,6 +209,11 @@ def stamped_row_fields(
         "w_max_radps": params.w_max_radps,
         "recording_schema_version": params.schema_version,
         "native_fps_source": resolved.source,
+        # Which task's demonstrations these are. `None` in the recording block means
+        # objectnav (see RecordingParams), and it is resolved to the string HERE rather
+        # than left null, because a consumer branching on the column should not also have
+        # to know that history.
+        "task": params.task_name,
     }
 
 
@@ -226,6 +245,7 @@ def sidecar_dict(
         "obs_spacing_mode": spacing_config.mode,
         "obs_spacing_jitter": spacing_config.jitter,
         "obs_spacing_seed": spacing_config.seed,
+        "task": resolved.params.task_name,
         "image_root": str(image_root),
     }
     blob.update(extra)

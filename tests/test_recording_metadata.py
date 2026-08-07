@@ -218,11 +218,16 @@ def test_provenance_differences_do_not_trip_consistency(tmp_path):
 # Drift guards for the two constants that cannot be imported
 # ---------------------------------------------------------------------------
 def test_mirrored_controller_limits_still_match_source():
-    """DEFAULT_V_MAX_MPS / REPLAY_MOVE_MAX_VW_RADPS mirror values that live as
-    literals inside functions in files this task does not own, so they cannot
-    be imported. If those literals move, this test is the alarm."""
+    """DEFAULT_V_MAX_MPS mirrors a literal inside a function in a file this module
+    does not own, so it cannot be imported. If that literal moves, this is the alarm.
+
+    ``REPLAY_MOVE_MAX_VW_RADPS`` used to be checked the same way, by grepping
+    ``replay.py`` for ``max_vw=2.0``. It no longer needs to be: the move phase now
+    passes ``replay.MOVE_MAX_VW``, which is importable, so the two are compared
+    directly in ``test_replay_constants.py``. A source grep is the fallback for a
+    value that has no name, and it fails the moment the value acquires one.
+    """
     controllers_src = (SRC / "controllers.py").read_text(encoding="utf-8")
-    replay_src = (SRC / "replay.py").read_text(encoding="utf-8")
 
     # A float literal spelled either "2" or "2.0".
     def literal(value: float) -> str:
@@ -234,9 +239,16 @@ def test_mirrored_controller_limits_still_match_source():
     )
     # HeadingRotationConfig's own cap, read live by resolve_velocity_limits.
     assert re.search(r"w_max: float = %s" % literal(FAKE_ROTATION_CONFIG.w_max), controllers_src)
-    # The move phase's explicit max_vw in record_segmented_demo.
-    assert re.search(
-        r"\bmax_vw=%s" % literal(REPLAY_MOVE_MAX_VW_RADPS), replay_src
-    ), "replay.py no longer passes max_vw=%g; update REPLAY_MOVE_MAX_VW_RADPS." % (
-        REPLAY_MOVE_MAX_VW_RADPS
-    )
+
+
+def test_replay_move_cap_is_the_one_the_move_phase_commands():
+    """The stamped ``w_max_radps`` must be the limit the recorder actually passes.
+
+    Imported on both sides rather than grepped, now that the recorder gives it a name.
+    Duplicated deliberately with ``test_replay_constants.py``: this module owns the
+    stamped value and that one owns the commanded value, and the pin belongs on both
+    sides of the mirror.
+    """
+    from continuous_demos.replay import MOVE_MAX_VW
+
+    assert MOVE_MAX_VW == REPLAY_MOVE_MAX_VW_RADPS

@@ -271,3 +271,109 @@ def test_reconstruct_reference_trajectory_rejects_gap_outside_chunk_coverage():
 
 def test_reconstruct_reference_trajectory_empty_input():
     assert reconstruct_reference_trajectory([]).shape == (0, 3)
+
+
+# ---------------------------------------------------------------------------
+# PointNav's extra per-tick arrays: goal2d and segment_index
+# ---------------------------------------------------------------------------
+# Both optional, and the first test is the one that matters most: omitting them must
+# leave an ObjectNav build *identical*, not merely equivalent. The existing corpora are
+# not going to be rebuilt to accommodate a second task.
+def _chunk_cfg(length=4, stride=2, fps=25.0):
+    return make_chunk_config(native_fps=fps, action_chunk_len=length,
+                             obs_stride_frames=stride)
+
+
+def test_omitting_the_pointnav_arrays_yields_todays_exact_key_set():
+    pose2d = random_walk_pose2d(40, seed=0)
+    paths = [f"f{i}.png" for i in range(40)]
+    records = build_observation_records(pose2d, paths, _chunk_cfg())
+    assert records
+    for rec in records:
+        assert set(rec) == {"obs_index", "frame_index", "image", "obs_pose", "action_chunk"}
+
+
+def test_obs_goal_is_the_goal_at_the_anchor_not_at_the_chunk_tail():
+    """The image was rendered at `idx`. Taking the goal from `idx + length` would
+    condition the model on which goal it is *about to* be given."""
+    n = 40
+    pose2d = random_walk_pose2d(n, seed=1)
+    paths = [f"f{i}.png" for i in range(n)]
+    # A goal that changes every tick, so anchor-vs-tail is unambiguous.
+    goal2d = [[float(i), 0.0, 0.0] for i in range(n)]
+    records = build_observation_records(pose2d, paths, _chunk_cfg(), goal2d=goal2d)
+    for rec in records:
+        assert rec["obs_goal"] == goal2d[rec["frame_index"]]
+
+
+def test_crosses_segment_is_true_exactly_when_the_chunk_spans_a_goal_change():
+    n = 40
+    length, stride = 4, 2
+    pose2d = random_walk_pose2d(n, seed=2)
+    paths = [f"f{i}.png" for i in range(n)]
+    segment_index = [0] * 20 + [1] * 20
+    records = build_observation_records(
+        pose2d, paths, _chunk_cfg(length, stride), segment_index=segment_index
+    )
+    assert records
+    for rec in records:
+        idx = rec["frame_index"]
+        expected = segment_index[idx + length] != segment_index[idx]
+        assert rec["crosses_segment"] is expected
+        assert rec["segment_index"] == segment_index[idx]
+    # ...and it is a minority: only the chunks straddling frame 20.
+    crossing = [r for r in records if r["crosses_segment"]]
+    assert 0 < len(crossing) <= length // stride
+
+
+def test_a_single_segment_episode_never_crosses():
+    n = 30
+    records = build_observation_records(
+        random_walk_pose2d(n, seed=3), [f"f{i}.png" for i in range(n)],
+        _chunk_cfg(), segment_index=[0] * n,
+    )
+    assert records and not any(r["crosses_segment"] for r in records)
+
+
+def test_the_two_arrays_are_independent():
+    """A corpus may carry goals without segments or the reverse; neither implies the
+    other, and asking for one must not silently require the other."""
+    n = 30
+    pose2d = random_walk_pose2d(n, seed=4)
+    paths = [f"f{i}.png" for i in range(n)]
+    goals = [[1.0, 2.0, 0.0]] * n
+
+    only_goal = build_observation_records(pose2d, paths, _chunk_cfg(), goal2d=goals)
+    assert "obs_goal" in only_goal[0] and "segment_index" not in only_goal[0]
+
+    only_seg = build_observation_records(pose2d, paths, _chunk_cfg(),
+                                         segment_index=[0] * n)
+    assert "segment_index" in only_seg[0] and "obs_goal" not in only_seg[0]
+
+
+@pytest.mark.parametrize("name", ["goal2d", "segment_index"])
+def test_a_misaligned_extra_array_raises_naming_itself(name):
+    """The same guard `rgb_paths` gets: a length mismatch binds every later chunk to the
+    wrong goal, and it is silent all the way to training."""
+    n = 30
+    kwargs = {name: ([[0.0, 0.0, 0.0]] * 12 if name == "goal2d" else [0] * 12)}
+    with pytest.raises(ValueError, match=name):
+        build_observation_records(
+            random_walk_pose2d(n, seed=5), [f"f{i}.png" for i in range(n)],
+            _chunk_cfg(), **kwargs,
+        )
+
+
+def test_the_extra_arrays_do_not_disturb_the_chunks_themselves():
+    """Adding a goal column must not move an action chunk by a frame."""
+    n = 40
+    pose2d = random_walk_pose2d(n, seed=6)
+    paths = [f"f{i}.png" for i in range(n)]
+    plain = build_observation_records(pose2d, paths, _chunk_cfg())
+    withgoal = build_observation_records(pose2d, paths, _chunk_cfg(),
+                                         goal2d=[[0.0, 0.0, 0.0]] * n,
+                                         segment_index=[0] * n)
+    assert len(plain) == len(withgoal)
+    for a, b in zip(plain, withgoal):
+        for key in ("obs_index", "frame_index", "image", "obs_pose", "action_chunk"):
+            assert a[key] == b[key]

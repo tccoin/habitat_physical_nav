@@ -66,16 +66,31 @@ def build_row_for_episode(
     spacing_config: SpacingConfig,
     rng: np.random.Generator,
     stamped: Dict[str, Any],
+    boundary_policy: str = "drop",
 ) -> Optional[Dict[str, Any]]:
     """Turn one episode into a single dataset row, or ``None`` if the episode is
     too short to anchor even one full action chunk.
 
     ``images`` are left as the *relative* rgb_paths straight out of the
     metadata JSONL here; ``make_absolute`` (a ``.map`` step in ``main``, as in
-    the reference ``build_uniform_dataset.py``) prepends ``--image-root``."""
+    the reference ``build_uniform_dataset.py``) prepends ``--image-root``.
+
+    A PointNav episode additionally carries ``goal2d`` and ``segment_index``, which come
+    through as ``obs_goals`` / ``segment_indices``. An ObjectNav episode has neither and
+    gets neither -- the columns are absent rather than empty, so its table is byte-for-byte
+    what it was. Mixing the two tables is a *runtime* union that aligns the column sets;
+    forcing them to agree on disk would mean rebuilding every existing corpus."""
+    goal2d = episode.get("goal2d")
+    segment_index = episode.get("segment_index")
     obs_records = build_observation_records(
-        episode["pose2d"], episode["rgb_paths"], chunk_config, spacing_config, rng
+        episode["pose2d"], episode["rgb_paths"], chunk_config, spacing_config, rng,
+        goal2d=goal2d, segment_index=segment_index,
     )
+    if segment_index is not None and boundary_policy == "drop":
+        # A chunk spanning a goal change has a tail of motion toward the NEXT goal while
+        # its conditioning shows the current one. Physically valid, supervisorily not.
+        # Roughly 1% of rows at clen=10/stride=5; `keep` is available as an ablation.
+        obs_records = [rec for rec in obs_records if not rec.get("crosses_segment")]
     if not obs_records:
         return None
 
@@ -91,6 +106,10 @@ def build_row_for_episode(
         "obs_poses": [rec["obs_pose"] for rec in obs_records],
         "action_chunks": [rec["action_chunk"] for rec in obs_records],
     }
+    if goal2d is not None:
+        row["obs_goals"] = [rec["obs_goal"] for rec in obs_records]
+    if segment_index is not None:
+        row["segment_indices"] = [rec["segment_index"] for rec in obs_records]
     # Timing/limits block, in-band on every row: derived from the corpus's own
     # recorded rate, never from a default (see chunk_build).
     row.update(stamped)
@@ -103,6 +122,7 @@ def build_all_rows(
     chunk_config: ChunkConfig,
     spacing_config: SpacingConfig,
     max_length: Optional[int],
+    boundary_policy: str = "drop",
 ) -> List[Dict[str, Any]]:
     # One rng shared across every episode in the run (not reseeded per
     # episode) so the draws for episode 2 aren't a repeat of episode 1's --
@@ -123,7 +143,8 @@ def build_all_rows(
             if max_length is not None and len(episode["pose2d"]) > max_length:
                 continue
             n_episodes += 1
-            row = build_row_for_episode(episode, chunk_config, spacing_config, rng, stamped)
+            row = build_row_for_episode(episode, chunk_config, spacing_config, rng,
+                                        stamped, boundary_policy)
             if row is None:
                 n_dropped_short += 1
                 continue
@@ -192,7 +213,8 @@ def main() -> None:
     resolved, chunk_config, spacing_config = resolve_build_config(args, metadata_dir)
     print(describe_build(resolved, chunk_config, spacing_config))
 
-    rows = build_all_rows(metadata_dir, resolved, chunk_config, spacing_config, args.max_length)
+    rows = build_all_rows(metadata_dir, resolved, chunk_config, spacing_config,
+                          args.max_length, args.boundary_policy)
     if not rows:
         raise ValueError("No episode rows produced -- check --data-dir / --max-length.")
 

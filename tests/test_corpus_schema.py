@@ -34,7 +34,7 @@ from continuous_demos.recording_metadata import (
 )
 
 
-def make_params(num_cameras=1, phase_free=False, native_fps=25.0, width=640):
+def make_params(num_cameras=1, phase_free=False, native_fps=25.0, width=640, task=None):
     return params_for_generation(
         native_fps,
         image_width=width,
@@ -43,6 +43,7 @@ def make_params(num_cameras=1, phase_free=False, native_fps=25.0, width=640):
         num_cameras=num_cameras,
         phase_free=phase_free,
         physics_timestep=0.008,
+        task=task,
     )
 
 
@@ -60,8 +61,8 @@ def write_shard(path, params, n=2):
 # ---------------------------------------------------------------------------
 # the schema is additive: a version-1 shard still reads, with no migration
 # ---------------------------------------------------------------------------
-def test_schema_version_is_two():
-    assert SCHEMA_VERSION == 2
+def test_schema_version_is_three():
+    assert SCHEMA_VERSION == 3
 
 
 def test_a_version_one_record_reads_as_single_camera_segmented():
@@ -317,7 +318,92 @@ def test_shards_that_disagree_on_the_rig_are_refused(tmp_path):
 
 
 def test_describe_rig_reads_as_english():
-    assert make_params().describe_rig() == "1 camera, segmented"
+    assert make_params().describe_rig() == "objectnav, 1 camera, segmented"
     described = make_params(num_cameras=5, phase_free=True).describe_rig()
     assert "5 cameras" in described and "3200px strip" in described
     assert "phase-free" in described
+    assert described.startswith("objectnav, ")
+    assert make_params(task="pointnav").describe_rig() == "pointnav, 1 camera, segmented"
+
+
+# ---------------------------------------------------------------------------
+# `task`: None MEANS objectnav, and that is what keeps the existing corpora safe
+# ---------------------------------------------------------------------------
+# Schema 3 adds `task` to CONSISTENCY_KEYS so a PointNav corpus cannot be poured
+# into an ObjectNav one. The whole design rests on ObjectNav continuing to stamp
+# `None` rather than the string "objectnav": every corpus written before this
+# field existed reads back as None, and `_values_agree(None, None)` is True, so
+# they stay appendable by their own generator. Stamping the string instead would
+# make the entire v2_25hz lineage unappendable overnight. These pin that.
+def test_an_objectnav_run_writes_no_task_key_at_all(tmp_path):
+    """`as_dict` drops None, so a new ObjectNav record is byte-identical to an old one."""
+    assert "task" not in make_params().as_dict()
+    assert make_params().task is None
+    assert make_params().task_name == "objectnav"
+
+
+def test_a_pre_task_record_reads_back_as_objectnav():
+    v2 = {
+        "native_fps": 25.0, "dt_native": 0.04, "physics_timestep": 0.008,
+        "physics_steps_per_tick": 5.0, "on_physics_grid": True,
+        "v_max_mps": 2.0, "w_max_radps": 2.0, "num_cameras": 1,
+        "phase_free": False, "schema_version": 2,
+    }
+    params = params_from_record({RECORDING_KEY: v2})
+    assert params.task is None
+    assert params.task_name == "objectnav"
+
+
+def test_a_pre_task_shard_is_still_appendable_by_a_default_run(tmp_path):
+    """The v2_25hz-lineage guarantee. If this breaks, every shipped corpus is frozen."""
+    shard = tmp_path / "scene.jsonl"
+    legacy = RecordingParams(
+        native_fps=25.0, dt_native=0.04, physics_timestep=0.008,
+        physics_steps_per_tick=5.0, on_physics_grid=True,
+        v_max_mps=2.0, w_max_radps=2.0, schema_version=2,
+    )
+    write_shard(shard, legacy)
+    assert "task" not in legacy.as_dict()
+    assert_shard_is_appendable(shard, make_params())  # must not raise
+
+
+def test_a_pointnav_run_cannot_append_to_an_objectnav_shard(tmp_path):
+    shard = tmp_path / "scene.jsonl"
+    write_shard(shard, make_params())
+    with pytest.raises(RuntimeError) as excinfo:
+        assert_shard_is_appendable(shard, make_params(task="pointnav"))
+    assert "task" in str(excinfo.value)
+
+
+def test_an_objectnav_run_cannot_append_to_a_pointnav_shard(tmp_path):
+    shard = tmp_path / "scene.jsonl"
+    write_shard(shard, make_params(task="pointnav"))
+    with pytest.raises(RuntimeError) as excinfo:
+        assert_shard_is_appendable(shard, make_params())
+    assert "task" in str(excinfo.value)
+
+
+def test_a_pointnav_run_cannot_adopt_an_objectnav_output_dir(tmp_path):
+    """The per-directory refusal, not just the per-shard one."""
+    metadata = tmp_path / "metadata"
+    metadata.mkdir()
+    write_shard(metadata / "scene.jsonl", make_params())
+    assert_corpus_marker_agrees(tmp_path, metadata, make_params(), True)
+    with pytest.raises(UnsafeOutputDir) as excinfo:
+        assert_corpus_marker_agrees(tmp_path, metadata, make_params(task="pointnav"))
+    assert "task" in str(excinfo.value)
+
+
+def test_two_pointnav_runs_agree_with_each_other(tmp_path):
+    shard = tmp_path / "scene.jsonl"
+    write_shard(shard, make_params(task="pointnav"))
+    assert_shard_is_appendable(shard, make_params(task="pointnav"))  # must not raise
+    assert make_params(task="pointnav").as_dict()["task"] == "pointnav"
+
+
+def test_shards_that_disagree_on_the_task_are_refused_at_read_time(tmp_path):
+    write_shard(tmp_path / "a.jsonl", make_params())
+    write_shard(tmp_path / "b.jsonl", make_params(task="pointnav"))
+    with pytest.raises(Exception) as excinfo:
+        resolve_corpus_params(tmp_path)
+    assert "task" in str(excinfo.value)

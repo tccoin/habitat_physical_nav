@@ -234,3 +234,4 @@ videos/
 .claude/settings.local.json
 output/
 habitat-web/
+/recordings

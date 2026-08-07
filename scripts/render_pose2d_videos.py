@@ -171,7 +171,13 @@ def main() -> None:
     # is required for pre-schema corpora, which record no rate.
     fps = args.fps
     if fps is None:
-        fps = resolve_corpus_params(metadata_dir, flag_name="--fps").params.native_fps
+        # allow_multiview: this script plays the frames on disk back as they
+        # are. A panoramic corpus's frames ARE strips, and a video of the strip
+        # is exactly what someone checking a panoramic corpus wants to watch --
+        # nothing here interprets a frame as a single camera's view.
+        fps = resolve_corpus_params(
+            metadata_dir, flag_name="--fps", allow_multiview=True
+        ).params.native_fps
         print(f"Video fps: {fps:g} (from the corpus's recording block)")
 
     records = load_records(metadata_dir)

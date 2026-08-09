@@ -471,6 +471,13 @@ end" — a different question with its own failure modes, most of them silent.
 Full documentation, including all four extension points, is in
 **`docs/OBJECTNAV_EVAL.md`**; read it before changing anything here.
 
+**To run or reproduce a standard policy evaluation, read
+`docs/SAMPLE101_EVALS.md` first.** It is the one episode set, navmesh and command
+shape every closed-loop number since 2026-08-06 comes from, and it documents the two
+failure modes that produce plausible wrong numbers rather than errors: a `--gap` that
+does not match the checkpoint's corpus, and comparing budgets in policy steps rather
+than sim time.
+
 Entry points: `scripts/eval_objectnav_policy.py` (the harness) and
 `scripts/policy_server.py` (the model-environment half of the policy bridge —
 it imports only `objectnav_eval.bridge`, numpy + stdlib, because it runs in an
@@ -548,3 +555,92 @@ raises without one. Measured: 500 units is ~95 s of demonstration motion and
 achieved displacement, lag, undershoot ratio, controller saturation). It is a
 diagnostic and gates nothing; see
 `/Projects/spatial_training/dump/eval_system/FINDINGS.md` for what it measured.
+
+## PointNav rollout and evaluation
+
+Running a PointNav policy, as opposed to generating PointNav demonstrations
+(`docs/POINTNAV_GENERATION.md`). **It is 95% the ObjectNav stack.** A PointNav
+policy is a pose-injecting ObjectNav policy with a different system prompt, a
+goal announced by a user message carrying two `<pose>` markers, and goals that
+arrive repeatedly. Nothing here is a parallel stack; every piece either
+subclasses or is a registry entry.
+
+| file | what it adds |
+| --- | --- |
+| `objectnav_eval/goal_sources.py` | `GoalSource` — `next_goal(robot_sim, pose) -> [X, Y, theta] \| None`. `NavmeshGoalSource` (samples under the corpus's own `screen_segment`/`choose_island`), `ScriptedGoalSource`, `QueueGoalSource`. **The queue source is the GUI seam**; its module docstring states exactly what a GUI must implement and the two things a click on a map gets wrong (the frame, and a constant goal heading). No GUI is built — the box is headless. |
+| `objectnav_eval/pointnav.py` | `PointGoal`/`PointNavEpisode` — a point goal *is* the degenerate one-view-point ObjectNav episode, so success/SPL/soft-SPL/oracle/`DistanceToGoal` come from `continuous_demos.objectnav` unchanged. Plus `PointNavEpisodeSource` (`--episode-source pointnav`), the `goal_pursuit` control, and `pursuit_chunk`/`next_waypoint`. |
+| `scripts/pointnav_rollout.py` | Free-running mode: one scene, chained goals, an MP4 with `--layout {topdown,viewport,both}` (the same two `pointnav_debug_episode.py` offers), per-goal SPL. |
+| `bridge._PoseFeed(goal_placement=...)` | Feeds the interleaved value column PointNav trains on. |
+
+### The row order is the whole contract, and it lives in one place
+
+`<pose>` is one modality type; a goal is another occurrence of it, bound by
+occurrence order alone. So **the k-th `<pose>` marker in the text receives the
+k-th value row, and row 0 must be an AGENT pose** — that is what makes
+`relative_se2`'s anchor mean the same thing in a PointNav row as in an ObjectNav
+one.
+
+That order is defined **once**, in
+`longnav.utils.vector_rollout.modality_value_rows`, which
+`data_scripts/format_action_chunk_dataset.py` now imports rather than defines.
+`PointNavValueStream` in the same module is its incremental form, for a rollout
+that learns its next goal only on arrival, and the two are asserted equal row
+for row in `/Projects/spatial_training/tests/test_pose_injection.py`. The bridge
+uses the stream and never its own opinion;
+`tests/test_pointnav_rollout.py::TestPoseFeedRowOrder` drives `_PoseFeed` turn by
+turn and asserts the accumulated column equals the formatter's.
+
+**The bug this replaces**: `_PoseFeed` fed one row per turn and read
+`relative_se2_last`, i.e. the last row of the accumulated column. With only
+agent poses in it that row is the agent's, so ObjectNav was right by accident of
+the column's contents; interleave goal rows and "the last row" stops meaning
+"the agent's pose" while staying a well-formed three-vector. Agent rows and goal
+rows now go through one accumulator (`VectorRolloutPolicy.pose_rows` ->
+`relative_se2_tail`), so there is no second stream to be in a different frame.
+
+### Two flags, and why one of them exists
+
+* **`--goal-placement {segment,observation}`** is required for a PointNav
+  checkpoint and has no default beyond "ObjectNav". Unlike pose injection — which
+  is declared by the weights and therefore deliberately has no flag — the goal
+  placement is a property of the training *text* (`format_action_chunk_dataset.py
+  --goal-placement`) and is recorded nowhere in the checkpoint. Passing it wrong
+  writes the markers somewhere the model never saw them with the counts still
+  adding up.
+* **`--source-set FIELD=VALUE`** (repeatable) forwards extra kwargs to an episode
+  source's factory, so a source needing more than a path does not add a flag per
+  source to the shared CLI.
+
+### The evaluation set is a seed, not a file
+
+`PointNavEpisodeSource` generates episodes from `(seed, scene, index)` through
+`continuous_demos.pointnav.episode_seed`, so the seed *is* the split —
+reproducible with no artifact to lose, and extendable by raising
+`episodes_per_scene` without invalidating what is already in it. It samples on
+the navmesh **shipped with the scene** (a standalone `PathFinder`, no
+`Simulator` per scene in every worker), which is also what `--navmesh dataset`
+measures on; episodes the robot cannot reach are then screened with a reason
+code exactly as ObjectNav's are.
+
+```bash
+# watch it: chained goals, an MP4, no checkpoint needed
+python scripts/pointnav_rollout.py --policy goal_pursuit --layout both \
+    --scene hm3d/train/00000-kfPV7w3FaU5/kfPV7w3FaU5.basis.glb \
+    --scene-root /Projects/data/scene_datasets --max-goals 4
+
+# score it
+python scripts/eval_objectnav_policy.py --episode-source pointnav --distance-to POINT \
+    --episodes '/Projects/data/scene_datasets/hm3d/val/*/*.basis.glb' \
+    --source-set episodes_per_scene=5 --source-set seed=101 \
+    --scene-root /Projects/data/scene_datasets --success-distance 0.5 --auto-stop \
+    --goal-placement segment --ckpt <dir> \
+    --policy-python /workspace/conda/envs/longnav_vlm/bin/python \
+    --policy-sys-path /Projects/spatial_training/src
+```
+
+`--policy goal_pursuit` is a **control**, not a baseline, in exactly the sense
+`forward` and `zero` are: it is handed the goal (and, in the free-running script,
+the planned route) and only tells you whether the loop works. Given only the goal
+it drives the straight line and wedges against furniture the robot navmesh calls
+traversable — the same per-scene navmesh optimism `docs/POINTNAV_GENERATION.md`
+documents for generation.

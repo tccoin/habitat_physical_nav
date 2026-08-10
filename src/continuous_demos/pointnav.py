@@ -185,6 +185,23 @@ class PointNavSampleConfig:
 
     #: Draws per segment before giving up on it.
     segment_retries: int = 30
+
+    #: OFF (0) by default, which keeps the draw order byte-identical to every corpus cut
+    #: before this existed. When > 0, a segment draws a target distance uniformly from
+    #: ``[min_geodesic_m, max_geodesic_m]``, collects up to this many candidates that pass
+    #: the *same* screening, and keeps the one closest to the target.
+    #:
+    #: Why it exists: drawing a navigable point uniformly and accepting the first that
+    #: passes gives the distribution the *scene* has, not the one asked for. Measured over
+    #: six HM3D scenes, the geodesic between two random points on the same island has
+    #: median 5.6 m and reaches 30 m in 0.0% of draws -- so widening ``max_geodesic_m``
+    #: lengthens the tail but leaves the same short-skewed shape. Stratifying reweights
+    #: toward a flat spread, as far as the geometry allows and no further.
+    #:
+    #: It only ever *reweights*: every candidate in the pool already passed
+    #: ``screen_segment``, so this can never admit a goal an unstratified draw would have
+    #: rejected. Costs up to ``stratified_pool`` extra path plans per segment.
+    stratified_pool: int = 0
     #: Draws for the episode's spawn point.
     start_retries: int = 20
     #: Draw theta_0 uniformly rather than inheriting the navmesh sampler's arbitrary

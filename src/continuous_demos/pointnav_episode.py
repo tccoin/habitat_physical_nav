@@ -199,6 +199,15 @@ def sample_segment(
     """
     rejections: Dict[str, int] = {}
     start = np.asarray(start_3d, dtype=np.float32)
+    # Stratification draws its target BEFORE the loop, so the rng is consumed in a fixed
+    # order regardless of how many candidates get rejected.
+    stratify = int(config.stratified_pool) > 0
+    target_m = (
+        float(rng.uniform(config.min_geodesic_m, config.max_geodesic_m))
+        if stratify
+        else None
+    )
+    pool: List[Tuple[float, _Segment]] = []
     for _ in range(int(config.segment_retries)):
         if max_radius_m is not None and max_radius_m > 0:
             goal = pathfinder.get_random_navigable_point_near(
@@ -238,18 +247,29 @@ def sample_segment(
             continue
 
         goal_theta = pn.path_tangent_heading(path_xy, at="end")
-        return (
-            _Segment(
-                goal_habitat=goal,
-                goal2d=[float(goal[0]), float(-goal[2]), float(goal_theta)],
-                path_3d=points,
-                path_xy=path_xy,
-                geodesic_m=geodesic,
-                turn_rad=turn,
-                rejections=dict(rejections),
-            ),
-            rejections,
+        segment = _Segment(
+            goal_habitat=goal,
+            goal2d=[float(goal[0]), float(-goal[2]), float(goal_theta)],
+            path_3d=points,
+            path_xy=path_xy,
+            geodesic_m=geodesic,
+            turn_rad=turn,
+            rejections=dict(rejections),
         )
+        if not stratify:
+            return segment, rejections
+        # Keep collecting rather than taking the first acceptable goal: the whole point is
+        # to choose among candidates, and the first one is distributed exactly the way the
+        # scene's geometry is -- which is what stratification exists to correct.
+        pool.append((abs(geodesic - target_m), segment))
+        if len(pool) >= int(config.stratified_pool):
+            break
+
+    if pool:
+        # Nearest to the sampled target. Every candidate here already passed the same
+        # screening an unstratified draw applies, so this only reweights, never admits.
+        best = min(pool, key=lambda item: item[0])[1]
+        return best, rejections
     return None, rejections
 
 

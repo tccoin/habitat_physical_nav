@@ -74,6 +74,41 @@ consequences the rest of the design honours:
   `outcome="rolled_back"`. A corpus that hid them would read cleaner than the scenes are,
   and every threshold re-cut from a pilot would be fit to a lie.
 
+### `--stratified-pool N` — how far the goals are, as a choice rather than an accident
+
+Default `0`, which is the original behaviour: draw a navigable point, screen it, keep the
+first that passes. That returns the distance distribution the **scene** has, not the one
+the window asks for. Measured over six HM3D scenes (4,000 same-island point pairs each),
+the geodesic between two random points has median 5.6 m, reaches 15 m in 7.1% of draws and
+**30 m in 0.0%** — so raising `--max-geodesic` from 8 to 30 lengthens the tail without
+changing the short-skewed shape, and is nearly indistinguishable from raising it to 15.
+
+`N > 0` draws a target distance uniformly from `[--min-geodesic, --max-geodesic]`, pools up
+to `N` candidates that pass the **same** screening, and keeps the one nearest the target.
+It only ever reweights: no setting can admit a goal an unstratified draw would reject.
+
+Measured on 4 scenes x 8 episodes of 2000 frames, matched seed:
+
+| setting | segment geodesic (med) | agent→goal (med / p90 / max) | segments/episode |
+| --- | --- | --- | --- |
+| `1.5–8`, pool 0 (production) | 4.03 | 2.76 / 5.70 / 7.96 | 21.2 |
+| `2–30`, pool 0 | 4.91 | 3.59 / 8.51 / 16.40 | 17.0 |
+| `2–15`, pool 0 | 4.91 | 3.55 / 8.18 / 13.55 | 17.3 |
+| `2–15`, pool 24 | 7.21 | 4.37 / 9.11 / 13.57 | 14.9 |
+| `2–30`, pool 24 | **10.59** | **5.70 / 12.25 / 18.55** | 11.8 |
+
+The cost is fewer goals per episode at a fixed frame budget — a longer goal takes longer to
+reach — so this trades goal-announcement count against goal distance. Yield falls slightly
+too (26/32 kept against 28/32).
+
+**What it does not fix.** The pose the encoder receives is anchor-relative
+(`relative_se2` against the episode's first observation), and *that* distribution is
+almost invariant across all five settings above: median 3.80 → 4.98 m, max 18.5 → 17.8 m.
+With 12–21 chained segments the robot covers the scene either way, so the anchor-relative
+extent is bounded by **scene diameter**, not by goal distance. No goal-sampling setting
+reaches beyond it; that ceiling is a property of indoor scenes and has to be answered on
+the encoder side rather than here.
+
 ## What the gates actually catch
 
 Measured over a 72-episode MP3D pilot and the first 160 episodes of the HM3D run:

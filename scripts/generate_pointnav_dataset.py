@@ -181,6 +181,7 @@ def build_configs(args):
         max_height_delta_m=args.max_height_delta,
         min_turn_deg=args.min_turn_deg,
         segment_retries=args.segment_retries,
+        stratified_pool=args.stratified_pool,
         tail_speed_mps=args.tail_speed_mps,
     )
     failure_config = DriveFailureConfig(
@@ -440,6 +441,13 @@ def parse_args(argv=None):
     sample.add_argument("--min-geodesic", type=float, default=1.5)
     sample.add_argument("--max-geodesic", type=float, default=8.0)
     sample.add_argument("--min-euclid", type=float, default=1.0)
+    sample.add_argument("--stratified-pool", type=int, default=0,
+                        help="0 (default) draws goals uniformly on the navmesh and takes "
+                             "the first that screens clean, which yields the distance "
+                             "distribution the scene happens to have. N>0 draws a target "
+                             "distance uniformly from [min,max] geodesic, pools up to N "
+                             "candidates that pass the same screening, and keeps the one "
+                             "nearest the target -- a flatter spread, never a laxer one")
     sample.add_argument("--max-height-delta", type=float, default=0.5)
     sample.add_argument("--min-turn-deg", type=float, default=0.0,
                         help="off by default: gating on it deletes straight corridors, "

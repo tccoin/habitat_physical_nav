@@ -56,6 +56,7 @@ PASSTHROUGH_FLAGS = (
     "fps", "width", "height", "panoramic", "urdf-path", "image-ext",
     "corpus-seed", "min-island-area", "min-island-radius",
     "min-geodesic", "max-geodesic", "min-euclid", "max-height-delta", "min-turn-deg",
+    "stratified-pool",
     "segment-retries", "tail-speed-mps", "goal-threshold", "min-segment-spl",
     "segment-rollbacks", "time-backstop-s", "fall-speed-mps", "fall-duration-s",
     "ref-miss-flag-m", "reject-ref-miss-s",
@@ -240,6 +241,12 @@ def main(argv=None) -> int:
     gen.add_argument("--min-island-radius", type=float, default=None)
     gen.add_argument("--min-geodesic", type=float, default=None)
     gen.add_argument("--max-geodesic", type=float, default=None)
+    gen.add_argument("--stratified-pool", type=int, default=None,
+                     help="see generate_pointnav_dataset.py: 0/unset draws goals uniformly "
+                          "on the navmesh, N>0 draws a target distance uniformly from "
+                          "[min,max] geodesic and keeps the nearest of N screened "
+                          "candidates. Without it, widening --max-geodesic lengthens the "
+                          "tail but leaves the scene's own short-skewed shape")
     gen.add_argument("--min-euclid", type=float, default=None)
     gen.add_argument("--max-height-delta", type=float, default=None)
     gen.add_argument("--min-turn-deg", type=float, default=None)

@@ -42,6 +42,11 @@ from objectnav_eval.episodes import (  # noqa: E402
     select_by_uid,
 )
 from objectnav_eval.harness import dry_run, run_episodes  # noqa: E402
+
+# Imported for its registrations: the `pointnav` episode source and the `goal_pursuit`
+# control. A registry entry is not worth a plugin loader, and importing it here rather
+# than from `episodes.py` keeps the dependency pointing the way the package does.
+import objectnav_eval.pointnav  # noqa: E402,F401
 from objectnav_eval.parallel import (  # noqa: E402
     read_shard_spec,
     run_parallel,
@@ -59,7 +64,12 @@ SERVER_SCRIPT = Path(__file__).resolve().parent / "policy_server.py"
 
 
 def load_selected(config: EvalConfig):
-    source = build_episode_source(config.episode_source, path=config.episodes)
+    # `source_kwargs` is empty for every source that takes only a path, so this is the
+    # same call it always was; a source needing more (PointNav needs a seed and a count)
+    # gets it from `--source-set` rather than from a flag per source on this CLI.
+    source = build_episode_source(
+        config.episode_source, path=config.episodes, **(config.source_kwargs or {})
+    )
     episodes = source.load()
     selection = EpisodeFilter(
         **config.selection_lists(),

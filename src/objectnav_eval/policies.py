@@ -36,6 +36,20 @@ class Observation:
     step: int
     pose: np.ndarray  # planar [X, Y, theta]; proprioceptive policies may use it
     sim_time: float
+    # PointNav's point goal, planar [X, Y, theta], in the SAME raw scene frame as
+    # `pose` -- they are two rows of one value column and the frame conversion happens
+    # once, on the model side. None on every ObjectNav rollout, where the goal is the
+    # category string in `goal`. A goal that changes mid-episode is a new goal
+    # announcement; see objectnav_eval.goal_sources.
+    goal_pose: Optional[np.ndarray] = None
+    # The navmesh route to that goal, planar (M, 2), when whatever chose the goal also
+    # planned one. **For controls and diagnostics only, and it deliberately never
+    # crosses the bridge**: a learned policy that could read the plan would not be
+    # solving the task, and no training conversation contains one. `BridgedPolicy` and
+    # `InProcessPolicy` therefore do not forward it -- it is here so an image-blind
+    # control can be a useful stand-in (drive the route) rather than a wall-finder
+    # (drive the straight line).
+    goal_path: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -145,7 +159,7 @@ class BridgedPolicy(Policy):
         # The pose goes over the wire on every step, whatever the checkpoint is.
         # Deciding here would mean the simulator side knowing which checkpoints
         # inject pose, and it is three floats next to a full RGB frame.
-        reply = self.bridge.act(obs.rgb, pose=obs.pose)
+        reply = self.bridge.act(obs.rgb, pose=obs.pose, goal=obs.goal_pose)
         self._last_stats = reply["stats"]
         return ActionChunk(reply["chunk"], stop=reply["stop"], stats=reply["stats"])
 
@@ -173,7 +187,8 @@ class InProcessPolicy(Policy):
 
     def act(self, obs: Observation) -> ActionChunk:
         chunk = self.backend.act(
-            np.ascontiguousarray(obs.rgb, dtype=np.uint8), pose=obs.pose
+            np.ascontiguousarray(obs.rgb, dtype=np.uint8), pose=obs.pose,
+            goal=obs.goal_pose,
         )
         return ActionChunk(
             chunk, stop=self.backend.wants_stop(), stats=dict(self.backend.last_stats)
@@ -301,4 +316,13 @@ def _stop_head_args(config: Any) -> Dict[str, Any]:
     if getattr(config, "pose_foreign", None):
         args["pose_foreign"] = config.pose_foreign
         args["pose_foreign_split"] = getattr(config, "pose_foreign_split", "train")
+    # PointNav's goal placement. Omitted unless set, so an ObjectNav run produces
+    # exactly the command line it always did.
+    if getattr(config, "goal_placement", None):
+        args["goal_placement"] = config.goal_placement
+    # Diagnostic, omitted unless set, so an ordinary run's command line is unchanged.
+    if getattr(config, "anchor_offset", None):
+        args["anchor_offset"] = config.anchor_offset
+    if getattr(config, "no_pose_injection", False):
+        args["no_pose_injection"] = True
     return args

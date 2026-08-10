@@ -197,6 +197,83 @@ def draw_goal_in_view(
     return out
 
 
+#: Colour of the commanded action chunk. Matches `topdown.COLOR_COMMANDED`, so green means
+#: "what the model asked for" in both visualisations.
+COMMANDED_COLOR = (28, 168, 88)
+
+#: How far off the floor a commanded chunk is drawn, metres. **Not cosmetic.** The shipped
+#: camera sits at 1.1 m with a 63.6 deg vertical field of view, so the floor first enters
+#: frame at ``1.1 / tan(31.8 deg) = 1.77 m``. A chunk is `action_chunk_len * dt_native` of
+#: motion -- 0.8 s, well under a metre, at the shipped 2.5 Hz build -- so drawn at floor
+#: level it is *always* below the bottom edge and the overlay renders nothing at all.
+#: Lifting trades positional literalness for being visible; it is a debug overlay.
+COMMANDED_LIFT_M = 0.85
+
+
+def chunk_to_world_xy(anchor_pose: Any, chunk: Any) -> Optional[np.ndarray]:
+    """A policy's relative action chunk -> planar world points ``(L+1, 2)``, or None.
+
+    ``chunk`` may be an object with a ``poses`` attribute (what every backend returns) or
+    a bare array. Composition uses
+    :func:`continuous_demos.action_chunking.relative_to_pose`, the exact inverse of the
+    transform the training targets were built with, so this draws the model's own output
+    rather than a re-derivation of it. The anchor is prefixed so the stub starts at the
+    robot rather than a chunk-length away from it.
+
+    Never raises: a control that emits something unshaped simply draws nothing. A debug
+    overlay must not be able to take down a rollout.
+    """
+    from continuous_demos.action_chunking import relative_to_pose
+
+    poses = getattr(chunk, "poses", chunk)
+    if poses is None:
+        return None
+    try:
+        rel = np.asarray(poses, dtype=float).reshape(-1, 3)
+        anchor = np.asarray(anchor_pose, dtype=float).reshape(3)
+    except Exception:
+        return None
+    if rel.shape[0] == 0:
+        return None
+    world = np.stack([relative_to_pose(anchor, r) for r in rel])
+    return np.vstack([anchor[None, :2], world[:, :2]])
+
+
+def draw_commanded_chunk(
+    rgb: np.ndarray,
+    robot_sim,
+    anchor_pose: Any,
+    chunk: Any,
+    *,
+    sensor_uuid: str = "color_sensor",
+    lift_m: float = COMMANDED_LIFT_M,
+    color: Sequence[int] = COMMANDED_COLOR,
+    thickness: int = 4,
+) -> np.ndarray:
+    """Draw a policy's commanded chunk into the frame it was emitted for.
+
+    The whole overlay in one call, so a caller only has to hold the last chunk and the
+    pose it was emitted at. Returns ``rgb`` unchanged whenever anything is missing -- no
+    sensor, no chunk, an unshaped chunk -- for the reason above.
+
+    Cheap enough to leave on: one 4x4 inverse, an (L+1)-point projection and one
+    ``cv2.polylines``, against ~3 ms for the render that produced the frame.
+    """
+    from continuous_demos.robot_pose import navmesh_height
+
+    xy = chunk_to_world_xy(anchor_pose, chunk)
+    if xy is None or xy.shape[0] < 2:
+        return rgb
+    camera = camera_matrix(robot_sim, sensor_uuid)
+    if camera is None:
+        return rgb
+    cam_to_world, (_w, _h, hfov) = camera
+    height = navmesh_height(robot_sim)
+    world_3d = np.stack([xy[:, 0], np.full(xy.shape[0], height), -xy[:, 1]], axis=1)
+    return draw_path_in_view(rgb, world_3d, cam_to_world, hfov, color=color,
+                             thickness=thickness, lift_m=lift_m)
+
+
 def annotate_view(
     rgb: np.ndarray,
     robot_sim,

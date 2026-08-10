@@ -337,8 +337,9 @@ def test_pose_survives_the_socket():
         def reset(self, goal_text=None):
             seen.append(("reset", goal_text))
 
-        def act(self, rgb, pose=None):
-            seen.append(("act", None if pose is None else list(pose)))
+        def act(self, rgb, pose=None, goal=None):
+            seen.append(("act", None if pose is None else list(pose),
+                         None if goal is None else list(goal)))
             return np.zeros((10, 3), dtype=np.float32)
 
     import tempfile
@@ -356,6 +357,10 @@ def test_pose_survives_the_socket():
         conn.send({
             "cmd": CMD_ACT, "shape": rgb.shape, "dtype": "uint8", "data": rgb.tobytes(),
             "pose": [3.25, -4.5, 1.125],
+            # PointNav's point goal rides the same message, for the same reason: it is
+            # another row of the same value column and the frame conversion happens once,
+            # on the model side.
+            "goal": [7.5, 2.0, -0.25],
         })
         reply = conn.recv()
         assert "error" not in reply, reply
@@ -372,7 +377,10 @@ def test_pose_survives_the_socket():
         conn.close()
         listener.close()
 
-    assert seen == [("act", [3.25, -4.5, 1.125]), ("act", None)]
+    assert seen == [
+        ("act", [3.25, -4.5, 1.125], [7.5, 2.0, -0.25]),
+        ("act", None, None),
+    ]
 
 
 def test_bridged_policy_sends_the_observation_pose():
@@ -392,8 +400,9 @@ def test_bridged_policy_sends_the_observation_pose():
         def reset(self, goal):
             pass
 
-        def act(self, rgb, pose=None):
+        def act(self, rgb, pose=None, goal=None):
             sent["pose"] = pose
+            sent["goal"] = goal
             return {"chunk": np.zeros((10, 3)), "stop": False, "stats": {}}
 
     pose = np.array([12.5, -3.25, 0.5])
@@ -402,6 +411,16 @@ def test_bridged_policy_sends_the_observation_pose():
                     pose=pose, sim_time=0.0)
     )
     np.testing.assert_array_equal(np.asarray(sent["pose"], dtype=float), pose)
+    # An ObjectNav observation carries no point goal, so none is sent -- the PointNav
+    # additions have to be invisible on the path that has always worked.
+    assert sent["goal"] is None
+
+    goal = np.array([1.0, 2.0, 0.75])
+    BridgedPolicy(_FakeBridge()).act(
+        Observation(rgb=np.zeros((2, 2, 3), np.uint8), goal=None, step=0,
+                    pose=pose, sim_time=0.0, goal_pose=goal)
+    )
+    np.testing.assert_array_equal(np.asarray(sent["goal"], dtype=float), goal)
 
 
 # ---------------------------------------------------------------------------

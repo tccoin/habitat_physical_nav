@@ -96,6 +96,8 @@ metric or diagnostic is an addition rather than an edit.
 | Module | Responsibility |
 | --- | --- |
 | `episodes.py` | `EvalEpisode`, the `EpisodeSource` interface + registry, `EpisodeFilter`. |
+| `pointnav.py` | PointNav as a one-goal ObjectNav episode: `PointGoal`, `PointNavEpisodeSource`, the `goal_pursuit` control. |
+| `goal_sources.py` | `GoalSource`: where the *next* point goal comes from, for the free-running rollout. The seam a GUI would drive. |
 | `navmesh.py` | Scene/navmesh resolution, `robot_position_3d`, geodesic queries. |
 | `screening.py` | Which episodes this robot can win, with machine-readable reasons. |
 | `policies.py` | `Policy` / `Observation` / `ActionChunk`, the image-blind controls, the registry. |
@@ -116,7 +118,22 @@ metric or diagnostic is an addition rather than an edit.
 **A new dataset.** Subclass `EpisodeSource`, return `EvalEpisode`s, and
 `register_source("mydata", MySource)`. Then `--episode-source mydata`. The only
 contracts are that `uid` is unique across the whole return value and
-`view_points` is an `(N, 3)` array in the habitat world frame.
+`view_points` is an `(N, 3)` array in the habitat world frame. A source needing
+more than a path takes it from `--source-set FIELD=VALUE` (repeatable), which is
+forwarded to the factory as keyword arguments — rather than adding a flag per
+source to this CLI. `objectnav_eval.pointnav.PointNavEpisodeSource` is the
+worked example: `--episode-source pointnav --source-set episodes_per_scene=5
+--source-set seed=101`.
+
+**A different task.** PointNav is one, and it is deliberately not a second
+harness: a point goal is the degenerate one-view-point ObjectNav episode, so
+`objectnav_eval/pointnav.py` supplies an episode object habitat's measures can
+read and nothing else changes — `success`, `spl`, `soft_spl`, `oracle_*`,
+`npwpl`, the budget and every probe are the same code computing the same
+statistic. The two things it does add are a goal fed *per step* rather than as a
+category string (`Observation.goal_pose`, forwarded over the bridge) and
+`--goal-placement`, which tells the model side where the goal's `<pose>` marker
+sits. See `CLAUDE.md` "PointNav rollout and evaluation".
 
 **A new policy head type** (e.g. a normalizing-flow head). Implement
 `bridge.PolicyBackend` — `reset`, `act(rgb, pose=None) -> (T, 3)`, optionally
@@ -200,6 +217,16 @@ head](POSE_INJECTION_EVAL.md) for the full writeup.
   same function the training collator calls, never a copy of it. There is no
   flag: a flag could disagree with the weights. Checkpoints without such a spec
   take the identical code path they always did.
+* **A point goal.** `--goal-placement` switches the same `_PoseFeed` to the
+  interleaved value column PointNav trains on: a goal is another occurrence of
+  the *same* `<pose>` marker, so agent rows and goal rows go through one
+  accumulator and `relative_se2` anchors on row 0 of the column training saw.
+  This one **does** need a flag, for the opposite reason pose does not: the
+  placement is a property of how the corpus's text was written
+  (`format_action_chunk_dataset.py --goal-placement`) and is recorded nowhere in
+  the checkpoint. The row order itself is never decided here — it comes from
+  `longnav.utils.vector_rollout.PointNavValueStream`, the incremental form of the
+  `modality_value_rows` the training formatter imports.
 * **Stop.** `bridge._StopHeadControl` finds `model.stop_head`. The stop
   probability and its logit are recorded every step regardless; `--stop-head` is
   what lets the decision actually end an episode. It is mutually exclusive with

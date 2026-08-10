@@ -44,6 +44,7 @@ from objectnav_eval.navmesh import robot_position_3d
 from objectnav_eval.policies import ActionChunk, Observation, Policy
 from objectnav_eval.probes import GoalDistanceProbe, RolloutProbe, TrackingDiagnostic
 from objectnav_eval.screening import ScreenResult
+from continuous_demos.viewport_overlay import draw_commanded_chunk
 from objectnav_eval.video import OverlayState, Recorder, annotate
 
 # Metrics lifted out of the task and reported per episode. Adding a measure to
@@ -127,6 +128,13 @@ class EpisodeRunner:
         goal_probe = GoalDistanceProbe()
         goal_probe.reset(episode)
 
+        # A point goal, when the episode source supplies one. Read once: it is a property
+        # of the episode, not of the tick, and re-reading it per step would be the seam a
+        # chained goal source belongs at -- which is the interactive rollout's job
+        # (scripts/pointnav_rollout.py), not this runner's.
+        goal_pose = (episode.extra or {}).get("goal2d")
+        goal_pose = None if goal_pose is None else np.asarray(goal_pose, dtype=np.float64)
+
         start_distance = float(start_metrics["distance_to_goal"])
         # Path length at the moment of closest approach, frozen the same way
         # `OracleSPL` freezes it at first success. Both halves of `npwpl` have to
@@ -200,7 +208,7 @@ class EpisodeRunner:
             if config.record_video and record.tick_in_chunk < ctx.executor.gap - 1:
                 recorder.add(
                     annotate(
-                        self._render(),
+                        self._overlay(config, ctx, self._render()),
                         OverlayState(
                             step=record.chunk_index, sim_time=record.sim_time,
                             goal=episode.object_category, distance=distance,
@@ -251,7 +259,7 @@ class EpisodeRunner:
                 if config.record_video:
                     recorder.add(
                         annotate(
-                            rgb,
+                            self._overlay(config, ctx, rgb),
                             OverlayState(
                                 step=step, sim_time=ctx.executor.sim_time,
                                 goal=episode.object_category, distance=distance,
@@ -268,6 +276,12 @@ class EpisodeRunner:
                     step=step,
                     pose=ctx.robot_sim.get_2d_pose(),
                     sim_time=ctx.executor.sim_time,
+                    # PointNav's point goal, constant for the whole episode -- one goal
+                    # per episode is the degenerate case of the chained structure the
+                    # demonstrations have, so the policy is announced one goal at step 0
+                    # and nothing here has to know about chaining. `None` for every
+                    # ObjectNav episode, whose sources set no `goal2d`.
+                    goal_pose=goal_pose,
                 )
                 # Sampled at *observation* time, because that is the frame the
                 # classifier looked at. Checking the post-chunk distance instead
@@ -275,6 +289,10 @@ class EpisodeRunner:
                 # seen when it decided.
                 distance_when_asked = distance
                 chunk = ctx.policy.act(observation)
+                # Held for the overlay only, and only when it is switched on: the frames
+                # drawn after this point belong to the chunk emitted here.
+                if config.record_video and config.overlay_chunk:
+                    self._last_chunk = (observation.pose, chunk)
                 latencies.append(float(chunk.stats.get("latency_s", float("nan"))))
                 if chunk.stats.get("stop_prob") is not None:
                     if stop_trace is None:
@@ -371,6 +389,23 @@ class EpisodeRunner:
     def _render(self) -> np.ndarray:
         obs = self.ctx.robot_sim.get_obs()[self.ctx.config.sensor_uuid]
         return np.asarray(obs)[..., :3]
+
+    def _overlay(self, config, ctx, rgb: np.ndarray) -> np.ndarray:
+        """The commanded chunk drawn into a frame, when `--overlay-chunk` asked for it.
+
+        Returns `rgb` untouched when the flag is off or no chunk has been emitted yet, so
+        the default video is exactly the frame it always was. `draw_commanded_chunk` is
+        itself total -- a missing sensor or an unshaped chunk draws nothing rather than
+        raising -- because a diagnostic must never be able to fail a rollout.
+        """
+        if not getattr(config, "overlay_chunk", False):
+            return rgb
+        last = getattr(self, "_last_chunk", None)
+        if last is None:
+            return rgb
+        anchor, chunk = last
+        return draw_commanded_chunk(rgb, ctx.robot_sim, anchor, chunk,
+                                    sensor_uuid=config.sensor_uuid)
 
     def _euclidean_to_goal(self, episode: EvalEpisode) -> float:
         """Straight-line distance to the nearest view point.

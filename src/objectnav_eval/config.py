@@ -31,6 +31,12 @@ class EvalConfig:
     # -- data ---------------------------------------------------------------
     episodes: str = ""
     episode_source: str = "objectnav"
+    # Extra keyword arguments handed to the episode source's factory, from repeatable
+    # `--source-set FIELD=VALUE`. The registry has always been an extension point; this
+    # is how a source that needs more than a path (PointNav needs a seed and an episode
+    # count) gets it without a flag per source on the shared CLI. Empty for
+    # `--episode-source objectnav`, which takes only a path.
+    source_kwargs: Dict[str, Any] = field(default_factory=dict)
     scene_root: str = "data/scene_datasets"
     output_dir: str = "dump/objectnav_eval"
 
@@ -103,6 +109,11 @@ class EvalConfig:
 
     # -- video --------------------------------------------------------------
     record_video: bool = False
+    #: Draw the policy's commanded action chunk into each recorded frame. Default OFF, so
+    #: an existing run's video is byte-identical to what it always was. It is a diagnostic
+    #: and gates nothing: it shows what the model ASKED for next to where the robot went,
+    #: which separates "the policy is aimed at a wall" from "the controller is stuck".
+    overlay_chunk: bool = False
     video_scale: float = 1.0
 
     # -- policy -------------------------------------------------------------
@@ -177,6 +188,23 @@ class EvalConfig:
     # no information about where the robot actually is.
     pose_foreign: Optional[str] = None
     pose_foreign_split: str = "train"
+    # POINTNAV. Where the goal's `<pose>` marker sits in the conversation, which must be
+    # the placement the CORPUS was formatted with (`format_action_chunk_dataset.py
+    # --goal-placement`). Unlike pose injection this DOES need a flag, and for the
+    # opposite reason: pose is declared by the weights (a modality spec), while the goal
+    # placement is a property of how the training text was written and is recorded
+    # nowhere in the checkpoint. Unset = ObjectNav.
+    goal_placement: Optional[str] = None
+    # DIAGNOSTIC "DX,DY[,DTHETA_RAD]". Moves the origin `relative_se2` anchors on, so the
+    # same physical task can be run with the pose values expressed far from, or rotated
+    # against, the frame. Deliberately not a corruption: the agent-to-goal geometry is
+    # preserved exactly and the model's context is byte-identical (the seeded anchor row
+    # is never emitted), so a success-rate difference is attributable to the frame alone.
+    anchor_offset: Optional[str] = None
+    # Evaluate the POSE-FREE arm of a mixture trained with and without pose injection:
+    # no <pose> marker rendered, no values supplied. Distinct from the pose-* ablations,
+    # which corrupt the values rather than removing the modality.
+    no_pose_injection: bool = False
     stop_temperature: Optional[float] = None
     stop_threshold: Optional[float] = None
     stop_inference: Optional[str] = None
@@ -371,6 +399,11 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                         help="ObjectNav split dir (with content/*.json.gz) or a .json.gz")
     parser.add_argument("--episode-source", default="objectnav",
                         help="episode source kind (see objectnav_eval.episodes)")
+    parser.add_argument("--source-set", action="append", default=[], metavar="FIELD=VALUE",
+                        help="extra keyword for the episode source's factory, repeatable "
+                             "(e.g. --source-set episodes_per_scene=5 --source-set "
+                             "seed=7). Ints/floats/bools are converted; everything else "
+                             "stays a string. Unused by --episode-source objectnav")
     parser.add_argument("--scene-root", default="data/scene_datasets")
     parser.add_argument("--output-dir", default="dump/objectnav_eval")
 
@@ -494,6 +527,15 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                      help="one MP4 per episode, one frame per control tick, so playback at "
                           "1/--dt fps is real time")
     vid.add_argument("--video-scale", type=float, default=1.0)
+    vid.add_argument("--overlay-chunk", action="store_true",
+                     help="draw the policy's commanded action chunk into each recorded "
+                          "frame -- what the model ASKED for, next to where the robot "
+                          "actually went. Separates 'the policy is aimed at a wall' from "
+                          "'the controller is stuck', which the RGB alone cannot. Drawn "
+                          "lifted off the floor because the camera sits at 1.1 m and the "
+                          "floor only enters frame beyond 1.77 m, so a chunk (under a "
+                          "metre long) would otherwise never be visible. Off by default: "
+                          "it is a diagnostic and gates nothing")
 
     mdl = parser.add_argument_group("policy")
     mdl.add_argument("--policy", default="model",
@@ -577,6 +619,26 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                           "--max-steps, so the walk stays continuous")
     mdl.add_argument("--pose-foreign-split", default="train",
                      help="split of --pose-foreign to draw from")
+    mdl.add_argument("--no-pose-injection", action="store_true",
+                     help="make the pose feed inert on a pose-declaring checkpoint: no "
+                          "<pose> marker and no values. The pose-free arm of a mixed "
+                          "run, not a corruption ablation")
+    mdl.add_argument("--anchor-offset", default=None,
+                     help="DIAGNOSTIC 'DX,DY[,DTHETA_RAD]'. Moves the origin "
+                          "relative_se2 anchors on, WITHOUT changing the model's "
+                          "context: the seeded row is never emitted, so the text, "
+                          "images, marker count and injected-row count are all "
+                          "identical and only the pose values move. Answers whether "
+                          "the same task gets harder from a distant/rotated anchor")
+    mdl.add_argument("--goal-placement", default=None,
+                     choices=["segment", "observation"],
+                     help="POINTNAV: where the goal's <pose> marker sits. Must match the "
+                          "placement the corpus was formatted with "
+                          "(format_action_chunk_dataset.py --goal-placement) -- it is a "
+                          "property of the training TEXT, not of the weights, so nothing "
+                          "in the checkpoint can be consulted and passing it wrong writes "
+                          "the markers somewhere the model never saw them with the counts "
+                          "still adding up. Unset = ObjectNav")
     mdl.add_argument("--stop-requires-oracle", action="store_true",
                      help="the classifier may only end an episode at a step where the "
                           "agent is ALREADY within --success-distance. Its false "
@@ -640,7 +702,35 @@ def config_from_args(args: argparse.Namespace) -> EvalConfig:
     known = {f.name for f in fields(EvalConfig)}
     values = {k: v for k, v in vars(args).items() if k in known}
     values["pid_overrides"] = _parse_pid_set(getattr(args, "pid_set", []))
+    values["source_kwargs"] = _parse_source_set(getattr(args, "source_set", []))
     return EvalConfig(**values)
+
+
+def _parse_source_set(entries) -> Dict[str, Any]:
+    """``["episodes_per_scene=5", "seed=7"]`` -> ``{"episodes_per_scene": 5, "seed": 7}``.
+
+    Numbers and booleans are converted, because a source's factory signature expects
+    them and ``"5"`` silently means something different to ``range`` than ``5`` does.
+    Anything that is neither stays a string, so a path or a glob passes through intact.
+    """
+    out: Dict[str, Any] = {}
+    for entry in entries or []:
+        if "=" not in entry:
+            raise ValueError(f"--source-set wants FIELD=VALUE, got {entry!r}")
+        name, _, raw = entry.partition("=")
+        raw = raw.strip()
+        if raw.lower() in ("true", "false"):
+            value: Any = raw.lower() == "true"
+        else:
+            try:
+                value = int(raw)
+            except ValueError:
+                try:
+                    value = float(raw)
+                except ValueError:
+                    value = raw
+        out[name.strip()] = value
+    return out
 
 
 def _parse_pid_set(entries) -> Dict[str, Any]:

@@ -80,6 +80,30 @@ def main() -> None:
                         help="pose-information ablation: inject another episode's pose "
                              "sequence, sampled from this load_from_disk() dataset")
     parser.add_argument("--pose-foreign-split", default="train")
+    parser.add_argument("--no-pose-injection", action="store_true",
+                        help="make the pose feed INERT on a checkpoint that declares a "
+                             "pose spec: no <pose> marker in the rendered turn and no "
+                             "values supplied. This is the pose-free arm of a mixture "
+                             "trained with and without pose -- not a corruption ablation, "
+                             "which feeds wrong values rather than none")
+    parser.add_argument("--anchor-offset", default=None,
+                        help="DIAGNOSTIC 'DX,DY[,DTHETA_RAD]'. Moves the origin that "
+                             "relative_se2 anchors on, by seeding the pose accumulator "
+                             "with a fictitious row that is never emitted -- so the text, "
+                             "the images, the marker count and the number of injected "
+                             "value rows are all unchanged, and only the numeric pose "
+                             "values move. Used to ask whether the same task gets harder "
+                             "when the anchor is far away or pointing elsewhere")
+    parser.add_argument("--goal-placement", default=None,
+                        choices=["segment", "observation"],
+                        help="PointNav: where the goal's <pose> marker sits, which must "
+                             "be the placement the CORPUS was formatted with "
+                             "(format_action_chunk_dataset.py --goal-placement). It is a "
+                             "property of the data, not of the weights, and is not "
+                             "recorded in the checkpoint -- so it has to be passed, and "
+                             "passing it wrong writes the markers somewhere the model "
+                             "never saw them with the counts still adding up. Unset = "
+                             "ObjectNav, which is what every run before this did")
     parser.add_argument("--stop-head", action="store_true",
                         help="let the checkpoint's stop classifier terminate episodes. "
                              "Off = the probability is still computed and reported in "
@@ -133,6 +157,12 @@ def main() -> None:
     if args.pose_foreign:
         kwargs["pose_foreign"] = args.pose_foreign
         kwargs["pose_foreign_split"] = args.pose_foreign_split
+    if args.goal_placement:
+        kwargs["goal_placement"] = args.goal_placement
+    if args.no_pose_injection:
+        kwargs["disable_pose"] = True
+    if args.anchor_offset:
+        kwargs["anchor_offset"] = [float(v) for v in args.anchor_offset.split(",")]
     backend = build_backend(args.backend, **kwargs)
     print(backend.describe(), flush=True)
     serve(args.socket, backend)

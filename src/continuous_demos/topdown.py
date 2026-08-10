@@ -52,6 +52,7 @@ COLOR_FREE = (236, 236, 236)
 COLOR_BLOCKED = (58, 58, 62)
 COLOR_EXECUTED = (32, 112, 220)  # where the robot has actually been
 COLOR_PLANNED = (206, 62, 196)  # the shortest path for the current segment
+COLOR_COMMANDED = (28, 168, 88)  # the policy's own commanded chunk
 COLOR_GOAL = (218, 44, 44)  # the current goal
 COLOR_PAST_GOAL = (140, 140, 146)  # goals already reached
 COLOR_AGENT = (16, 16, 16)
@@ -147,6 +148,13 @@ class TopDownState:
     planned_path: Optional[Any] = None
     #: Where the robot has actually been this episode, planar ``(T, 2)``.
     executed: Optional[Any] = None
+    #: The policy's most recent commanded action chunk, composed into world poses,
+    #: planar ``(L, 2)``. What the model *wants* to do, against `executed`'s what it did.
+    #: One chunk is `action_chunk_len * dt_native` of motion -- 0.8 s at the shipped
+    #: 2.5 Hz build -- so this is a short stub, not a trajectory. It is worth drawing
+    #: anyway because its *direction* is readable long before its length is: a policy
+    #: aimed at the goal and a policy aimed at a wall differ from tick one.
+    commanded: Optional[Any] = None
     #: Goals already reached, so a chained episode shows its history.
     past_goals: Sequence[Sequence[float]] = ()
     segment_index: int = 0
@@ -267,6 +275,12 @@ class TopDownMap:
                 img, [polyline_pixels(ext, state.planned_path)], False, COLOR_PLANNED, lw,
                 lineType=cv2.LINE_AA,
             )
+        # Last, so it reads on top of both the reference and the history: it is the one
+        # thing here the model produced.
+        if state.commanded is not None and len(state.commanded) >= 2:
+            pts = polyline_pixels(ext, state.commanded)
+            cv2.polylines(img, [pts], False, COLOR_COMMANDED, lw + 1, lineType=cv2.LINE_AA)
+            cv2.circle(img, tuple(pts[-1]), 2 * lw, COLOR_COMMANDED, -1, lineType=cv2.LINE_AA)
         for goal in state.past_goals:
             row, col = world_to_pixel(ext, float(goal[0]), float(goal[1]))
             cv2.circle(img, (col, row), 2 * lw, COLOR_PAST_GOAL, -1, lineType=cv2.LINE_AA)

@@ -306,19 +306,38 @@ At 640×480 on HM3D:
 So an 8-worker run offers roughly +22% load per GPU across 8 devices, and 10k episodes of
 2000 frames is ~800 GB and ~11 h.
 
+## Rollout and evaluation
+
+Both now exist — see `CLAUDE.md` "PointNav rollout and evaluation" for the layout, and the
+module docstrings of `objectnav_eval/goal_sources.py` (the goal seam, including what a GUI
+would have to implement), `objectnav_eval/pointnav.py` (the task and the episode set) and
+`objectnav_eval/bridge.py::_PoseFeed` (the row order). The two entry points are
+
+```bash
+# watch an agent go: chained goals, an MP4, per-goal metrics
+python scripts/pointnav_rollout.py --policy goal_pursuit --scene ... --scene-root ...
+
+# score a policy on a seeded, held-out point-goal set
+python scripts/eval_objectnav_policy.py --episode-source pointnav --distance-to POINT \
+    --episodes '<scene glob>' --source-set episodes_per_scene=5 --source-set seed=101 \
+    --goal-placement segment --ckpt ...
+```
+
+The row-ordering hazard this section used to describe is fixed and pinned: the order lives
+once, in `longnav.utils.vector_rollout.modality_value_rows`, which the training formatter
+imports and which `PointNavValueStream` reproduces incrementally for the rollout. `<pose>`
+value rows now go through `VectorRolloutPolicy.pose_rows` — one accumulator for agent rows
+and goal rows alike, so `relative_se2` anchors on row 0 of the same column training saw.
+
 ## Out of scope, needed later
 
-1. **Rollout.** `objectnav_eval/bridge._PoseFeed` calls `relative_se2_last`, which on a
-   column carrying goal rows returns the **goal**, not the agent. It needs to keep both
-   streams and assemble them in text order, and to install `RolloutConfig.goal_marker`
-   from the spec the way it already installs `modality_marker`. Until then a
-   PointNav-trained checkpoint can be trained but not rolled out.
-2. A PointNav task layer in `objectnav_eval` (success/SPL against a sampled point, an
-   `EpisodeSource` for point goals) and a held-out evaluation split — the generator makes
-   demonstrations, not an eval set.
-3. Runtime mixing of the two corpora. Deliberately not built yet: the tables stay separate
+1. Runtime mixing of the two corpora. Deliberately not built yet: the tables stay separate
    on disk, and a union that aligns the column sets is a runtime concern.
-4. `vector_sft`'s `episode_stop_labels` derives stops from the *episode* end, which is
+2. `vector_sft`'s `episode_stop_labels` derives stops from the *episode* end, which is
    wrong for chained segments — a segment-boundary stop label would need a real column.
-5. `render_pose2d_videos.py` does not know about `goal2d`, so a PointNav corpus renders
-   back without the goal overlay.
+   The rollout's consequence: a PointNav checkpoint's stop head, if it has one, is
+   trained to fire at the episode end rather than at a goal, so `--stop-head` on a
+   PointNav run is not yet meaningful.
+3. `render_pose2d_videos.py` does not know about `goal2d`, so a PointNav corpus renders
+   back without the goal overlay. (`scripts/pointnav_rollout.py` does draw it, but it
+   drives the simulator rather than reading a corpus.)

@@ -39,6 +39,18 @@ CMD_STOP = "stop"
 # ---------------------------------------------------------------------------
 
 
+def _pose3(value: Sequence[float], what: str) -> list:
+    """``[X, Y, theta]`` as three plain floats, or a loud error.
+
+    One definition for the agent's pose and for a point goal: they are rows of the same
+    value column and a width mismatch in either is the same bug.
+    """
+    row = [float(v) for v in value]
+    if len(row) != 3:
+        raise ValueError(f"{what} must be 3 numbers [X, Y, theta], got {len(row)}: {row}")
+    return row
+
+
 class PolicyBackend:
     """Interface for the thing that turns an image into an action chunk.
 
@@ -53,7 +65,8 @@ class PolicyBackend:
     def reset(self, goal_text: Optional[str]) -> None:  # pragma: no cover
         raise NotImplementedError
 
-    def act(self, rgb: np.ndarray, pose: Optional[Sequence[float]] = None) -> np.ndarray:
+    def act(self, rgb: np.ndarray, pose: Optional[Sequence[float]] = None,
+            goal: Optional[Sequence[float]] = None) -> np.ndarray:
         """Return an ``(T, 3)`` chunk of ``[dx, dy, dtheta]`` offsets.
 
         ``pose`` is the agent's **raw planar** ``[X, Y, theta]`` at this
@@ -62,6 +75,12 @@ class PolicyBackend:
         is offered to every backend and ignored by the ones whose checkpoint
         declares no use for it; see :class:`_PoseFeed` for why the raw value is
         what crosses the wire.
+
+        ``goal`` is the PointNav point goal, in the **same raw planar frame** and
+        for the same reason: it is another row of the same value column, and the
+        conversion to the frame the model reads happens once, on the model side,
+        in ``relative_se2``. ``None`` on every ObjectNav rollout, where the goal
+        is a category string handed to ``reset``.
         """
         raise NotImplementedError  # pragma: no cover
 
@@ -149,7 +168,13 @@ class _PoseCorruption:
         return self.mirror or bool(self.rotate_deg % 360.0)
 
     def apply(self, rel):
-        """``(1, 3)`` relative pose -> corrupted ``(1, 3)``. Identity when inert."""
+        """``(K, 3)`` relative poses -> corrupted ``(K, 3)``. Identity when inert.
+
+        Row-wise, so a PointNav step that writes several rows at once (an agent pose and
+        a goal) gets the *same* change of frame applied to all of them. Corrupting only
+        some rows would move the goal relative to the agent, which is a corruption of the
+        geometry rather than of the frame -- a different ablation, and not this one.
+        """
         if not self:
             return rel
         import math
@@ -158,16 +183,19 @@ class _PoseCorruption:
 
         from longnav.utils.pose_frame import wrap_to_pi
 
-        x, y, theta = (float(v) for v in rel[0])
-        if self.mirror:
-            y, theta = -y, -theta
-        if self.rotate_deg:
-            phi = math.radians(self.rotate_deg)
-            cos, sin = math.cos(phi), math.sin(phi)
-            x, y = cos * x - sin * y, sin * x + cos * y
-            theta = theta + phi
-        theta = float(wrap_to_pi(torch.tensor(theta, dtype=torch.float64)))
-        return torch.tensor([[x, y, theta]], dtype=torch.float32)
+        out = []
+        for row in rel:
+            x, y, theta = (float(v) for v in row)
+            if self.mirror:
+                y, theta = -y, -theta
+            if self.rotate_deg:
+                phi = math.radians(self.rotate_deg)
+                cos, sin = math.cos(phi), math.sin(phi)
+                x, y = cos * x - sin * y, sin * x + cos * y
+                theta = theta + phi
+            theta = float(wrap_to_pi(torch.tensor(theta, dtype=torch.float64)))
+            out.append([x, y, theta])
+        return torch.tensor(out, dtype=torch.float32)
 
     def describe(self) -> str:
         if not self:
@@ -326,14 +354,50 @@ class _PoseFeed:
     Inert on every checkpoint that declares no such spec: no marker is
     installed, ``step_kwargs`` returns an empty dict, and the ``step()`` call is
     character for character the one that ran before this existed.
+
+    PointNav
+    --------
+    ``goal_placement`` switches this class from feeding one row per turn to
+    feeding the **interleaved column PointNav trains on**, where a goal is
+    another occurrence of the same ``<pose>`` marker. It is a separate argument
+    rather than something read off the checkpoint because it is a property of
+    how the *corpus* was formatted (``format_action_chunk_dataset.py
+    --goal-placement``) and is not recorded in the weights. There is no way to
+    infer it, and guessing it wrong writes the markers somewhere the model never
+    saw them with the counts still adding up.
+
+    What it must not do is grow a second opinion about the row order. The order
+    comes from ``longnav.utils.vector_rollout.PointNavValueStream``, which is the
+    incremental form of the same ``modality_value_rows`` the training formatter
+    calls, pinned against it in ``tests/test_pose_injection.py``. This class only
+    decides *when* a goal is announced; the stream decides what rows that emits
+    and in which order, and ``VectorRolloutPolicy.pose_rows`` turns them into
+    values through the one ``relative_se2``.
+
+    **The bug this replaces**: ``relative_se2_last`` returns the last row of the
+    accumulated column. With only agent poses in it that row is the agent's, so
+    ObjectNav was right by accident of the column's contents. Interleave goal
+    rows and "the last row" stops meaning "the agent's pose" -- and the value is
+    still a well-formed three-vector, so the model reads it, the rollout
+    completes, and the run prints a number.
     """
 
     def __init__(self, policy: Any, corruption: Optional["_PoseCorruption"] = None,
-                 foreign: Optional["_ForeignPose"] = None, seed: int = 0):
+                 foreign: Optional["_ForeignPose"] = None, seed: int = 0,
+                 goal_placement: Optional[str] = None,
+                 anchor_offset: Optional[Sequence[float]] = None,
+                 disable_pose: bool = False):
         # `_pose_spec` is None on any checkpoint without the modality mechanism,
         # and the attribute itself is absent on a longnav old enough to predate
         # it -- both mean "this checkpoint does not want pose".
-        self.spec = getattr(policy, "_pose_spec", None)
+        # `disable_pose` makes this class inert on a checkpoint that DOES declare a pose
+        # spec, which is the only way to evaluate the pose-free arm of a mixture trained
+        # with both. It is not an ablation in the `_PoseCorruption` sense -- those feed
+        # wrong values -- it removes the marker from the rendered turn and supplies no
+        # values at all, which is character-for-character the conversation the pose-free
+        # corpus was formatted with. Feeding zeros instead would be a different, and
+        # in-distribution-looking, input the model never trained on.
+        self.spec = None if disable_pose else getattr(policy, "_pose_spec", None)
         self.fed = 0
         self.corruption = corruption or _PoseCorruption()
         self.foreign = foreign
@@ -341,11 +405,53 @@ class _PoseFeed:
         self.walk: Optional[_ForeignWalk] = None
         self.episodes = 0
         self.marker: Optional[str] = None
+        self.goal_placement = goal_placement or None
+        # Diagnostic only, default None. Moves `relative_se2`'s origin without adding
+        # anything to the model's context -- see `VectorRolloutPolicy._seed_anchor`. It is
+        # here rather than in `_PoseCorruption` because it does not corrupt anything: the
+        # geometry between agent and goal is preserved exactly and only the frame the
+        # values are expressed in moves, which is the variable the anchor experiment tests.
+        self.anchor_offset = None if anchor_offset is None else [float(v) for v in anchor_offset]
+        self.stream: Optional[Any] = None
+        self.goal: Optional[list] = None
+        self.goals_announced = 0
+        #: The value actually injected for the agent at the last step, so the
+        #: runner's `pose_injected` trace works on the PointNav path too -- there
+        #: `step()` is called with `modality=`, which does not populate
+        #: `last_stats["pose_value"]`.
+        self.last_value: Optional[list] = None
+        if self.goal_placement is not None:
+            from longnav.utils.vector_rollout import GOAL_PLACEMENTS
+
+            if self.goal_placement not in GOAL_PLACEMENTS:
+                raise ValueError(
+                    f"goal_placement must be one of {GOAL_PLACEMENTS}, got "
+                    f"{self.goal_placement!r}"
+                )
+            if self.spec is None:
+                raise ValueError(
+                    "a PointNav goal placement was requested but this checkpoint declares "
+                    "no modality spec with the 'pose_relative_first' transform, so a point "
+                    "goal has nowhere to go. Either the checkpoint is an ObjectNav one or "
+                    "--policy-sys-path points at a longnav that cannot read its spec."
+                )
+            if self.foreign is not None:
+                # The foreign-pose ablation replaces the agent's trajectory with an
+                # unrelated one. Under PointNav that would leave the goal rows expressed
+                # against a walk the goal has nothing to do with -- an ablation of the
+                # geometry, not of the information, and not the one the flag means.
+                raise ValueError(
+                    "--pose-foreign is not defined for a PointNav rollout: substituting "
+                    "the agent's trajectory would leave the goal rows anchored to a walk "
+                    "unrelated to them, which corrupts the geometry rather than the "
+                    "information. Run the ablation on an ObjectNav split."
+                )
         if self.spec is not None:
             self._install_marker(policy)
 
     def _install_marker(self, policy: Any) -> None:
-        """Write this spec's token into every turn's user block."""
+        """Write this spec's token into every turn's user block (and, for PointNav,
+        into the goal announcement)."""
         config = getattr(policy, "cfg", None)
         if config is None or not hasattr(config, "modality_marker"):
             raise RuntimeError(
@@ -364,20 +470,56 @@ class _PoseFeed:
                 "what the model was trained on; refusing to guess which."
             )
         self.marker = config.modality_marker
+        if self.goal_placement is None:
+            return
+        # Same token, deliberately: `<pose>` is ONE modality type and a goal pose is
+        # another occurrence of it. Set from `spec.token` for the same reason the
+        # observation marker is -- a literal here would be a second place for it to be
+        # wrong.
+        if not hasattr(config, "goal_marker") or not hasattr(config, "goal_placement"):
+            raise RuntimeError(
+                "a PointNav goal placement was requested but this RolloutConfig has no "
+                "`goal_marker`/`goal_placement` field -- the longnav checkout on "
+                "--policy-sys-path predates PointNav. Point it at one that has them."
+            )
+        config.goal_marker = self.spec.token
+        config.goal_placement = self.goal_placement
 
     def __bool__(self) -> bool:
         return self.spec is not None
 
+    def reset_kwargs(self, goal_text: Optional[str]) -> Dict[str, Any]:
+        """What ``policy.reset(**...)`` should be called with for this task.
+
+        ObjectNav interpolates the goal *category* into its prompt; PointNav has no such
+        string -- a point goal is a value injected at a marker -- so it gets its own
+        prompt and no goal text. The prompt is imported from ``vector_rollout``, which is
+        also where the training formatter reads it, so the two cannot drift.
+        """
+        extra = {} if self.anchor_offset is None else {"anchor_offset": self.anchor_offset}
+        if self.goal_placement is None:
+            return {"goal_text": goal_text, **extra}
+        from longnav.utils.vector_rollout import POINTNAV_SYSTEM_PROMPT
+
+        return {"system_prompt": POINTNAV_SYSTEM_PROMPT, **extra}
+
     def on_episode_reset(self) -> None:
         self.fed = 0
+        self.goal = None
+        self.goals_announced = 0
+        self.last_value = None
+        if self.goal_placement is not None:
+            from longnav.utils.vector_rollout import PointNavValueStream
+
+            self.stream = PointNavValueStream(self.goal_placement)
         # A fresh draw per episode, seeded like every other stochastic part of a
         # rollout so the run reproduces.
         if self.foreign is not None:
             self.walk = self.foreign.walk(self.seed + self.episodes)
         self.episodes += 1
 
-    def step_kwargs(self, policy: Any,
-                    pose: Optional[Sequence[float]]) -> Dict[str, Any]:
+    def step_kwargs(self, policy: Any, pose: Optional[Sequence[float]],
+                    goal: Optional[Sequence[float]] = None) -> Dict[str, Any]:
         if self.spec is None:
             return {}
         if pose is None:
@@ -389,17 +531,15 @@ class _PoseFeed:
                 "read a meaningless embedding. (Sim side: Observation.pose must reach "
                 "PolicyBridge.act; in-process: pass act(rgb, pose=...).)"
             )
-        values = [float(v) for v in pose]
-        if len(values) != 3:
-            raise ValueError(
-                f"pose must be 3 numbers [X, Y, theta], got {len(values)}: {values}"
-            )
+        values = _pose3(pose, "pose")
         if self.walk is not None:
             # Substituted BEFORE the frame conversion, so the foreign poses go
             # through the identical relative_se2 the real ones would have. The
             # robot's actual pose is simply discarded.
             values = self.walk.next()
         self.fed += 1
+        if self.goal_placement is not None:
+            return self._pointnav_step_kwargs(policy, values, goal)
         if not self.corruption:
             # Production path: hand the raw pose over and let the model's own
             # `pose_values` -> `relative_se2` do the conversion, untouched.
@@ -410,6 +550,79 @@ class _PoseFeed:
         # exclusive by design, so the corrupted value goes through `modality`.
         return {"modality": {self.spec.key: self.corruption.apply(policy.pose_values(values))}}
 
+    def _pointnav_step_kwargs(self, policy: Any, pose: Sequence[float],
+                              goal: Optional[Sequence[float]]) -> Dict[str, Any]:
+        """One PointNav turn's rows, plus the goal announcement when one is due.
+
+        A goal is announced when it differs from the one currently in force, and the
+        first goal of an episode therefore always is (``on_episode_reset`` clears it).
+        Comparison by value rather than by an explicit flag from the caller keeps the
+        wire at three floats and one list; the consequence, stated because it is the only
+        one, is that re-issuing the *identical* point is not a new goal. No goal source
+        here does that -- a point already reached is not offered again -- and under the
+        ``observation`` placement there is no announcement message at all.
+        """
+        if goal is None:
+            raise RuntimeError(
+                "a PointNav rollout was configured (goal_placement="
+                f"{self.goal_placement!r}) but this step carried no goal. The goal is a "
+                "value row bound to a marker that IS in the text, so continuing would "
+                "either inject nothing or bind the agent's pose to the goal's marker. "
+                "(Sim side: Observation.goal_pose must reach PolicyBridge.act.)"
+            )
+        goal_row = _pose3(goal, "goal")
+        if self.goal != goal_row:
+            announced = self.stream.announce(pose, goal_row)
+            self.goal = goal_row
+            self.goals_announced += 1
+            if announced:
+                # The announcement is its OWN user message, emitted before this turn's.
+                # Its tokens and its rows are queued together, in one call, because
+                # "before in the text" and "before in the rows" have to be the same
+                # statement -- occurrence order is the only binding there is.
+                from longnav.utils.vector_rollout import render_goal_block
+
+                policy.queue_user_block(
+                    render_goal_block(policy.processor, policy.cfg),
+                    {self.spec.key: self.corruption.apply(policy.pose_rows(announced))},
+                )
+        turn_rows = self.stream.observe(pose)
+        values = self.corruption.apply(policy.pose_rows(turn_rows))
+        # The stream and the policy's accumulator are two records of one column. They
+        # cannot be allowed to disagree: the policy's is what `relative_se2` anchors on,
+        # the stream's is what decided the order, and a divergence between them is the
+        # exact failure this class was rewritten to remove. One `len` per step.
+        # `anchor_offset` deliberately seeds ONE extra row into the policy's accumulator
+        # to move `relative_se2`'s origin. That row is never emitted (see
+        # `vector_rollout.seed_anchor`), so it is not a row of the value column and is
+        # discounted here. Everything else the guard catches, it still catches: the
+        # comparison stays exact, it is only offset by a row this code put there itself.
+        seeded = 1 if self.anchor_offset is not None else 0
+        accumulated = len(getattr(policy, "_raw_poses", self.stream.rows)) - seeded
+        if accumulated != len(self.stream.rows):
+            raise RuntimeError(
+                f"the injected value column has {accumulated} row(s) but the row order "
+                f"says {len(self.stream.rows)}; the k-th marker would no longer receive "
+                "the k-th row"
+                + (f" (discounting {seeded} seeded anchor row)" if seeded else "")
+            )
+        self.last_value = [float(v) for v in values[0]]
+        return {"modality": {self.spec.key: values}}
+
+    def annotate(self, stats: Dict[str, Any]) -> Dict[str, Any]:
+        """Put the injected agent value back into ``last_stats`` on the PointNav path.
+
+        ``VectorRolloutPolicy.step`` records ``pose_value`` only for the ``obs_pose=``
+        convenience; PointNav goes through ``modality=`` because a turn can write more
+        than one row. The runner's ``pose_injected`` trace is the end-to-end proof that
+        injection happened at all, so it must not go quiet exactly on the path that has
+        the most ways to be wrong.
+        """
+        if self.last_value is not None and stats.get("pose_value") is None:
+            stats["pose_value"] = list(self.last_value)
+            stats["goals_announced"] = self.goals_announced
+        return stats
+
     def describe(self) -> str:
         if self.spec is None:
             return "pose=none (no spec declares 'pose_relative_first')"
@@ -417,6 +630,9 @@ class _PoseFeed:
             f"pose={self.spec.token} raw [X, Y, theta] -> relative_se2 vs this "
             f"episode's first observation (transform={self.spec.transform}, "
             f"column={self.spec.source_column}, marker in user block={self.marker!r})"
+            + (f"\n  [pointnav goals: placement={self.goal_placement}, same marker "
+               f"{self.marker!r}, row order from PointNavValueStream]"
+               if self.goal_placement else "")
             + (f"\n  [{self.corruption.describe()}]" if self.corruption else "")
             + (f"\n  [{self.foreign.describe()}]" if self.foreign is not None else "")
         )
@@ -581,6 +797,9 @@ class VectorRolloutBackend(PolicyBackend):
         pose_rotate_deg: float = 0.0,
         pose_foreign: Optional[str] = None,
         pose_foreign_split: str = "train",
+        goal_placement: Optional[str] = None,
+        anchor_offset: Optional[Sequence[float]] = None,
+        disable_pose: bool = False,
     ):
         from longnav.utils.vector_rollout import RolloutConfig, VectorRolloutPolicy
 
@@ -597,7 +816,8 @@ class VectorRolloutBackend(PolicyBackend):
         self._pose = _PoseFeed(
             self.policy, _PoseCorruption(pose_mirror, pose_rotate_deg),
             _ForeignPose(pose_foreign, pose_foreign_split) if pose_foreign else None,
-            seed=int(seed),
+            seed=int(seed), goal_placement=goal_placement,
+            anchor_offset=anchor_offset, disable_pose=disable_pose,
         )
         self._stop = _StopHeadControl(
             self.policy, enabled=stop_head, temperature=stop_temperature,
@@ -605,22 +825,23 @@ class VectorRolloutBackend(PolicyBackend):
         )
 
     def reset(self, goal_text: Optional[str]) -> None:
-        self.policy.reset(goal_text=goal_text)
+        self.policy.reset(**self._pose.reset_kwargs(goal_text))
         self._pose.on_episode_reset()
         self._stop.seed(self.policy, self.seed + self._episode_count)
         self._episode_count += 1
 
-    def act(self, rgb: np.ndarray, pose: Optional[Sequence[float]] = None) -> np.ndarray:
+    def act(self, rgb: np.ndarray, pose: Optional[Sequence[float]] = None,
+            goal: Optional[Sequence[float]] = None) -> np.ndarray:
         from PIL import Image
 
         chunk = self.policy.step(
-            Image.fromarray(rgb), **self._pose.step_kwargs(self.policy, pose)
+            Image.fromarray(rgb), **self._pose.step_kwargs(self.policy, pose, goal)
         )
         return np.asarray(chunk.numpy(), dtype=np.float32)
 
     @property
     def last_stats(self) -> Dict[str, Any]:
-        return self._stop.annotate(_wire_safe(self.policy.last_stats))
+        return self._pose.annotate(self._stop.annotate(_wire_safe(self.policy.last_stats)))
 
     def wants_stop(self) -> bool:
         return self._stop.decided(self.policy.last_stats)
@@ -666,6 +887,9 @@ class BinRolloutBackend(PolicyBackend):
         pose_rotate_deg: float = 0.0,
         pose_foreign: Optional[str] = None,
         pose_foreign_split: str = "train",
+        goal_placement: Optional[str] = None,
+        anchor_offset: Optional[Sequence[float]] = None,
+        disable_pose: bool = False,
     ):
         from longnav.utils.bin_rollout import load_bin_policy, seed_sampling
         from longnav.utils.vector_rollout import RolloutConfig
@@ -683,7 +907,8 @@ class BinRolloutBackend(PolicyBackend):
         self._pose = _PoseFeed(
             self.policy, _PoseCorruption(pose_mirror, pose_rotate_deg),
             _ForeignPose(pose_foreign, pose_foreign_split) if pose_foreign else None,
-            seed=int(seed),
+            seed=int(seed), goal_placement=goal_placement,
+            anchor_offset=anchor_offset, disable_pose=disable_pose,
         )
         self._stop = _StopHeadControl(
             self.policy, enabled=stop_head, temperature=stop_temperature,
@@ -691,22 +916,25 @@ class BinRolloutBackend(PolicyBackend):
         )
 
     def reset(self, goal_text: Optional[str]) -> None:
-        self.policy.reset(goal_text=goal_text)
+        self.policy.reset(**self._pose.reset_kwargs(goal_text))
         if self.decode == "sample":
             self._seed_sampling(self.policy, self.seed + self._episode_count)
         self._pose.on_episode_reset()
         self._stop.seed(self.policy, self.seed + self._episode_count)
         self._episode_count += 1
 
-    def act(self, rgb: np.ndarray, pose: Optional[Sequence[float]] = None) -> np.ndarray:
+    def act(self, rgb: np.ndarray, pose: Optional[Sequence[float]] = None,
+            goal: Optional[Sequence[float]] = None) -> np.ndarray:
         from PIL import Image
 
-        chunk = self.policy.step(Image.fromarray(rgb), **self._pose.step_kwargs(self.policy, pose))
+        chunk = self.policy.step(
+            Image.fromarray(rgb), **self._pose.step_kwargs(self.policy, pose, goal)
+        )
         return np.asarray(chunk.numpy(), dtype=np.float32)
 
     @property
     def last_stats(self) -> Dict[str, Any]:
-        return self._stop.annotate(_wire_safe(self.policy.last_stats))
+        return self._pose.annotate(self._stop.annotate(_wire_safe(self.policy.last_stats)))
 
     def wants_stop(self) -> bool:
         return self._stop.decided(self.policy.last_stats)
@@ -847,6 +1075,9 @@ class ARRolloutBackend(PolicyBackend):
         pose_rotate_deg: float = 0.0,
         pose_foreign: Optional[str] = None,
         pose_foreign_split: str = "train",
+        goal_placement: Optional[str] = None,
+        anchor_offset: Optional[Sequence[float]] = None,
+        disable_pose: bool = False,
     ):
         # Checked before the imports: a bad decode rule should fail the same way in any
         # interpreter, not only in one that can already load the checkpoint.
@@ -884,7 +1115,8 @@ class ARRolloutBackend(PolicyBackend):
         self._pose = _PoseFeed(
             self.policy, _PoseCorruption(pose_mirror, pose_rotate_deg),
             _ForeignPose(pose_foreign, pose_foreign_split) if pose_foreign else None,
-            seed=int(seed),
+            seed=int(seed), goal_placement=goal_placement,
+            anchor_offset=anchor_offset, disable_pose=disable_pose,
         )
         self._stop = _StopHeadControl(
             self.policy, enabled=stop_head, temperature=stop_temperature,
@@ -904,7 +1136,7 @@ class ARRolloutBackend(PolicyBackend):
         self.policy.model.normalizer.generator = generator
 
     def reset(self, goal_text: Optional[str]) -> None:
-        self.policy.reset(goal_text=goal_text)
+        self.policy.reset(**self._pose.reset_kwargs(goal_text))
         if self.decode == "sample":
             self._reseed(self.seed + self._episode_count)
         self._pose.on_episode_reset()
@@ -912,17 +1144,20 @@ class ARRolloutBackend(PolicyBackend):
         self._episode_count += 1
         self._context.on_episode_reset(goal_text)
 
-    def act(self, rgb: np.ndarray, pose: Optional[Sequence[float]] = None) -> np.ndarray:
+    def act(self, rgb: np.ndarray, pose: Optional[Sequence[float]] = None,
+            goal: Optional[Sequence[float]] = None) -> np.ndarray:
         from PIL import Image
 
         # No-op unless --context-reset-every was passed; see _PeriodicContextReset.
         self._context.before_act(self.policy)
-        chunk = self.policy.step(Image.fromarray(rgb), **self._pose.step_kwargs(self.policy, pose))
+        chunk = self.policy.step(
+            Image.fromarray(rgb), **self._pose.step_kwargs(self.policy, pose, goal)
+        )
         return np.asarray(chunk.numpy(), dtype=np.float32)
 
     @property
     def last_stats(self) -> Dict[str, Any]:
-        stats = self._stop.annotate(_wire_safe(self.policy.last_stats))
+        stats = self._pose.annotate(self._stop.annotate(_wire_safe(self.policy.last_stats)))
         context = getattr(self, "_context", None)
         if context is not None and context.every:
             stats["context_resets"] = context.resets
@@ -1043,6 +1278,9 @@ class FlowRolloutBackend(PolicyBackend):
         pose_rotate_deg: float = 0.0,
         pose_foreign: Optional[str] = None,
         pose_foreign_split: str = "train",
+        goal_placement: Optional[str] = None,
+        anchor_offset: Optional[Sequence[float]] = None,
+        disable_pose: bool = False,
     ):
         # Checked before the imports, as on the AR backend: a bad decode rule should fail
         # the same way in any interpreter, not only in one that can load the checkpoint.
@@ -1081,7 +1319,8 @@ class FlowRolloutBackend(PolicyBackend):
         self._pose = _PoseFeed(
             self.policy, _PoseCorruption(pose_mirror, pose_rotate_deg),
             _ForeignPose(pose_foreign, pose_foreign_split) if pose_foreign else None,
-            seed=int(seed),
+            seed=int(seed), goal_placement=goal_placement,
+            anchor_offset=anchor_offset, disable_pose=disable_pose,
         )
         self._stop = _StopHeadControl(
             self.policy, enabled=stop_head, temperature=stop_temperature,
@@ -1100,7 +1339,7 @@ class FlowRolloutBackend(PolicyBackend):
         self._seed_sampling(self.policy, int(seed))
 
     def reset(self, goal_text: Optional[str]) -> None:
-        self.policy.reset(goal_text=goal_text)
+        self.policy.reset(**self._pose.reset_kwargs(goal_text))
         # Unconditional: one generation mode, and it always draws noise.
         self._reseed(self.seed + self._episode_count)
         self._pose.on_episode_reset()
@@ -1108,17 +1347,20 @@ class FlowRolloutBackend(PolicyBackend):
         self._episode_count += 1
         self._context.on_episode_reset(goal_text)
 
-    def act(self, rgb: np.ndarray, pose: Optional[Sequence[float]] = None) -> np.ndarray:
+    def act(self, rgb: np.ndarray, pose: Optional[Sequence[float]] = None,
+            goal: Optional[Sequence[float]] = None) -> np.ndarray:
         from PIL import Image
 
         # No-op unless --policy-memory-seconds was passed; see _PeriodicContextReset.
         self._context.before_act(self.policy)
-        chunk = self.policy.step(Image.fromarray(rgb), **self._pose.step_kwargs(self.policy, pose))
+        chunk = self.policy.step(
+            Image.fromarray(rgb), **self._pose.step_kwargs(self.policy, pose, goal)
+        )
         return np.asarray(chunk.numpy(), dtype=np.float32)
 
     @property
     def last_stats(self) -> Dict[str, Any]:
-        stats = self._stop.annotate(_wire_safe(self.policy.last_stats))
+        stats = self._pose.annotate(self._stop.annotate(_wire_safe(self.policy.last_stats)))
         context = getattr(self, "_context", None)
         if context is not None and context.every:
             stats["context_resets"] = context.resets
@@ -1209,7 +1451,8 @@ def serve(socket_path: str, backend: PolicyBackend) -> None:
                 # still talks to a server that has it -- the backend raises with
                 # a real explanation if its checkpoint actually needed one.
                 chunk = np.asarray(
-                    backend.act(rgb, pose=message.get("pose")), dtype=np.float32
+                    backend.act(rgb, pose=message.get("pose"),
+                                goal=message.get("goal")), dtype=np.float32
                 )
                 conn.send(
                     {
@@ -1264,7 +1507,12 @@ class PolicyBridge:
             if value is None or value is False:
                 continue
             flag = "--" + key.replace("_", "-")
-            command += [flag] if value is True else [flag, str(value)]
+            # `--flag=value`, never `--flag value`: argparse on the far side reads a value
+            # beginning with `-` as another option and dies with "expected one argument".
+            # That bit a whole sweep -- an anchor offset of `-8.09,0.68` is perfectly
+            # ordinary, and so is a negative `--pose-rotate-deg`. The `=` form has no such
+            # ambiguity and is identical for every other value.
+            command += [flag] if value is True else [f"{flag}={value}"]
         print(f"[bridge] launching policy server: {' '.join(command)}", flush=True)
         print(f"[bridge] server log -> {self.log_path}", flush=True)
         self._log = open(self.log_path, "w")
@@ -1339,7 +1587,8 @@ class PolicyBridge:
     def reset(self, goal_text: Optional[str]) -> None:
         self._rpc({"cmd": CMD_RESET, "goal_text": goal_text})
 
-    def act(self, rgb: np.ndarray, pose: Optional[Sequence[float]] = None) -> Dict[str, Any]:
+    def act(self, rgb: np.ndarray, pose: Optional[Sequence[float]] = None,
+            goal: Optional[Sequence[float]] = None) -> Dict[str, Any]:
         rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
         reply = self._rpc(
             {
@@ -1348,6 +1597,11 @@ class PolicyBridge:
                 # unconditionally and cheaply (three floats); what to do with it is
                 # the checkpoint's business, not the simulator's -- see _PoseFeed.
                 "pose": None if pose is None else [float(v) for v in pose],
+                # PointNav's point goal, in the same raw planar frame and sent the
+                # same way. Absent on an ObjectNav run, and `serve` reads it with
+                # `.get`, so a sim side predating it still talks to a server that
+                # has it.
+                "goal": None if goal is None else [float(v) for v in goal],
             }
         )
         chunk = (

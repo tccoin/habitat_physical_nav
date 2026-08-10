@@ -307,6 +307,7 @@ def build_observation_records(
     rng: Optional[np.random.Generator] = None,
     goal2d: Optional[Sequence[Sequence[float]]] = None,
     segment_index: Optional[Sequence[int]] = None,
+    boundary_policy: str = "keep",
 ) -> List[Dict[str, Any]]:
     """Slide an observation window over one episode's native trajectory.
 
@@ -343,12 +344,45 @@ def build_observation_records(
     image was rendered at ``idx``, and taking the goal from the chunk's tail would
     condition the model on which goal it is *about to* be given.
 
-    ``crosses_segment`` marks a chunk that spans a goal change. Such a chunk is
-    physically valid -- the robot never teleports -- but not supervisorily valid, because
-    its tail is motion toward the next goal while the conditioning shows the current one.
-    At ``action_chunk_len=10`` and ``obs_stride_frames=5`` that is one observation per
-    boundary, roughly 1% of a chained episode. The flag is emitted always; whether to drop
-    those rows is the builder's ``--boundary-policy``.
+    ``crosses_segment`` marks a chunk that spans a goal change: its tail is motion toward
+    the NEXT goal while the conditioning shows the current one. ``boundary_policy`` says
+    what to do about that, and the choice is far more consequential than it looks:
+
+      * ``"keep"`` (default) -- leave the chunk exactly as recorded, tail and all. Every
+        target is motion that actually happened.
+      * ``"clamp"`` -- hold the last within-segment pose for the rest of the chunk.
+      * ``"drop"`` -- emit the flag and let the builder discard those rows.
+
+    **Both alternatives to ``"keep"`` were tried and both broke the policy.**
+
+    ``"drop"`` discards 18% of observations and, because the discarded ones are exactly
+    those whose chunk reaches the goal, leaves **no** surviving observation within 1.31 m
+    of the goal it is pursuing (median 3.88 m) -- a corpus with no arrivals in it. The
+    observation stream also jumps 30 ticks instead of 10 at every boundary. Trained on it,
+    the policy overshoots and circles: 19.8 m travelled for a 7.5 m geodesic.
+
+    ``"clamp"`` fixes the arrivals (15.7% of observations land within 1 m) but fabricates
+    dead time. It raises exactly-zero ticks -- zero in ALL THREE components -- from 0.79%
+    to **11.70%**, and gives **11.65%** of chunks a completely frozen second half. That
+    motion never happened: the robot arrives and immediately turns toward the next goal.
+    A head that models the conditional distribution puts mass on "do nothing", and
+    freezing is self-reinforcing, so the policy stands still for long stretches. Observed
+    directly in rollout video.
+
+    What ``"keep"`` admits instead is real: measured over 451 boundary-crossing chunks,
+    the post-boundary tail averages **0.019 m of translation and 37 degrees of rotation**
+    -- the turn-in-place toward the next goal. Conditioning that on the outgoing goal is a
+    far smaller lie than inventing a hold, and the old corpus already contains 21%
+    rotation-only ticks from the same manoeuvre mid-segment.
+
+    **``"drop"`` is a trap and is no longer the default.** Measured on a real 2000-frame,
+    20-segment episode at ``action_chunk_len=20`` / ``obs_stride_frames=10``: it discards
+    18% of observations, and because the discarded ones are precisely those whose chunk
+    reaches the goal, **not one surviving observation sits within 1.31 m of the goal it is
+    pursuing** (median 3.88 m), while the discarded ones have a median of 0.55 m. A model
+    trained on that has never seen an arrival, and the observation stream additionally
+    jumps 30 ticks instead of 10 at every boundary -- a hole located exactly where a
+    chained task lives.
 
     ``spacing_config`` controls how far apart consecutive observations land
     (see the module docstring's "Variable observation spacing" section);
@@ -383,7 +417,15 @@ def build_observation_records(
     idx = 0
     while idx + length <= n - 1:
         anchor = pose2d[idx]
-        chunk = [pose_to_relative(anchor, pose2d[idx + j]) for j in range(1, length + 1)]
+        # Clamping holds the last pose that still belongs to this observation's segment,
+        # so the chunk reads "arrive, then hold" instead of running on into the next goal.
+        limit = idx + length
+        if segment_index is not None and boundary_policy == "clamp":
+            here = int(segment_index[idx])
+            while limit > idx and int(segment_index[limit]) != here:
+                limit -= 1
+        chunk = [pose_to_relative(anchor, pose2d[min(idx + j, limit)])
+                 for j in range(1, length + 1)]
         record = {
             "obs_index": obs_index,
             "frame_index": idx,

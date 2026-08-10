@@ -10,7 +10,10 @@ single row, so an episode never splits across rows:
 
   * ``obs_indices`` / ``frame_indices`` -- per-observation, one entry each
   * ``images``       -- absolute path per observation
-  * ``obs_poses``    -- ``[x, y, theta]`` anchor per observation
+  * ``obs_poses``    -- ``[x, y, theta]`` anchor per observation. The name is a
+    known misnomer: downstream this column carries goal poses too, bound by
+    occurrence order. A rename is queued -- see
+    ``/Projects/spatial_training/docs/column_naming.md``.
   * ``action_chunks``-- one ``action_chunk_len``-long chunk per observation
 
 plus episode-level ``episode_id`` / ``scene_id`` / ``goal_text`` /
@@ -66,7 +69,7 @@ def build_row_for_episode(
     spacing_config: SpacingConfig,
     rng: np.random.Generator,
     stamped: Dict[str, Any],
-    boundary_policy: str = "drop",
+    boundary_policy: str = "keep",
 ) -> Optional[Dict[str, Any]]:
     """Turn one episode into a single dataset row, or ``None`` if the episode is
     too short to anchor even one full action chunk.
@@ -84,12 +87,12 @@ def build_row_for_episode(
     segment_index = episode.get("segment_index")
     obs_records = build_observation_records(
         episode["pose2d"], episode["rgb_paths"], chunk_config, spacing_config, rng,
-        goal2d=goal2d, segment_index=segment_index,
+        goal2d=goal2d, segment_index=segment_index, boundary_policy=boundary_policy,
     )
     if segment_index is not None and boundary_policy == "drop":
-        # A chunk spanning a goal change has a tail of motion toward the NEXT goal while
-        # its conditioning shows the current one. Physically valid, supervisorily not.
-        # Roughly 1% of rows at clen=10/stride=5; `keep` is available as an ablation.
+        # Kept as an ablation only. See `build_observation_records`: dropping removes
+        # every observation whose chunk reaches its goal, so a corpus built this way
+        # contains no arrivals at all.
         obs_records = [rec for rec in obs_records if not rec.get("crosses_segment")]
     if not obs_records:
         return None
@@ -122,7 +125,7 @@ def build_all_rows(
     chunk_config: ChunkConfig,
     spacing_config: SpacingConfig,
     max_length: Optional[int],
-    boundary_policy: str = "drop",
+    boundary_policy: str = "keep",
 ) -> List[Dict[str, Any]]:
     # One rng shared across every episode in the run (not reseeded per
     # episode) so the draws for episode 2 aren't a repeat of episode 1's --

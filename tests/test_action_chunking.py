@@ -377,3 +377,127 @@ def test_the_extra_arrays_do_not_disturb_the_chunks_themselves():
     for a, b in zip(plain, withgoal):
         for key in ("obs_index", "frame_index", "image", "obs_pose", "action_chunk"):
             assert a[key] == b[key]
+
+
+# ---------------------------------------------------------------------------
+# boundary_policy: the one that decides whether arrivals exist in the corpus
+# ---------------------------------------------------------------------------
+# `drop` was the original default and removes every observation whose chunk reaches its
+# goal. Measured on a real 2000-frame / 20-segment episode at clen=20 / stride=10: 18% of
+# observations gone and NOT ONE survivor within 1.31 m of the goal it is pursuing. A model
+# trained on that has never seen an arrival. These pin the fix.
+def _two_segment_episode(n=60, boundary=30):
+    """A robot driving +X, with the goal changing at `boundary`."""
+    pose2d = [[0.05 * i, 0.0, 0.0] for i in range(n)]
+    paths = [f"f{i}.png" for i in range(n)]
+    segment_index = [0] * boundary + [1] * (n - boundary)
+    goal2d = [[0.05 * (boundary - 1), 0.0, 0.0]] * boundary + [[0.05 * (n - 1), 0.0, 0.0]] * (n - boundary)
+    return pose2d, paths, goal2d, segment_index
+
+
+def test_keep_is_the_default():
+    """The default must be the one whose targets are all real recorded motion.
+
+    Both alternatives were tried against a real policy and both broke it. `drop` removes
+    every arrival from the corpus (no observation survives within 1.31 m of its goal) and
+    the policy overshoots. `clamp` fabricates dead time -- exactly-zero ticks go from 0.79%
+    to 11.70%, and 11.65% of chunks get a fully frozen second half -- and the policy then
+    stands still for long stretches, which is visible in rollout video.
+    """
+    import inspect
+    assert inspect.signature(build_observation_records).parameters[
+        "boundary_policy"].default == "keep"
+
+
+def test_clamp_fabricates_dead_time_and_keep_does_not():
+    """The measurement that condemned `clamp`: targets that are zero in ALL THREE dims.
+
+    A turn-in-place is zero translation with real rotation and is fine -- the corpus is
+    ~21% those. A clamped tail is zero in every component: motion that never happened.
+    """
+    pose2d, paths, goal2d, seg = _two_segment_episode()
+    cfg = _chunk_cfg(length=10, stride=5)
+
+    def dead_fraction(policy):
+        recs = build_observation_records(pose2d, paths, cfg, goal2d=goal2d,
+                                         segment_index=seg, boundary_policy=policy)
+        chunks = np.asarray([r["action_chunk"] for r in recs])
+        prev = np.concatenate([np.zeros((chunks.shape[0], 1, 3)), chunks], axis=1)
+        step = np.diff(prev, axis=1)
+        return float(((np.abs(step) < 1e-9).all(axis=2)).mean())
+
+    assert dead_fraction("clamp") > dead_fraction("keep")
+    assert dead_fraction("keep") == pytest.approx(0.0, abs=1e-9)
+
+
+def test_clamp_holds_the_last_within_segment_pose():
+    pose2d, paths, goal2d, seg = _two_segment_episode()
+    recs = build_observation_records(pose2d, paths, _chunk_cfg(length=10, stride=5),
+                                     goal2d=goal2d, segment_index=seg,
+                                     boundary_policy="clamp")
+    crossing = [r for r in recs if r["crosses_segment"]]
+    assert crossing, "the fixture must contain a boundary-crossing chunk"
+    for rec in crossing:
+        chunk = np.asarray(rec["action_chunk"])
+        steps = np.linalg.norm(np.diff(chunk[:, :2], axis=0), axis=1)
+        assert steps[0] > 1e-6, "it should move at the start"
+        assert steps[-1] == pytest.approx(0.0, abs=1e-9), "and be held at the end"
+        # Never past the last pose of its own segment.
+        assert chunk[:, 0].max() <= 0.05 * 29 + 1e-9
+
+
+def test_clamp_keeps_every_observation_and_a_uniform_stride():
+    """`drop` punches a hole in the observation stream exactly at each goal change."""
+    pose2d, paths, goal2d, seg = _two_segment_episode()
+    cfg = _chunk_cfg(length=10, stride=5)
+    clamped = build_observation_records(pose2d, paths, cfg, goal2d=goal2d,
+                                        segment_index=seg, boundary_policy="clamp")
+    dropped = [r for r in build_observation_records(
+        pose2d, paths, cfg, goal2d=goal2d, segment_index=seg, boundary_policy="drop")
+        if not r["crosses_segment"]]
+    assert len(clamped) > len(dropped)
+    assert set(np.diff([r["frame_index"] for r in clamped]).tolist()) == {5}
+    assert set(np.diff([r["frame_index"] for r in dropped]).tolist()) != {5}
+
+
+def test_clamp_keeps_observations_that_reach_their_goal():
+    """The property that actually matters: arrivals survive."""
+    pose2d, paths, goal2d, seg = _two_segment_episode()
+    cfg = _chunk_cfg(length=10, stride=5)
+    poses = np.asarray(pose2d)
+
+    def nearest(records):
+        return min(
+            float(np.linalg.norm(np.asarray(r["obs_goal"][:2]) - poses[r["frame_index"]][:2]))
+            for r in records
+        )
+
+    clamped = build_observation_records(pose2d, paths, cfg, goal2d=goal2d,
+                                        segment_index=seg, boundary_policy="clamp")
+    dropped = [r for r in build_observation_records(
+        pose2d, paths, cfg, goal2d=goal2d, segment_index=seg, boundary_policy="drop")
+        if not r["crosses_segment"]]
+    assert nearest(clamped) < nearest(dropped)
+
+
+def test_keep_leaves_the_chunk_exactly_as_recorded():
+    pose2d, paths, goal2d, seg = _two_segment_episode()
+    cfg = _chunk_cfg(length=10, stride=5)
+    kept = build_observation_records(pose2d, paths, cfg, goal2d=goal2d,
+                                     segment_index=seg, boundary_policy="keep")
+    plain = build_observation_records(pose2d, paths, cfg)
+    for a, b in zip(kept, plain):
+        assert a["action_chunk"] == b["action_chunk"]
+
+
+def test_a_corpus_without_segments_is_untouched_by_the_policy():
+    """ObjectNav has no segments; every policy must leave it identical."""
+    n = 40
+    pose2d = random_walk_pose2d(n, seed=9)
+    paths = [f"f{i}.png" for i in range(n)]
+    base = build_observation_records(pose2d, paths, _chunk_cfg())
+    for policy in ("clamp", "drop", "keep"):
+        other = build_observation_records(pose2d, paths, _chunk_cfg(),
+                                          boundary_policy=policy)
+        assert [r["action_chunk"] for r in other] == [r["action_chunk"] for r in base]
+        assert set(other[0]) == set(base[0])

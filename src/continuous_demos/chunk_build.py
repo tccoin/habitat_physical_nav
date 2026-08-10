@@ -86,15 +86,20 @@ def add_chunking_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
 
     group.add_argument(
         "--boundary-policy",
-        choices=("drop", "keep"),
-        default="drop",
+        choices=("keep", "clamp", "drop"),
+        default="keep",
         help=(
             "what to do with an action chunk that spans a goal change in a chained "
-            "PointNav episode. Such a chunk is physically valid -- the robot never "
-            "teleports -- but its tail is motion toward the NEXT goal while the "
-            "conditioning shows the current one. `drop` costs about 1%% of rows at "
-            "clen=10/stride=5; `keep` is the ablation. No effect on a corpus without "
-            "segments."
+            "PointNav episode -- its tail is motion toward the NEXT goal while the "
+            "conditioning shows the current one. `keep` (default) leaves the chunk "
+            "exactly as recorded, whose tail is a real turn-in-place toward the next "
+            "goal (measured: 0.019 m translation, 37 deg rotation). `clamp` holds the "
+            "last within-segment pose, which "
+            "FABRICATES dead time -- it lifts exactly-zero ticks from 0.8%% to 11.7%% and "
+            "freezes the second half of 11.7%% of chunks, and the policy then stands "
+            "still. `drop` discards the row, removing every arrival from the corpus. "
+            "Both were tried and both broke the policy. No effect on a "
+            "corpus without segments."
         ),
     )
 

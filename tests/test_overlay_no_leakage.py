@@ -123,6 +123,51 @@ def test_runner_overlay_does_not_touch_its_input_when_enabled(frame):
     assert digest(frame) == before
 
 
+def test_rgb_bev_composer_keeps_policy_pixels_and_draws_a_continuous_route(frame):
+    """The side-by-side default video is still display-only, not policy input."""
+    from objectnav_eval.video import EpisodeBev, OverlayState, compose_with_bev
+
+    background = np.zeros((120, 120, 3), dtype=np.uint8)
+    background[..., 0] = np.arange(120, dtype=np.uint8)[None, :]
+    background[..., 1] = np.arange(120, dtype=np.uint8)[:, None]
+    bev = EpisodeBev(
+        background,
+        world_center_xy=(0.0, 0.0),
+        world_span_m=20.0,
+        panel_size=(frame.shape[1], frame.shape[0]),
+        target_xy=np.array([[4.0, 3.0]]),
+        view_points_xy=np.array([[3.7, 2.9], [4.2, 3.1]]),
+        start_xy=(-4.0, -3.0),
+        framing_xy=np.array([[-4.0, -3.0], [4.0, 3.0]]),
+    )
+    state = OverlayState(
+        step=7, sim_time=0.35, goal="chair", distance=2.0,
+        start_distance=5.0, is_observation=True,
+    )
+    before = digest(frame)
+    first = compose_with_bev(frame, state, bev, (-4.0, -3.0, 0.0))
+    second = compose_with_bev(frame, state, bev, (-1.0, -1.0, 0.0))
+
+    assert digest(frame) == before
+    # The header is outside the RGB/BEV panels.  This tiny synthetic frame
+    # needs the two-line (60px) version; production's 1280px frame uses 34px.
+    assert first.shape == (frame.shape[0] + 60, frame.shape[1] * 2, 3)
+    assert not np.array_equal(first, second)
+    assert np.any(np.all(second == (178, 178, 178), axis=2))
+
+
+def test_recorded_video_uses_bev_unless_explicitly_disabled():
+    import argparse
+
+    from objectnav_eval.config import add_arguments, config_from_args
+
+    parser = add_arguments(argparse.ArgumentParser())
+    assert config_from_args(parser.parse_args(["--episodes", "x"])).video_bev is True
+    assert config_from_args(
+        parser.parse_args(["--episodes", "x", "--no-video-bev"])
+    ).video_bev is False
+
+
 # ---------------------------------------------------------------------------
 # The composer, against a live simulator -- the path a real rollout takes
 # ---------------------------------------------------------------------------

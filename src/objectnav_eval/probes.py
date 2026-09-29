@@ -720,12 +720,20 @@ class TrajectoryLog(RolloutProbe):
     enabled: bool = True
 
     ticks: List[List[float]] = field(default_factory=list)
+    tick_chunk_index: List[int] = field(default_factory=list)
+    tick_in_chunk: List[int] = field(default_factory=list)
     chunks: List[List[List[float]]] = field(default_factory=list)
+    chunk_anchor_pose: List[List[float]] = field(default_factory=list)
+    chunk_execution_sim_s: List[float] = field(default_factory=list)
+    chunk_target_reached: List[Optional[bool]] = field(default_factory=list)
     heights: List[float] = field(default_factory=list)
     cameras: List[Any] = field(default_factory=list)
 
     def reset(self, episode: Any = None) -> None:
-        self.ticks, self.chunks, self.heights = [], [], []
+        self.ticks, self.tick_chunk_index, self.tick_in_chunk = [], [], []
+        self.chunks, self.chunk_anchor_pose = [], []
+        self.chunk_execution_sim_s, self.chunk_target_reached = [], []
+        self.heights = []
         self.cameras = []
 
     def on_tick(self, record: TickRecord) -> None:
@@ -741,6 +749,8 @@ class TrajectoryLog(RolloutProbe):
             round(float(record.pose[1]), n),
             round(float(record.pose[2]), n),
         ])
+        self.tick_chunk_index.append(int(record.chunk_index))
+        self.tick_in_chunk.append(int(record.tick_in_chunk))
         height = getattr(record, "height", None)
         self.heights.append(None if height is None else round(float(height), n))
         camera = getattr(record, "camera", None)
@@ -755,6 +765,11 @@ class TrajectoryLog(RolloutProbe):
             return
         n = self.ndigits
         self.chunks.append([[round(float(v), n) for v in row] for row in poses])
+        self.chunk_anchor_pose.append(
+            [round(float(v), n) for v in execution.anchor]
+        )
+        self.chunk_execution_sim_s.append(float(execution.action_sim_time))
+        self.chunk_target_reached.append(execution.action_target_reached)
 
     def summary(self) -> Dict[str, Any]:
         if not self.enabled or not self.ticks:
@@ -765,9 +780,14 @@ class TrajectoryLog(RolloutProbe):
             #: [sim_time, X, Y, theta] per control tick, planar control frame
             #: (X = habitat_x, Y = -habitat_z, theta CCW from +X).
             "tick_pose": self.ticks,
+            "tick_chunk_index": self.tick_chunk_index,
+            "tick_in_chunk": self.tick_in_chunk,
             #: Chunks as EMITTED -- (T, 3) relative [dx, dy, dtheta] in the
             #: emitting pose's own frame, before the executor truncated to `gap`.
             "chunks": self.chunks,
+            "chunk_anchor_pose": self.chunk_anchor_pose,
+            "chunk_execution_sim_s": self.chunk_execution_sim_s,
+            "chunk_target_reached": self.chunk_target_reached,
         }
         if any(h is not None for h in self.heights):
             out["tick_height"] = self.heights

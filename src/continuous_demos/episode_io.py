@@ -131,6 +131,8 @@ def build_robot_sim(
     height: int,
     urdf_path: str,
     num_cameras: int = 1,
+    depth_sensor_uuid: Optional[str] = None,
+    topdown_sensor_uuid: Optional[str] = None,
 ) -> HabitatRobotSim:
     """Build the pipeline's simulator: this scene, this robot, this camera.
 
@@ -153,12 +155,22 @@ def build_robot_sim(
         sim_settings["scene_dataset_config_file"] = scene_dataset_config
 
     sensor_setup = rgb_sensor_setup(width, height, num_cameras=num_cameras)
+    if depth_sensor_uuid:
+        from continuous_demos.panoramic import SENSOR_LINK
+
+        depth_spec = habitat_sim.sensor.CameraSensorSpec()
+        depth_spec.uuid = str(depth_sensor_uuid)
+        depth_spec.sensor_type = habitat_sim.sensor.SensorType.DEPTH
+        depth_spec.resolution = [height, width]
+        depth_spec.hfov = 79.0
+        sensor_setup[SENSOR_LINK].append(depth_spec)
 
     robot_sim = HabitatRobotSim(
         sim_settings=sim_settings,
         urdf_path=urdf_path,
         sensor_setup=sensor_setup,
         fixed_base=True,
+        topdown_sensor_uuid=topdown_sensor_uuid,
     )
     robot_sim.navmesh_config_and_recompute()
     return robot_sim

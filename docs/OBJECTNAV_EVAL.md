@@ -65,9 +65,10 @@ checkpoint (see [Two environments](#two-environments)).
 
 | File | What it is |
 | --- | --- |
-| `objectnav_eval_results[_<policy>].json` | Summary, every per-episode record in full, every skipped episode, and the exact config the run used. |
-| `objectnav_eval_results[_<policy>].jsonl` | One compact line per episode — **including skipped ones**, with their reason. This is the file to read. Carries the outcome (`success`, `spl`, distances), the tracking summary (`undershoot`, `lag_m`) and the behavioural summary (`frozen_frac`, `turn_frac`, `drive_frac`, `obstructed_frac`, `collisions_per_m`, `flip_rate`). The full probe output is in the `.json`. |
-| `videos/<uid>.mp4` | One frame per control tick, so playback at `1/dt` fps is real time. |
+| `objectnav_eval_results[_<policy>].json` | Summary, compact per-episode metrics, every skipped episode, exact config, and references to compressed trajectory/detail files. |
+| `objectnav_eval_results[_<policy>].jsonl` | One compact line per episode — **including skipped ones**, with their reason. This is the file to read. Carries the outcome (`success`, `spl`, distances), the tracking summary (`undershoot`, `lag_m`) and the behavioural summary (`frozen_frac`, `turn_frac`, `drive_frac`, `obstructed_frac`, `collisions_per_m`, `flip_rate`). |
+| `episode_details/<uid>.json.gz` | Compressed per-step diagnostics such as policy/execution latency, goal-distance, stop-score, injected-pose, and SG mapping/action traces. `result.json` and the JSONL retain scalar summaries plus a `details_file` reference. |
+| `videos/<uid>.mp4` | One frame per control tick, so playback at `1/dt` fps is real time. By default it is first-person RGB beside a scene-RGB top-down BEV with travelled route, target, and all success view points; `--no-video-bev` restores first-person-only video. |
 | `shards/shard_N*.{json,log}` | Per-worker spec, raw results and log. `--report` re-aggregates from here. |
 | `logs/policy_shardN.log` | The model-side interpreter's stdout/stderr. |
 

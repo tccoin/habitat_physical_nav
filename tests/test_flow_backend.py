@@ -177,7 +177,8 @@ class _FakeFlowPolicy:
 
 
 def flow_backend(decoder_config=None, spec=None, decode="sample", seed=1000,
-                 num_inference_steps=10, context_reset_every=0, **model_kwargs):
+                 seed_by_episode_uid=False, num_inference_steps=10,
+                 ode_rng_preconsume_size=0, context_reset_every=0, **model_kwargs):
     """A `FlowRolloutBackend` wearing a fake policy.
 
     `__init__` loads a multi-billion-parameter VLM, which is exactly what this suite does
@@ -187,6 +188,9 @@ def flow_backend(decoder_config=None, spec=None, decode="sample", seed=1000,
     backend = FlowRolloutBackend.__new__(FlowRolloutBackend)
     backend.decode = decode
     backend.seed = seed
+    backend.seed_by_episode_uid = seed_by_episode_uid
+    backend.uses_episode_uid = seed_by_episode_uid
+    backend.ode_rng_preconsume_size = ode_rng_preconsume_size
     backend._episode_count = 0
     backend.num_inference_steps = num_inference_steps
     backend._context = _PeriodicContextReset(context_reset_every)
@@ -199,6 +203,14 @@ def flow_backend(decoder_config=None, spec=None, decode="sample", seed=1000,
     backend.policy = _FakeFlowPolicy(model, spec)
     backend._pose = _PoseFeed(backend.policy, seed=seed)
     backend._stop = _StopStub()
+    backend._trajectory_stop_threshold_m = None
+    backend._trajectory_stop_yaw_threshold_rad = None
+    backend._trajectory_stop_min_steps = 0
+    backend._trajectory_stop_prefix_points = 10
+    backend._trajectory_stop = False
+    backend._trajectory_stop_stats = {}
+    backend._decision_index = 0
+    backend._stop_head_min_steps = 0
     return backend
 
 
@@ -243,6 +255,39 @@ def _flow_pose_spec():
 
 def _rgb():
     return np.zeros((8, 8, 3), dtype=np.uint8)
+
+
+def test_trajectory_stop_requires_both_translation_and_yaw_to_be_small():
+    import torch
+
+    backend = flow_backend()
+    backend._trajectory_stop_threshold_m = 0.01
+    backend._trajectory_stop_yaw_threshold_rad = 0.01
+    backend.policy.step = lambda *_args, **_kwargs: torch.tensor(
+        [[0.0, 0.0, 0.02]], dtype=torch.float32
+    )
+    backend.act(_rgb())
+    assert backend.wants_stop() is False
+    assert backend.last_stats["action_yaw_path_rad"] == pytest.approx(0.02)
+
+    backend.policy.step = lambda *_args, **_kwargs: torch.zeros((1, 3))
+    backend.act(_rgb())
+    assert backend.wants_stop() is True
+
+
+def test_trajectory_stop_uses_the_executable_chunk_prefix():
+    import torch
+
+    backend = flow_backend()
+    backend._trajectory_stop_threshold_m = 0.01
+    backend._trajectory_stop_yaw_threshold_rad = 0.01
+    backend._trajectory_stop_prefix_points = 10
+    backend.policy.step = lambda *_args, **_kwargs: torch.tensor(
+        [[0.0, 0.0, 0.0]] * 10 + [[1.0, 0.0, 0.0]], dtype=torch.float32
+    )
+    backend.act(_rgb())
+    assert backend.wants_stop() is True
+    assert backend.last_stats["action_path_length_m"] == pytest.approx(0.0)
 
 
 def _training_values(raw_poses, spec):
@@ -329,7 +374,41 @@ def test_backend_seeds_every_episode_unconditionally():
     backend.reset(goal_text="chair")
     assert backend.policy.__dict__["seeded"] == 1000
     backend.reset(goal_text="chair")
-    assert backend.policy.__dict__["seeded"] == 1001
+    assert backend.policy.__dict__["seeded"] == 1000
+
+
+def test_fixed_episode_seed_ignores_episode_uid():
+    backend = flow_backend(seed=42)
+    backend.reset(goal_text="sofa", episode_uid="wPLokgvCnuk:6")
+    assert backend.policy.__dict__["seeded"] == 42
+
+
+def test_uid_seed_option_is_rejected_for_fixed_episode_seeding():
+    from objectnav_eval.config import EvalConfig
+
+    with pytest.raises(ValueError, match="fixed per-episode"):
+        EvalConfig(
+            episodes="x", ckpt="/ckpt", policy_backend="flow_rollout",
+            policy_python="/usr/bin/python", policy_seed_by_episode_uid=True,
+        )
+
+
+def test_ode_rng_compatibility_consumes_the_raw_sampler_permutation():
+    import torch
+
+    backend = flow_backend(ode_rng_preconsume_size=9)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(37)
+    backend.policy.model.codec.generator = generator
+
+    expected = torch.Generator(device="cpu")
+    expected.manual_seed(37)
+    torch.randperm(9, generator=expected, device="cpu")
+    expected_next = torch.randn(4, generator=expected)
+
+    backend.act(_rgb())
+    actual_next = torch.randn(4, generator=generator)
+    torch.testing.assert_close(actual_next, expected_next)
 
 
 def test_backend_is_inert_on_a_checkpoint_with_no_pose_spec():
@@ -375,7 +454,7 @@ def test_describe_reports_the_integration_that_actually_ran():
     described = flow_backend(num_inference_steps=4).describe()
     assert "euler_steps=4" in described
     assert "action_scales=(0.03, 0.03, 0.05)" in described
-    assert "decode=sample" in described and "seed_base=1000" in described
+    assert "decode=sample" in described and "seed_reset_per_episode=1000" in described
     assert "n_ticks=10" in described
     assert "memory=unlimited" in described
 

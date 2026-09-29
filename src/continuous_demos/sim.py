@@ -51,22 +51,66 @@ import magnum as mn
 # =============================================================================
 
 
+def clip_navmesh_world_velocity(
+    pathfinder: Any,
+    start: np.ndarray,
+    world_v_x: float,
+    world_v_y: float,
+    dt: float,
+) -> tuple[float, float, bool, float]:
+    """Clip one planar world-frame velocity step to the active navmesh."""
+    if dt <= 0 or not getattr(pathfinder, "is_loaded", False):
+        return world_v_x, world_v_y, False, 0.0
+    start = np.asarray(start, dtype=np.float64)
+    if start.shape != (3,) or not np.isfinite(start).all():
+        return 0.0, 0.0, True, 0.0
+    target = start.copy()
+    target[0] += world_v_x * dt
+    target[2] -= world_v_y * dt
+    try:
+        allowed = np.asarray(pathfinder.try_step(start, target), dtype=np.float64)
+    except Exception:
+        allowed = np.full(3, np.nan, dtype=np.float64)
+    if allowed.shape != (3,) or not np.isfinite(allowed).all():
+        return 0.0, 0.0, True, float(np.linalg.norm(target[[0, 2]] - start[[0, 2]]))
+    requested = target[[0, 2]]
+    accepted = allowed[[0, 2]]
+    rejected_m = float(np.linalg.norm(requested - accepted))
+    if rejected_m <= 1e-6:
+        return world_v_x, world_v_y, False, 0.0
+    return (
+        float((allowed[0] - start[0]) / dt),
+        float(-(allowed[2] - start[2]) / dt),
+        True,
+        rejected_m,
+    )
+
+
 class HabitatRobotSim:
     def __init__(
-        self, 
-        sim_settings: Dict[str, Any], 
-        urdf_path: str, 
-        sensor_setup: Dict[str, List[habitat_sim.sensor.SensorSpec]], 
+        self,
+        sim_settings: Dict[str, Any],
+        urdf_path: str,
+        sensor_setup: Dict[str, List[habitat_sim.sensor.SensorSpec]],
         fixed_base: bool = False,
+        topdown_sensor_uuid: Optional[str] = None,
+        topdown_world_span_m: float = 60.0,
         # Must be a whole multiple/divisor of habitat's fixed Bullet timestep
         # (0.008 s) or each step_world() call spans a variable number of physics
         # steps -- see step() for the full aliasing story. 0.008 makes one
         # substep == exactly one physics step.
-        max_substep_dt: float = 0.008
+        max_substep_dt: float = 0.008,
     ):
         self.urdf_path = urdf_path
         self.sensor_setup = sensor_setup
         self.fixed_base = fixed_base
+        self.topdown_sensor_uuid = topdown_sensor_uuid
+        self.topdown_world_span_m = float(topdown_world_span_m)
+        if self.topdown_sensor_uuid and self.topdown_world_span_m <= 0:
+            raise ValueError("topdown_world_span_m must be positive")
+        self.navmesh_step_filter = False
+        self.navmesh_step_filter_hits = 0
+        self.navmesh_step_filter_rejected_m = 0.0
         self.max_substep_dt = max_substep_dt
         self.robot = None
         self.joint_name_to_motor_id = {}
@@ -74,6 +118,9 @@ class HabitatRobotSim:
         # scratch -- see _build_cfg / _reconfigure_scene.
         self.sim_settings = dict(sim_settings)
         self.agent_id = self.sim_settings.get("default_agent", 0)
+        self.topdown_agent_id = (
+            int(self.agent_id) + 1 if self.topdown_sensor_uuid is not None else None
+        )
         # Set by navmesh_config_and_recompute(); a scene switch reloads the
         # stock navmesh, so we re-run the recompute only if the caller asked
         # for one in the first place.
@@ -114,6 +161,18 @@ class HabitatRobotSim:
         for specs in self.sensor_setup.values():
             all_sensor_specs.extend(specs)
         cfg.agents[self.agent_id].sensor_specifications = all_sensor_specs
+        if self.topdown_sensor_uuid is not None:
+            topdown_agent = habitat_sim.agent.AgentConfiguration()
+            topdown_sensor = habitat_sim.CameraSensorSpec()
+            topdown_sensor.uuid = self.topdown_sensor_uuid
+            topdown_sensor.sensor_type = habitat_sim.SensorType.COLOR
+            topdown_sensor.sensor_subtype = habitat_sim.SensorSubType.ORTHOGRAPHIC
+            topdown_sensor.resolution = [1024, 1024]
+            topdown_sensor.position = [0.0, 0.0, 0.0]
+            # Habitat's orthographic scale is reciprocal to the world span.
+            topdown_sensor.ortho_scale = 1.0 / self.topdown_world_span_m
+            topdown_agent.sensor_specifications = [topdown_sensor]
+            cfg.agents.append(topdown_agent)
         return cfg
 
     def _reconfigure_scene(
@@ -184,8 +243,7 @@ class HabitatRobotSim:
                 break
         # Map link names to link IDs to easily find where to attach sensors
         link_name_to_id = {
-            self.robot.get_link_name(i): i 
-            for i in range(self.robot.num_links)
+            self.robot.get_link_name(i): i for i in range(self.robot.num_links)
         }
 
         # Attach sensors to the corresponding robot links
@@ -193,10 +251,10 @@ class HabitatRobotSim:
         for link_name, specs in self.sensor_setup.items():
             if link_name not in link_name_to_id:
                 raise ValueError(f"Link '{link_name}' not found in URDF.")
-                
+
             link_id = link_name_to_id[link_name]
             link_scene_node = self.robot.get_link_scene_node(link_id)
-            
+
             for spec in specs:
                 # Get the instantiated sensor node from the agent's subtree
                 sensor_node = agent_node.subtree_sensors.get(spec.uuid)
@@ -207,7 +265,14 @@ class HabitatRobotSim:
                     # z-up base_rotation_offset). Re-orient it so the camera looks
                     # along the robot's forward (+x body) in habitat's -z-forward
                     # image convention, instead of pointing at the floor.
-                    sensor_node.object.rotation = sensor_node.object.rotation = mn.Quaternion.rotation(mn.Rad(-math.pi/2), mn.Vector3(0, 1, 0))*mn.Quaternion.rotation(mn.Rad(-math.pi/2), mn.Vector3(0, 0, 1))
+                    sensor_node.object.rotation = sensor_node.object.rotation = (
+                        mn.Quaternion.rotation(
+                            mn.Rad(-math.pi / 2), mn.Vector3(0, 1, 0)
+                        )
+                        * mn.Quaternion.rotation(
+                            mn.Rad(-math.pi / 2), mn.Vector3(0, 0, 1)
+                        )
+                    )
                     # OPTIONAL rig yaw. A spec may declare `yaw_offset_rad` to
                     # sit at a fixed yaw relative to the robot's forward -- that
                     # is how continuous_demos.panoramic builds an N-camera ring
@@ -230,19 +295,20 @@ class HabitatRobotSim:
                     yaw_offset = float(getattr(spec, "yaw_offset_rad", 0.0))
                     if yaw_offset:
                         sensor_node.object.rotation = (
-                            mn.Quaternion.rotation(mn.Rad(yaw_offset), mn.Vector3(0, 0, 1))
+                            mn.Quaternion.rotation(
+                                mn.Rad(yaw_offset), mn.Vector3(0, 0, 1)
+                            )
                             * sensor_node.object.rotation
                         )
                     # Ensure the sensor is exactly at the URDF link's origin
                     sensor_node.object.translation = mn.Vector3(0, 0, 0)
-    
-    
+
     def step(
-        self, 
-        chassis_twist: np.ndarray, 
-        joint_targets: Optional[Dict[str, float]] = None, 
+        self,
+        chassis_twist: np.ndarray,
+        joint_targets: Optional[Dict[str, float]] = None,
         twist_frame: str = "robot",
-        dt: float = 1.0 / 60.0
+        dt: float = 1.0 / 60.0,
     ) -> dict:
         """Advance physics under a base twist command.
 
@@ -308,23 +374,46 @@ class HabitatRobotSim:
         substep_dt = dt / num_steps
 
         v_x_cmd, v_y_cmd, omega_cmd = chassis_twist
-        
+
         for step_idx in range(num_steps):
             # 1. Update chassis velocities
             if twist_frame == "world":
                 world_v_x, world_v_y = v_x_cmd, v_y_cmd
             elif twist_frame == "robot" or isinstance(twist_frame, tuple):
                 # Get current heading to transform body twist to world frame
-                heading = self.get_joint_state("joint_th") if twist_frame == "robot" else float(twist_frame[0])+float(twist_frame[1])*step_idx*substep_dt
-                
+                heading = (
+                    self.get_joint_state("joint_th")
+                    if twist_frame == "robot"
+                    else float(twist_frame[0])
+                    + float(twist_frame[1]) * step_idx * substep_dt
+                )
+
                 # Standard 2D rotation matrix
                 world_v_x = v_x_cmd * math.cos(heading) - v_y_cmd * math.sin(heading)
                 world_v_y = v_x_cmd * math.sin(heading) + v_y_cmd * math.cos(heading)
             else:
                 raise ValueError("twist_frame must be 'world' or 'robot'")
 
+            if self.navmesh_step_filter:
+                from continuous_demos.robot_pose import robot_navmesh_position
+
+                world_v_x, world_v_y, blocked, rejected_m = clip_navmesh_world_velocity(
+                    self.sim.pathfinder,
+                    robot_navmesh_position(self),
+                    world_v_x,
+                    world_v_y,
+                    substep_dt,
+                )
+                if blocked:
+                    self.navmesh_step_filter_hits += 1
+                    self.navmesh_step_filter_rejected_m += rejected_m
+
             # Apply to motors
-            for joint_name, vel in [("joint_x", world_v_x), ("joint_y", world_v_y), ("joint_th", omega_cmd)]:
+            for joint_name, vel in [
+                ("joint_x", world_v_x),
+                ("joint_y", world_v_y),
+                ("joint_th", omega_cmd),
+            ]:
                 motor_id = self.joint_name_to_motor_id.get(joint_name)
                 if motor_id is not None:
                     settings = self.robot.get_joint_motor_settings(motor_id)
@@ -342,9 +431,54 @@ class HabitatRobotSim:
 
             # 3. Advance physics
             self.sim.step_world(substep_dt)
-            
-    def get_obs(self) -> dict:# Return standard observation dictionary
+
+    def get_obs(self) -> dict:  # Return standard observation dictionary
         return self.sim.get_sensor_observations(self.agent_id)
+
+    def navmesh_step_filter_summary(self) -> Dict[str, Any]:
+        return {
+            "enabled": bool(self.navmesh_step_filter),
+            "hits": int(self.navmesh_step_filter_hits),
+            "rejected_m": float(self.navmesh_step_filter_rejected_m),
+        }
+
+    def capture_topdown_rgb(
+        self, center_xy: np.ndarray, height_m: float
+    ) -> np.ndarray:
+        """Capture a static orthographic scene view from the optional debug camera.
+
+        The overhead camera belongs to a second Habitat agent, never to the
+        articulated robot.  Moving it therefore cannot perturb physics or the
+        first-person observation supplied to the policy.
+        """
+        if self.topdown_sensor_uuid is None or self.topdown_agent_id is None:
+            raise RuntimeError("top-down camera was not enabled when this simulator was built")
+        center = np.asarray(center_xy, dtype=np.float32).reshape(2)
+        state = habitat_sim.AgentState()
+        state.position = np.asarray([center[0], float(height_m), -center[1]], dtype=np.float32)
+        state.rotation = np.asarray(
+            [-math.sin(math.pi / 4.0), 0.0, 0.0, math.cos(math.pi / 4.0)],
+            dtype=np.float32,
+        )
+        self.sim.get_agent(self.topdown_agent_id).set_state(state, reset_sensors=True)
+        rgba = self.sim.get_sensor_observations(self.topdown_agent_id)[self.topdown_sensor_uuid]
+        return np.ascontiguousarray(np.asarray(rgba)[..., :3], dtype=np.uint8)
+
+    def apply_camera_action(self, action: str, angle_degrees: float = 30.0) -> None:
+        """Apply one Habitat-style LOOK_UP/LOOK_DOWN action to every camera."""
+        action = str(action).upper()
+        if action not in {"LOOK_UP", "LOOK_DOWN"}:
+            raise ValueError(f"unsupported camera action {action!r}")
+        angle = float(angle_degrees) if action == "LOOK_UP" else -float(angle_degrees)
+        agent_node = self.sim.get_agent(self.agent_id).scene_node
+        for specs in self.sensor_setup.values():
+            for spec in specs:
+                sensor_node = agent_node.subtree_sensors.get(spec.uuid)
+                if sensor_node is not None:
+                    sensor_node.object.rotate_x_local(mn.Deg(angle))
+                    sensor_node.object.rotation = (
+                        sensor_node.object.rotation.normalized()
+                    )
 
     # Height (metres) the robot is parked at while its collision caches are
     # flushed. Habitat's Bullet world uses btDbvtBroadphase (a dynamic AABB
@@ -404,9 +538,11 @@ class HabitatRobotSim:
         self,
         scene_id: Optional[str] = None,
         robot_translation: Optional[np.ndarray] = None,
-        robot_rotation: Optional[Any] = None,  # Accepts mn.Quaternion or [x, y, z, w] array
+        robot_rotation: Optional[
+            Any
+        ] = None,  # Accepts mn.Quaternion or [x, y, z, w] array
         snap_to_navmesh: bool = True,
-        vertical_offset: Optional[float] = None, # Manual override if AABB is weird
+        vertical_offset: Optional[float] = None,  # Manual override if AABB is weird
         home_joint_positions: Optional[Dict[str, float]] = None,
         scene_dataset_config: Optional[str] = None,
     ) -> dict:
@@ -428,6 +564,8 @@ class HabitatRobotSim:
         binding can reset -- see dump/sim_reset_fix/FINDINGS.md and
         tests/test_sim_reset_isolation.py.
         """
+        self.navmesh_step_filter_hits = 0
+        self.navmesh_step_filter_rejected_m = 0.0
         # 1. Handle Scene Changes and Graph Rebuild
         if scene_id is not None and scene_id != self.cfg.sim_cfg.scene_id:
             self._reconfigure_scene(scene_id, scene_dataset_config)
@@ -468,7 +606,9 @@ class HabitatRobotSim:
         if robot_rotation is not None:
             if isinstance(robot_rotation, (np.ndarray, list, tuple)):
                 if len(robot_rotation) != 4:
-                    raise ValueError("robot_rotation array must have 4 elements: [x, y, z, w]")
+                    raise ValueError(
+                        "robot_rotation array must have 4 elements: [x, y, z, w]"
+                    )
                 # Habitat agent quaternion [x, y, z, w]. Habitat is x=right, y=up,
                 # z=back, so the agent's FORWARD is -z (habitat_sim.geo.FRONT), NOT
                 # +x. Remap the quaternion into the magnum/planar frame ((hx,hy,hz)
@@ -476,7 +616,9 @@ class HabitatRobotSim:
                 # to +y, so the agent's forward axis is +y here (not +x).
                 x, y, z, w = robot_rotation
                 robot_rotation = mn.Quaternion(mn.Vector3(x, -z, y), w)
-                forward_vec = np.array([0.0, 1.0, 0.0])  # habitat FRONT (-z) in magnum frame
+                forward_vec = np.array(
+                    [0.0, 1.0, 0.0]
+                )  # habitat FRONT (-z) in magnum frame
             else:
                 # Already a magnum quaternion in the planar frame; its +x is forward.
                 forward_vec = np.array([1.0, 0.0, 0.0])
@@ -484,8 +626,10 @@ class HabitatRobotSim:
                 home_joint_positions = {}
             rotated_forward = robot_rotation.transform_vector(forward_vec)
             # Heading in the control frame X=habitat_x, Y=-habitat_z (== hab_quat_to_heading).
-            home_joint_positions["joint_th"] = float(np.arctan2(rotated_forward[1], rotated_forward[0]))
-        self.robot.rotation = self.base_rotation_offset #TODO: allow non aligned base.
+            home_joint_positions["joint_th"] = float(
+                np.arctan2(rotated_forward[1], rotated_forward[0])
+            )
+        self.robot.rotation = self.base_rotation_offset  # TODO: allow non aligned base.
 
         # 3. Handle NavMesh Snapping & Vertical Offsets
         if robot_translation is not None:
@@ -493,7 +637,7 @@ class HabitatRobotSim:
                 safe_point = self.sim.pathfinder.snap_point(robot_translation)
                 if not np.isnan(safe_point[0]):
                     robot_translation = safe_point
-            
+
             # Compute dynamic vertical offset if not manually provided
             if vertical_offset is None:
                 aabb = self.robot.root_scene_node.cumulative_bb
@@ -503,7 +647,7 @@ class HabitatRobotSim:
             # Apply translation with offset (Habitat is Y-up)
             robot_translation[1] += vertical_offset
             self.robot.translation = robot_translation
-            
+
         # 4. Clear physics momentum & set home joints
         # Zero out velocities and forces to prevent flying away after teleport
         num_dofs = len(self.robot.joint_velocities)
@@ -526,14 +670,14 @@ class HabitatRobotSim:
         # first step_world() is a function of the spawn pose and nothing else.
         # See _flush_physics_contact_state().
         self._flush_physics_contact_state()
-                    
-                    # # Update the motor target so it doesn't try to snap back
-                    # settings = self.robot.get_joint_motor_settings(m_id)
-                    # settings.position_target = pos_target
-                    # self.robot.update_joint_motor(m_id, settings)
+
+        # # Update the motor target so it doesn't try to snap back
+        # settings = self.robot.get_joint_motor_settings(m_id)
+        # settings.position_target = pos_target
+        # self.robot.update_joint_motor(m_id, settings)
         # self.robot.awake = True
-        
-    #TODO: fix this
+
+    # TODO: fix this
     def get_joint_state(self, joint_name: str, is_vel: bool = False) -> float:
         """
         Retrieves the position or velocity of a specific joint by its name.
@@ -541,7 +685,7 @@ class HabitatRobotSim:
         motor_id = self.joint_name_to_motor_id.get(joint_name)
         if motor_id is None:
             raise ValueError(f"Joint '{joint_name}' not found in motor mappings.")
-            
+
         link_id = self.robot.existing_joint_motor_ids[motor_id]
         if is_vel:
             # joint_velocities are indexed by DOF id
@@ -551,8 +695,10 @@ class HabitatRobotSim:
             # joint_positions are indexed by position offset
             pos_offset = self.robot.get_link_joint_pos_offset(link_id)
             return self.robot.joint_positions[pos_offset]
-        
-    def get_2d_pose_and_twist(self, virtual_heading = None) -> tuple[np.ndarray, np.ndarray]:
+
+    def get_2d_pose_and_twist(
+        self, virtual_heading=None
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Pose [X, Y, theta] and twist [v_forward, w] in the planar control frame.
 
         The world position is X = habitat_x, Y = -habitat_z, assembled as the
@@ -563,7 +709,11 @@ class HabitatRobotSim:
         """
         jx = self.get_joint_state("joint_x")
         jy = self.get_joint_state("joint_y")
-        jth = self.get_joint_state("joint_th") if virtual_heading is None else virtual_heading  # Adjust for URDF orientation
+        jth = (
+            self.get_joint_state("joint_th")
+            if virtual_heading is None
+            else virtual_heading
+        )  # Adjust for URDF orientation
 
         # Retrieve current velocity
         vx = self.get_joint_state("joint_x", is_vel=True)
@@ -571,12 +721,12 @@ class HabitatRobotSim:
         vth = self.get_joint_state("joint_th", is_vel=True)
 
         # rx = habitat_x, rz = habitat_z of the base; planar Y uses -habitat_z.
-        rz,rx = self.robot.translation[2],self.robot.translation[0]
+        rz, rx = self.robot.translation[2], self.robot.translation[0]
         v_forward = vx * math.cos(jth) + vy * math.sin(jth)
 
         # limit jth to [-pi, pi]
         jth = (jth + math.pi) % (2 * math.pi) - math.pi
-        return np.array([jx+rx,jy-rz, jth]), np.array([v_forward, vth])
+        return np.array([jx + rx, jy - rz, jth]), np.array([v_forward, vth])
 
     def get_2d_pose(self) -> np.ndarray:
         """Planar pose [X, Y, theta] with X=habitat_x, Y=-habitat_z, theta=joint_th."""
@@ -585,10 +735,10 @@ class HabitatRobotSim:
         jth = self.get_joint_state("joint_th")
 
         jth = (jth + math.pi) % (2 * math.pi) - math.pi
-        rz,rx = self.robot.translation[2],self.robot.translation[0]
-        return np.array([jx+rx,jy-rz, jth])
+        rz, rx = self.robot.translation[2], self.robot.translation[0]
+        return np.array([jx + rx, jy - rz, jth])
 
-    def is_stationary(self,lin_vel_threshold, ang_vel_threshold) -> bool:
+    def is_stationary(self, lin_vel_threshold, ang_vel_threshold) -> bool:
         """
         Checks if the robot is stationary based on linear and angular velocity thresholds.
         """
@@ -600,7 +750,7 @@ class HabitatRobotSim:
         angular_speed = abs(vth)
 
         return linear_speed < lin_vel_threshold and angular_speed < ang_vel_threshold
-    
+
     def is_tipped_over(self, angle_threshold_degrees: float = 45.0) -> bool:
         """
         Checks if the robot is tipped over based on its orientation.
@@ -608,8 +758,10 @@ class HabitatRobotSim:
         # Get the robot's up vector in world coordinates
         roll = self.get_joint_state("joint_roll")
         pitch = self.get_joint_state("joint_pitch")
-        return abs(roll) > math.radians(angle_threshold_degrees) or abs(pitch) > math.radians(angle_threshold_degrees)
-    
+        return abs(roll) > math.radians(angle_threshold_degrees) or abs(
+            pitch
+        ) > math.radians(angle_threshold_degrees)
+
     def navmesh_config_and_recompute(self) -> None:
         """
         This method is setup to be overridden in for setting config accessibility
@@ -630,26 +782,33 @@ class HabitatRobotSim:
         # the scene's stock navmesh, which is cut for a point agent, not for
         # this robot's radius/height.
         self._navmesh_recomputed = True
-        
+
     def draw_axes(self, translation, axis_len=1.0):
         lr = self.sim.get_debug_line_render()
         lr.set_line_width(5)
 
-        opacity = 1.0   
+        opacity = 1.0
         red = mn.Color4(1.0, 0.0, 0.0, opacity)
         green = mn.Color4(0.0, 1.0, 0.0, opacity)
         blue = mn.Color4(0.0, 0.0, 1.0, opacity)
         white = mn.Color4(1.0, 1.0, 1.0, opacity)
         # draw axes with x+ = red, y+ = green, z+ = blue
-        lr.draw_transformed_line(translation, mn.Vector3(axis_len, 0, 0)+translation, red)
-        lr.draw_transformed_line(translation, mn.Vector3(0, axis_len, 0)+translation, green)
-        lr.draw_transformed_line(translation, mn.Vector3(0, 0, axis_len)+translation, blue)
-    
-    def draw_path(self,path_3d,color):
+        lr.draw_transformed_line(
+            translation, mn.Vector3(axis_len, 0, 0) + translation, red
+        )
+        lr.draw_transformed_line(
+            translation, mn.Vector3(0, axis_len, 0) + translation, green
+        )
+        lr.draw_transformed_line(
+            translation, mn.Vector3(0, 0, axis_len) + translation, blue
+        )
+
+    def draw_path(self, path_3d, color):
         lr = self.sim.get_debug_line_render()
         lr.set_line_width(5)
-        opacity = 1.0   
+        opacity = 1.0
         offset = mn.Vector3(0, 0.2, 0)
-        for i in range(len(path_3d)-1):
-            lr.draw_transformed_line(path_3d[i]+offset, path_3d[i+1]+offset, color)
-
+        for i in range(len(path_3d) - 1):
+            lr.draw_transformed_line(
+                path_3d[i] + offset, path_3d[i + 1] + offset, color
+            )

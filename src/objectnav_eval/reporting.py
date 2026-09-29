@@ -18,10 +18,13 @@ summary. Reading only the evaluated episodes would silently overstate coverage.
 
 from __future__ import annotations
 
+import gzip
 import json
+import os
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
+from urllib.parse import quote
 
 import numpy as np
 
@@ -322,6 +325,12 @@ def episode_line(record: Dict[str, Any]) -> Dict[str, Any]:
     contact = record.get("contact") or {}
     coherence = record.get("coherence") or {}
     escape = record.get("escape") or {}
+    trajectory_file = record.get("trajectory_file")
+    if trajectory_file is None and "trajectory" in record:
+        trajectory_file = str(_trajectory_relative_path(record["uid"]))
+    details_file = record.get("details_file")
+    if details_file is None and _has_episode_details(record):
+        details_file = str(_details_relative_path(record["uid"]))
     line = {
         "uid": record["uid"], "scene": record["scene"],
         "episode_id": record["episode_id"], "category": record["category"],
@@ -342,6 +351,12 @@ def episode_line(record: Dict[str, Any]) -> Dict[str, Any]:
         "path_m": jsonable(record.get("path_length_m"), 2),
         "path_at_min_m": jsonable(record.get("path_at_min_m"), 2),
         "steps": record.get("steps"),
+        "ticks": record.get("ticks"),
+        "sim_seconds": jsonable(record.get("sim_seconds"), 3),
+        "wall_seconds": jsonable(record.get("wall_seconds"), 3),
+        "mean_policy_latency_s": jsonable(
+            record.get("mean_policy_latency_s"), 6
+        ),
         "terminated": record.get("terminated"),
         "terminated_by": (
             record.get("terminated_by") or terminated_code(record.get("terminated"))
@@ -366,6 +381,8 @@ def episode_line(record: Dict[str, Any]) -> Dict[str, Any]:
         "escaped": escape.get("escaped"),
         "total_drop_m": jsonable(escape.get("total_drop_m"), 2),
         "video": Path(record["video"]).name if record.get("video") else None,
+        "trajectory_file": trajectory_file,
+        "details_file": details_file,
     }
     return line
 
@@ -393,15 +410,123 @@ def write_results(
 ) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    compact_results = externalize_trajectories(path, results)
+    compact_results = externalize_episode_details(path, compact_results)
     payload = {
         "summary": jsonable(summary, 6),
-        "results": jsonable(sorted(results, key=lambda r: r["uid"]), 6),
+        "results": jsonable(sorted(compact_results, key=lambda r: r["uid"]), 6),
         "skipped": jsonable(sorted(skipped, key=lambda r: r["uid"]), 6),
     }
     if config is not None:
         payload["config"] = config
-    path.write_text(json.dumps(payload, indent=2))
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(payload, indent=2))
+    temporary.replace(path)
     return path
+
+
+def _trajectory_relative_path(uid: str) -> Path:
+    filename = f"{quote(str(uid), safe='')}.json.gz"
+    return Path("trajectories") / filename
+
+
+def _details_relative_path(uid: str) -> Path:
+    filename = f"{quote(str(uid), safe='')}.json.gz"
+    return Path("episode_details") / filename
+
+
+def _has_episode_details(record: Dict[str, Any]) -> bool:
+    if record.get("step_timing"):
+        return True
+    return any(
+        isinstance(record.get(section), dict)
+        and trace_key in record[section]
+        for section, trace_key in (
+            ("goal_distance", "trace"),
+            ("stop", "trace"),
+            ("action_stop", "trace"),
+            ("pose_injected", "trace"),
+            ("sg_mapping_action_trace", "samples"),
+        )
+    )
+
+
+def externalize_trajectories(
+    result_path: Path, results: Sequence[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    compact_results: List[Dict[str, Any]] = []
+    for record in results:
+        compact = dict(record)
+        trajectory = compact.pop("trajectory", None)
+        if trajectory is not None:
+            relative_path = _trajectory_relative_path(str(record["uid"]))
+            trajectory_path = result_path.parent / relative_path
+            trajectory_path.parent.mkdir(parents=True, exist_ok=True)
+            if not trajectory_path.exists():
+                temporary_path = trajectory_path.with_name(
+                    f".{trajectory_path.name}.{os.getpid()}.tmp"
+                )
+                with gzip.open(temporary_path, "wt", encoding="utf-8") as handle:
+                    json.dump(
+                        jsonable(trajectory, 6),
+                        handle,
+                        separators=(",", ":"),
+                    )
+                os.replace(temporary_path, trajectory_path)
+            compact["trajectory_file"] = str(relative_path)
+        compact_results.append(compact)
+    return compact_results
+
+
+def externalize_episode_details(
+    result_path: Path, results: Sequence[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Move per-step diagnostic arrays out of the user-facing results JSON."""
+    compact_results: List[Dict[str, Any]] = []
+    for record in results:
+        compact = dict(record)
+        details: Dict[str, Any] = {"uid": str(record["uid"])}
+
+        step_timing = compact.pop("step_timing", None)
+        if step_timing:
+            details["step_timing"] = step_timing
+
+        for section, trace_key in (
+            ("goal_distance", "trace"),
+            ("stop", "trace"),
+            ("action_stop", "trace"),
+            ("pose_injected", "trace"),
+            ("sg_mapping_action_trace", "samples"),
+        ):
+            values = compact.get(section)
+            if not isinstance(values, dict) or trace_key not in values:
+                continue
+            compact_values = dict(values)
+            trace = compact_values.pop(trace_key)
+            details[section] = {trace_key: trace}
+            if compact_values:
+                compact[section] = compact_values
+            else:
+                compact.pop(section, None)
+
+        if len(details) > 1:
+            relative_path = _details_relative_path(str(record["uid"]))
+            details_path = result_path.parent / relative_path
+            details_path.parent.mkdir(parents=True, exist_ok=True)
+            if not details_path.exists():
+                temporary_path = details_path.with_name(
+                    f".{details_path.name}.{os.getpid()}.tmp"
+                )
+                with gzip.open(temporary_path, "wt", encoding="utf-8") as handle:
+                    json.dump(
+                        jsonable(details, 6),
+                        handle,
+                        separators=(",", ":"),
+                    )
+                os.replace(temporary_path, details_path)
+            compact["details_file"] = str(relative_path)
+        compact_results.append(compact)
+    return compact_results
 
 
 # ---------------------------------------------------------------------------
@@ -427,8 +552,8 @@ def print_summary(
         for reason, items in sorted(by_reason.items()):
             print(f"    {len(items)}x  {reason}")
             for item in items:
-                dataset = item.get("geodesic_start_dataset_m", float("nan"))
-                dataset_text = f"{dataset:.2f} m" if np.isfinite(dataset) else "n/a"
+                dataset = item.get("geodesic_start_dataset_m")
+                dataset_text = f"{float(dataset):.2f} m" if is_finite(dataset) else "n/a"
                 print(
                     f"        {item['uid']:<28} {str(item['category']):<14} "
                     f"dataset-navmesh geodesic {dataset_text}"
@@ -643,8 +768,19 @@ def load_and_merge(path: Path) -> Dict[str, Any]:
         payloads = [
             json.loads(p.read_text()) for p in sorted(path.glob("*_results.json"))
         ]
-        results = [r for p in payloads for r in p.get("results", [])]
-        skipped = [s for p in payloads for s in p.get("skipped", [])]
+        results_by_uid = {
+            str(record["uid"]): record
+            for payload in payloads
+            for record in payload.get("results", [])
+        }
+        skipped_by_uid = {
+            str(record["uid"]): record
+            for payload in payloads
+            for record in payload.get("skipped", [])
+            if str(record["uid"]) not in results_by_uid
+        }
+        results = list(results_by_uid.values())
+        skipped = list(skipped_by_uid.values())
         return {"results": results, "skipped": skipped, "path": path / "merged_results.json"}
     payload = json.loads(path.read_text())
     return {

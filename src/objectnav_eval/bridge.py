@@ -95,6 +95,9 @@ class PolicyBackend:
     def describe(self) -> str:
         return type(self).__name__
 
+    def close(self) -> None:
+        pass
+
 
 _BACKENDS: Dict[str, Callable[..., PolicyBackend]] = {}
 
@@ -669,6 +672,11 @@ class _StopHeadControl:
         inference: Optional[str] = None,
     ):
         self.head = getattr(getattr(policy, "model", None), "stop_head", None)
+        self._state_probe = False
+        if self.head is None:
+            probe = getattr(policy, "_probe", None)
+            self.head = getattr(probe, "stop_head", None)
+            self._state_probe = self.head is not None
         self.enabled = bool(enabled)
         if self.enabled and self.head is None:
             raise ValueError(
@@ -677,6 +685,20 @@ class _StopHeadControl:
                 "--auto-stop for the oracle stop instead."
             )
         if self.head is None:
+            return
+        if self._state_probe:
+            self.inference = inference or "threshold"
+            if self.inference not in self.MODES:
+                raise ValueError(
+                    f"stop inference must be one of {self.MODES}, got {self.inference!r}"
+                )
+            self.temperature = 1.0 if temperature is None else float(temperature)
+            self.threshold = 0.5 if threshold is None else float(threshold)
+            if self.temperature <= 0:
+                raise ValueError(f"stop temperature must be > 0, got {temperature}")
+            if not 0.0 <= self.threshold <= 1.0:
+                raise ValueError(f"stop threshold must be in [0, 1], got {threshold}")
+            self._rng = None
             return
         cfg = self.head.cfg
         if inference is not None:
@@ -704,7 +726,11 @@ class _StopHeadControl:
         but only called when sampling, so a threshold run does not allocate a
         generator it will never read.
         """
-        if self.head is not None and self.head.cfg.inference == "sample":
+        if self._state_probe and self.inference == "sample":
+            import numpy as np
+
+            self._rng = np.random.default_rng(int(seed))
+        elif not self._state_probe and self.head is not None and self.head.cfg.inference == "sample":
             policy.seed_stop(int(seed))
 
     def annotate(self, stats: Dict[str, Any]) -> Dict[str, Any]:
@@ -725,6 +751,16 @@ class _StopHeadControl:
         """
         if self.head is None:
             return stats
+        if self._state_probe:
+            raw = stats.get("stop_logit")
+            if raw is None:
+                return stats
+            import math
+
+            raw = float(raw)
+            stats["stop_logit"] = raw
+            stats["stop_prob"] = 1.0 / (1.0 + math.exp(-raw / self.temperature))
+            return stats
         prob = stats.get("stop_prob")
         if prob is None:
             return stats
@@ -741,11 +777,33 @@ class _StopHeadControl:
         computed under the configured inference rule. Recomputing it here would
         be a second decision rule for the same logit.
         """
-        return bool(self.enabled and stats.get("stop"))
+        if not self.enabled:
+            return False
+        if not self._state_probe:
+            return bool(stats.get("stop"))
+        raw = stats.get("stop_logit")
+        if raw is None:
+            return False
+        import math
+
+        prob = 1.0 / (1.0 + math.exp(-float(raw) / self.temperature))
+        if self.inference == "sample":
+            if self._rng is None:
+                raise RuntimeError("state-probe stop sampler was not seeded")
+            return bool(self._rng.random() < prob)
+        if self.inference == "argmax":
+            return bool(prob >= 0.5)
+        return bool(prob >= self.threshold)
 
     def describe(self) -> str:
         if self.head is None:
             return "stop head=none (oracle --auto-stop is the only termination)"
+        if self._state_probe:
+            state = "ACTIVE" if self.enabled else "reported only (not acting)"
+            return (
+                f"state-probe stop head={state} inference={self.inference} "
+                f"temperature={self.temperature} threshold={self.threshold}"
+            )
         cfg = self.head.cfg
         state = "ACTIVE" if self.enabled else "reported only (not acting)"
         return (
@@ -1263,17 +1321,24 @@ class FlowRolloutBackend(PolicyBackend):
         self,
         ckpt: str,
         device: str = "cuda",
-        merge_lora: bool = True,
+        merge_lora: bool = False,
         max_context_tokens: int = 0,
         placeholder: Optional[str] = None,
         decode: str = "sample",
         num_inference_steps: Optional[int] = None,
         seed: int = 0,
+        seed_by_episode_uid: bool = False,
+        ode_rng_preconsume_size: int = 0,
         context_reset_every: int = 0,
         stop_head: bool = False,
         stop_temperature: Optional[float] = None,
         stop_threshold: Optional[float] = None,
         stop_inference: Optional[str] = None,
+        stop_head_min_steps: int = 0,
+        trajectory_stop_threshold_m: Optional[float] = None,
+        trajectory_stop_yaw_threshold_rad: Optional[float] = None,
+        trajectory_stop_min_steps: int = 0,
+        trajectory_stop_prefix_points: int = 10,
         pose_mirror: bool = False,
         pose_rotate_deg: float = 0.0,
         pose_foreign: Optional[str] = None,
@@ -1306,6 +1371,15 @@ class FlowRolloutBackend(PolicyBackend):
             config.placeholder = placeholder
         self.decode = decode
         self.seed = int(seed)
+        if seed_by_episode_uid:
+            raise ValueError(
+                "seed_by_episode_uid is incompatible with fixed per-episode policy seeding"
+            )
+        self.seed_by_episode_uid = False
+        self.uses_episode_uid = False
+        self.ode_rng_preconsume_size = int(ode_rng_preconsume_size)
+        if self.ode_rng_preconsume_size < 0:
+            raise ValueError("ode_rng_preconsume_size must be >= 0")
         self._episode_count = 0
         # 0 = unlimited memory (production default); see _PeriodicContextReset.
         self._context = _PeriodicContextReset(context_reset_every)
@@ -1326,6 +1400,37 @@ class FlowRolloutBackend(PolicyBackend):
             self.policy, enabled=stop_head, temperature=stop_temperature,
             threshold=stop_threshold, inference=stop_inference,
         )
+        self._stop_head_min_steps = int(stop_head_min_steps)
+        if self._stop_head_min_steps < 0:
+            raise ValueError("stop_head_min_steps must be non-negative")
+        if self._stop_head_min_steps and not stop_head:
+            raise ValueError("stop_head_min_steps requires stop_head")
+        self._trajectory_stop_threshold_m = trajectory_stop_threshold_m
+        self._trajectory_stop_yaw_threshold_rad = trajectory_stop_yaw_threshold_rad
+        self._trajectory_stop_min_steps = int(trajectory_stop_min_steps)
+        self._trajectory_stop_prefix_points = int(trajectory_stop_prefix_points)
+        if (
+            trajectory_stop_threshold_m is None
+        ) != (
+            trajectory_stop_yaw_threshold_rad is None
+        ):
+            raise ValueError(
+                "trajectory STOP requires both translation and yaw thresholds"
+            )
+        if trajectory_stop_threshold_m is not None and (
+            float(trajectory_stop_threshold_m) < 0.0
+            or float(trajectory_stop_yaw_threshold_rad) < 0.0
+        ):
+            raise ValueError("trajectory STOP thresholds must be non-negative")
+        if self._trajectory_stop_min_steps < 0:
+            raise ValueError("trajectory_stop_min_steps must be non-negative")
+        if self._trajectory_stop_prefix_points < 1:
+            raise ValueError("trajectory_stop_prefix_points must be positive")
+        if stop_head and trajectory_stop_threshold_m is not None:
+            raise ValueError("trajectory STOP and --stop-head are mutually exclusive")
+        self._trajectory_stop = False
+        self._trajectory_stop_stats: Dict[str, Any] = {}
+        self._decision_index = 0
 
     def _reseed(self, seed: int) -> None:
         """Pin this episode's noise draws.
@@ -1338,14 +1443,19 @@ class FlowRolloutBackend(PolicyBackend):
         """
         self._seed_sampling(self.policy, int(seed))
 
-    def reset(self, goal_text: Optional[str]) -> None:
+    def reset(self, goal_text: Optional[str], episode_uid: Optional[str] = None) -> None:
         self.policy.reset(**self._pose.reset_kwargs(goal_text))
-        # Unconditional: one generation mode, and it always draws noise.
-        self._reseed(self.seed + self._episode_count)
+        # Every episode starts from the same policy RNG state.  Simulator construction and
+        # worker ordering are intentionally outside the policy's random stream.
+        episode_seed = self.seed
+        self._reseed(episode_seed)
         self._pose.on_episode_reset()
-        self._stop.seed(self.policy, self.seed + self._episode_count)
+        self._stop.seed(self.policy, episode_seed)
         self._episode_count += 1
         self._context.on_episode_reset(goal_text)
+        self._trajectory_stop = False
+        self._trajectory_stop_stats = {}
+        self._decision_index = 0
 
     def act(self, rgb: np.ndarray, pose: Optional[Sequence[float]] = None,
             goal: Optional[Sequence[float]] = None) -> np.ndarray:
@@ -1353,20 +1463,61 @@ class FlowRolloutBackend(PolicyBackend):
 
         # No-op unless --policy-memory-seconds was passed; see _PeriodicContextReset.
         self._context.before_act(self.policy)
+        if self.ode_rng_preconsume_size:
+            import torch
+
+            codec = self.policy.model.codec
+            if codec.generator is None:
+                raise RuntimeError("ODE RNG compatibility requires a seeded flow codec")
+            torch.randperm(
+                self.ode_rng_preconsume_size,
+                generator=codec.generator,
+                device=codec.action_scales.device,
+            )
         chunk = self.policy.step(
             Image.fromarray(rgb), **self._pose.step_kwargs(self.policy, pose, goal)
         )
-        return np.asarray(chunk.numpy(), dtype=np.float32)
+        chunk_array = np.asarray(chunk.numpy(), dtype=np.float32)
+        trajectory_stop_threshold_m = getattr(self, "_trajectory_stop_threshold_m", None)
+        if trajectory_stop_threshold_m is not None:
+            from longnav.utils.trajectory_stop import trajectory_stop_decision
+
+            self._trajectory_stop, translation_m, yaw_rad = trajectory_stop_decision(
+                chunk_array,
+                translation_threshold_m=float(trajectory_stop_threshold_m),
+                yaw_threshold_rad=float(self._trajectory_stop_yaw_threshold_rad),
+                decision_index=getattr(self, "_decision_index", 0),
+                min_steps=getattr(self, "_trajectory_stop_min_steps", 0),
+                prefix_points=getattr(self, "_trajectory_stop_prefix_points", 10),
+            )
+            self._trajectory_stop_stats = {
+                "action_path_length_m": translation_m,
+                "action_yaw_path_rad": yaw_rad,
+                "trajectory_stop_threshold_m": float(trajectory_stop_threshold_m),
+                "trajectory_stop_yaw_threshold_rad": float(
+                    self._trajectory_stop_yaw_threshold_rad
+                ),
+                "trajectory_stop_min_steps": self._trajectory_stop_min_steps,
+                "trajectory_stop_prefix_points": self._trajectory_stop_prefix_points,
+                "trajectory_stop": self._trajectory_stop,
+            }
+        self._decision_index = getattr(self, "_decision_index", 0) + 1
+        return chunk_array
 
     @property
     def last_stats(self) -> Dict[str, Any]:
         stats = self._pose.annotate(self._stop.annotate(_wire_safe(self.policy.last_stats)))
+        stats.update(self._trajectory_stop_stats)
         context = getattr(self, "_context", None)
         if context is not None and context.every:
             stats["context_resets"] = context.resets
         return stats
 
     def wants_stop(self) -> bool:
+        if getattr(self, "_trajectory_stop", False):
+            return True
+        if self._decision_index <= self._stop_head_min_steps:
+            return False
         return self._stop.decided(self.policy.last_stats)
 
     #: Velocity-field options that default OFF or to the shape the v8 run uses, so a
@@ -1401,16 +1552,27 @@ class FlowRolloutBackend(PolicyBackend):
                   if context is not None and context.every else "memory=unlimited")
         pose = getattr(self, "_pose", None)
         stop = getattr(self, "_stop", None)
+        seed_description = (
+            f"seed_reset_per_episode={self.seed}"
+        )
         return (
             f"{self.policy.describe()}\n"
-            f"  [flow decode={self.decode} seed_base={self.seed} "
+            f"  [flow decode={self.decode} {seed_description} "
             f"n_ticks={model.decoder.n_ticks} {memory}]\n"
             f"  [flow ODE euler_steps={getattr(self, 'num_inference_steps', None)} "
-            f"action_scales={scales}]\n"
+            f"action_scales={scales} rng_preconsume={self.ode_rng_preconsume_size}]\n"
             f"  [flow field d_model={cfg.get('d_model')} n_layers={cfg.get('n_layers')} "
             f"n_heads={cfg.get('n_heads')} {arch}]"
             + (f"\n  [{pose.describe()}]" if pose is not None else "")
             + (f"\n  [{stop.describe()}]" if stop is not None else "")
+            + (
+                "\n  [trajectory stop "
+                f"xy<={getattr(self, '_trajectory_stop_threshold_m', None)} "
+                f"yaw<={getattr(self, '_trajectory_stop_yaw_threshold_rad', None)} "
+                f"min_steps={getattr(self, '_trajectory_stop_min_steps', 0)} "
+                f"prefix={getattr(self, '_trajectory_stop_prefix_points', 10)}]"
+                if getattr(self, "_trajectory_stop_threshold_m", None) is not None else ""
+            )
         )
 
 
@@ -1439,7 +1601,10 @@ def serve(socket_path: str, backend: PolicyBackend) -> None:
                 if command == CMD_STOP:
                     break
                 if command == CMD_RESET:
-                    backend.reset(message.get("goal_text"))
+                    reset_kwargs = {}
+                    if getattr(backend, "uses_episode_uid", False):
+                        reset_kwargs["episode_uid"] = message.get("episode_uid")
+                    backend.reset(message.get("goal_text"), **reset_kwargs)
                     conn.send({"ok": True})
                     continue
                 rgb = np.frombuffer(message["data"], dtype=message["dtype"]).reshape(
@@ -1450,9 +1615,24 @@ def serve(socket_path: str, backend: PolicyBackend) -> None:
                 # both. `.get` rather than `[...]`, so a sim side predating pose
                 # still talks to a server that has it -- the backend raises with
                 # a real explanation if its checkpoint actually needed one.
+                depth = None
+                if message.get("depth_data") is not None:
+                    depth = np.frombuffer(
+                        message["depth_data"], dtype=message["depth_dtype"]
+                    ).reshape(message["depth_shape"])
+                extra = {"depth": depth} if depth is not None else {}
+                if getattr(backend, "uses_camera_pose", False):
+                    extra["camera_pose"] = message.get("camera_pose")
+                if getattr(backend, "uses_floor_height", False):
+                    extra["floor_height"] = message.get("floor_height")
                 chunk = np.asarray(
-                    backend.act(rgb, pose=message.get("pose"),
-                                goal=message.get("goal")), dtype=np.float32
+                    backend.act(
+                        rgb,
+                        pose=message.get("pose"),
+                        goal=message.get("goal"),
+                        **extra,
+                    ),
+                    dtype=np.float32,
                 )
                 conn.send(
                     {
@@ -1468,6 +1648,7 @@ def serve(socket_path: str, backend: PolicyBackend) -> None:
                 traceback.print_exc()
                 conn.send({"error": f"{type(exc).__name__}: {exc}"})
     finally:
+        backend.close()
         conn.close()
     print("policy server exiting", flush=True)
 
@@ -1584,12 +1765,19 @@ class PolicyBridge:
             raise RuntimeError(f"policy server error: {reply['error']}")
         return reply
 
-    def reset(self, goal_text: Optional[str]) -> None:
-        self._rpc({"cmd": CMD_RESET, "goal_text": goal_text})
+    def reset(self, goal_text: Optional[str], episode_uid: Optional[str] = None) -> None:
+        self._rpc(
+            {"cmd": CMD_RESET, "goal_text": goal_text, "episode_uid": episode_uid}
+        )
 
     def act(self, rgb: np.ndarray, pose: Optional[Sequence[float]] = None,
-            goal: Optional[Sequence[float]] = None) -> Dict[str, Any]:
+            goal: Optional[Sequence[float]] = None,
+            depth: Optional[np.ndarray] = None,
+            camera_pose: Optional[Sequence[float]] = None,
+            floor_height: Optional[float] = None) -> Dict[str, Any]:
         rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
+        if depth is not None:
+            depth = np.ascontiguousarray(depth, dtype=np.float32)
         reply = self._rpc(
             {
                 "cmd": CMD_ACT, "shape": rgb.shape, "dtype": "uint8", "data": rgb.tobytes(),
@@ -1602,6 +1790,16 @@ class PolicyBridge:
                 # `.get`, so a sim side predating it still talks to a server that
                 # has it.
                 "goal": None if goal is None else [float(v) for v in goal],
+                "depth_shape": None if depth is None else list(depth.shape),
+                "depth_dtype": None if depth is None else "float32",
+                "depth_data": None if depth is None else depth.tobytes(),
+                "camera_pose": (
+                    None if camera_pose is None
+                    else [float(v) for v in camera_pose]
+                ),
+                "floor_height": (
+                    None if floor_height is None else float(floor_height)
+                ),
             }
         )
         chunk = (

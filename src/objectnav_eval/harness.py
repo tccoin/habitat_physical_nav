@@ -16,7 +16,7 @@ scene is built.)
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from objectnav_eval.episodes import EvalEpisode, group_by_scene
 from objectnav_eval.executor import ChunkExecutor
@@ -43,13 +43,22 @@ def build_scene_simulator(episode: EvalEpisode, config: Any):
     robot_sim = build_robot_sim(
         scene_path, scene_dataset_config, config.width, config.height,
         str(DEFAULT_URDF_PATH),
+        depth_sensor_uuid=getattr(config, "depth_sensor_uuid", None),
+        topdown_sensor_uuid=(
+            "video_bev_topdown"
+            if config.record_video and getattr(config, "video_bev", True)
+            else None
+        ),
     )
     # Which mesh every distance in this run is measured on. Printed rather than
     # assumed -- it changes what the numbers mean, not how the robot moves.
-    print(
-        f"    navmesh         {apply_navmesh_choice(robot_sim, scene_path, config.navmesh)}",
-        flush=True,
+    navmesh_description = apply_navmesh_choice(robot_sim, scene_path, config.navmesh)
+    robot_sim.navmesh_step_filter = bool(
+        getattr(config, "navmesh_step_filter", False)
     )
+    print(f"    navmesh         {navmesh_description}", flush=True)
+    if robot_sim.navmesh_step_filter:
+        print("    execution fence active (per-substep navmesh clipping)", flush=True)
     return robot_sim, scene_path
 
 
@@ -108,8 +117,39 @@ def _build_runner(robot_sim, scene_id: str, config: Any, policy) -> EpisodeRunne
     )
 
 
+def _evaluate_episode(
+    episode: EvalEpisode,
+    config: Any,
+    screener: EpisodeScreener,
+    runner: EpisodeRunner,
+    results: List[Dict[str, Any]],
+    screening: ScreeningLog,
+    progress_callback: Optional[Callable[[str, Dict[str, Any]], None]],
+) -> None:
+    verdict = screener.screen(episode)
+    if not verdict.ok:
+        screening.add(episode, verdict)
+        record = screening.records[-1]
+        if progress_callback is not None:
+            progress_callback("skipped", record)
+        print(
+            f"[shard {config.shard_index}] SKIP {episode.uid} "
+            f"({episode.object_category}): {verdict.reason}",
+            flush=True,
+        )
+        return
+    record = runner.run(episode, verdict)
+    results.append(record)
+    if progress_callback is not None:
+        progress_callback("result", record)
+    print(format_episode_line(record, config.shard_index), flush=True)
+
+
 def run_episodes(
-    episodes: Sequence[EvalEpisode], config: Any, server_script: str
+    episodes: Sequence[EvalEpisode],
+    config: Any,
+    server_script: str,
+    progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Evaluate every episode, reusing one simulator per scene.
 
@@ -149,15 +189,6 @@ def run_episodes(
                 )
                 runner = _build_runner(robot_sim, scene_id, config, policy)
                 for index, episode in enumerate(scene_episodes):
-                    verdict = screener.screen(episode)
-                    if not verdict.ok:
-                        screening.add(episode, verdict)
-                        print(
-                            f"[shard {config.shard_index}] SKIP {episode.uid} "
-                            f"({episode.object_category}): {verdict.reason}",
-                            flush=True,
-                        )
-                        continue
                     if config.fresh_sim_per_episode and index > 0:
                         # Close before opening: two live habitat-sim Simulators
                         # abort the process at teardown.
@@ -165,12 +196,87 @@ def run_episodes(
                         robot_sim, _ = build_scene_simulator(episode, config)
                         screener.robot_pathfinder = robot_sim.sim.pathfinder
                         runner = _build_runner(robot_sim, scene_id, config, policy)
-                    record = runner.run(episode, verdict)
-                    results.append(record)
-                    print(format_episode_line(record, config.shard_index), flush=True)
+                    _evaluate_episode(
+                        episode,
+                        config,
+                        screener,
+                        runner,
+                        results,
+                        screening,
+                        progress_callback,
+                    )
             finally:
                 robot_sim.sim.close()
     finally:
+        policy.close()
+    return results, screening.records
+
+
+def run_episode_queue(
+    next_episode: Callable[[Optional[str]], Optional[EvalEpisode]],
+    config: Any,
+    server_script: str,
+    progress_callback: Callable[[str, Dict[str, Any]], None],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Keep one policy alive while dynamically claiming episodes."""
+    from objectnav_eval.policies import build_policy
+
+    log_path = (
+        Path(config.output_dir) / "logs" / f"policy_shard{config.shard_index}.log"
+    )
+    policy = build_policy(config, server_script, str(log_path))
+    results: List[Dict[str, Any]] = []
+    screening = ScreeningLog()
+    robot_sim = None
+    current_scene_id: Optional[str] = None
+    screener = None
+    runner = None
+    try:
+        while True:
+            episode = next_episode(current_scene_id)
+            if episode is None:
+                break
+            rebuild = (
+                robot_sim is None
+                or config.fresh_sim_per_episode
+                or episode.scene_id != current_scene_id
+            )
+            if rebuild:
+                if robot_sim is not None:
+                    robot_sim.sim.close()
+                robot_sim, scene_path = build_scene_simulator(episode, config)
+                current_scene_id = episode.scene_id
+                print(
+                    f"[shard {config.shard_index}] scene {Path(scene_path).stem} "
+                    f"(queue episode {episode.uid})"
+                    + (
+                        "  [fresh sim per episode]"
+                        if config.fresh_sim_per_episode
+                        else ""
+                    ),
+                    flush=True,
+                )
+                screener = EpisodeScreener(
+                    robot_pathfinder=robot_sim.sim.pathfinder,
+                    dataset_pathfinder=dataset_pathfinder(scene_path),
+                    success_distance=config.success_distance,
+                    screen_trivial=config.screen_trivial,
+                )
+                runner = _build_runner(
+                    robot_sim, episode.scene_id, config, policy
+                )
+            _evaluate_episode(
+                episode,
+                config,
+                screener,
+                runner,
+                results,
+                screening,
+                progress_callback,
+            )
+    finally:
+        if robot_sim is not None:
+            robot_sim.sim.close()
         policy.close()
     return results, screening.records
 

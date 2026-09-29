@@ -35,6 +35,10 @@ from pathlib import Path
 # and the exception takes down the whole worker shard along with every episode
 # it had not yet run. `train_ar_action_sft.py` sets the same variable.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# Each evaluator worker owns a policy server.  Unbounded CPU math pools make
+# several otherwise independent GPU workers oversubscribe the host.
+for _thread_env in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+    os.environ.setdefault(_thread_env, "1")
 
 # The model environment has no reason to have this package installed, and
 # installing it there would drag habitat-lab expectations into an env that
@@ -53,6 +57,8 @@ def main() -> None:
     parser.add_argument("--backend", default="vector_rollout",
                         help=f"policy head implementation; one of {available_backends()}")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--merge-lora", action="store_true",
+                        help="fold LoRA into the base model before inference")
     parser.add_argument("--max-context-tokens", type=int, default=0)
     parser.add_argument("--placeholder", default=None)
     parser.add_argument("--decode", default=None,
@@ -60,7 +66,10 @@ def main() -> None:
                              "ar_rollout); unset means the backend's own default")
     parser.add_argument("--num-inference-steps", type=int, default=None,
                         help="Euler steps for the flow-matching head's ODE (flow_rollout); "
-                             "unset means the checkpoint's own num_inference_steps")
+                            "unset means the checkpoint's own num_inference_steps")
+    parser.add_argument("--ode-rng-preconsume-size", type=int, default=0,
+                        help="flow_rollout compatibility: consume a raw FlowSDE ODE "
+                             "permutation before each base-noise draw")
     parser.add_argument("--context-reset-every", type=int, default=None,
                         help="memory-length ablation: drop rollout history (KV cache and "
                              "visual dedup DB) every N policy steps, keeping the system "
@@ -69,7 +78,10 @@ def main() -> None:
                              "harness converts from --policy-memory-seconds using dt*gap")
     parser.add_argument("--seed", type=int, default=None,
                         help="base seed for a backend's per-episode seeded sampling "
-                             "(bin_rollout / ar_rollout with --decode sample)")
+                        "(bin_rollout / ar_rollout with --decode sample)")
+    parser.add_argument("--seed-by-episode-uid", action="store_true",
+                        help="flow_rollout only: derive ODE noise from the stable "
+                             "episode UID instead of worker-local ordering")
     parser.add_argument("--pose-mirror", action="store_true",
                         help="pose-frame ablation: mirror the injected pose about the "
                              "start heading")
@@ -112,6 +124,11 @@ def main() -> None:
                         choices=["sample", "threshold", "argmax"])
     parser.add_argument("--stop-threshold", type=float, default=None)
     parser.add_argument("--stop-temperature", type=float, default=None)
+    parser.add_argument("--stop-head-min-steps", type=int, default=0)
+    parser.add_argument("--trajectory-stop-threshold-m", type=float, default=None)
+    parser.add_argument("--trajectory-stop-yaw-threshold-rad", type=float, default=None)
+    parser.add_argument("--trajectory-stop-min-steps", type=int, default=0)
+    parser.add_argument("--trajectory-stop-prefix-points", type=int, default=10)
     parser.add_argument("--sys-path", default=None,
                         help="colon-separated paths to prepend to sys.path before "
                              "loading the backend -- the checkout the checkpoint's code "
@@ -129,6 +146,7 @@ def main() -> None:
     kwargs = dict(
         ckpt=args.ckpt,
         device=args.device,
+        merge_lora=args.merge_lora,
         max_context_tokens=args.max_context_tokens,
         placeholder=args.placeholder,
     )
@@ -138,8 +156,12 @@ def main() -> None:
         kwargs["decode"] = args.decode
     if args.num_inference_steps is not None:
         kwargs["num_inference_steps"] = args.num_inference_steps
+    if args.ode_rng_preconsume_size:
+        kwargs["ode_rng_preconsume_size"] = args.ode_rng_preconsume_size
     if args.seed is not None:
         kwargs["seed"] = args.seed
+    if args.seed_by_episode_uid:
+        kwargs["seed_by_episode_uid"] = True
     if args.context_reset_every is not None:
         kwargs["context_reset_every"] = args.context_reset_every
     # Same rule as above: only forwarded when the run asked for it, so a backend
@@ -150,6 +172,24 @@ def main() -> None:
         value = getattr(args, name)
         if value is not None:
             kwargs[name] = value
+    if args.stop_head_min_steps:
+        if not args.stop_head:
+            raise ValueError("--stop-head-min-steps requires --stop-head")
+        if args.stop_head_min_steps < 0:
+            raise ValueError("--stop-head-min-steps must be non-negative")
+        kwargs["stop_head_min_steps"] = args.stop_head_min_steps
+    trajectory_stop_m = args.trajectory_stop_threshold_m
+    trajectory_stop_yaw = args.trajectory_stop_yaw_threshold_rad
+    if trajectory_stop_m is not None or trajectory_stop_yaw is not None:
+        if trajectory_stop_m is None or trajectory_stop_yaw is None:
+            raise ValueError(
+                "trajectory STOP requires both --trajectory-stop-threshold-m and "
+                "--trajectory-stop-yaw-threshold-rad"
+            )
+        kwargs["trajectory_stop_threshold_m"] = trajectory_stop_m
+        kwargs["trajectory_stop_yaw_threshold_rad"] = trajectory_stop_yaw
+        kwargs["trajectory_stop_min_steps"] = args.trajectory_stop_min_steps
+        kwargs["trajectory_stop_prefix_points"] = args.trajectory_stop_prefix_points
     if args.pose_mirror:
         kwargs["pose_mirror"] = True
     if args.pose_rotate_deg:

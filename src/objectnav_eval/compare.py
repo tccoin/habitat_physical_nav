@@ -77,9 +77,11 @@ def load_jsonl(path: str | Path) -> Dict[str, Dict[str, Any]]:
     """
     path = Path(path)
     if path.is_dir():
-        candidates = sorted(path.glob("objectnav_eval_results*.jsonl"))
+        candidates = sorted(path.glob("result*.jsonl"))
         if not candidates:
-            raise FileNotFoundError(f"no objectnav_eval_results*.jsonl under {path}")
+            candidates = sorted(path.glob("objectnav_eval_results*.jsonl"))
+        if not candidates:
+            raise FileNotFoundError(f"no result*.jsonl under {path}")
         path = candidates[0]
     rows: Dict[str, Dict[str, Any]] = {}
     with open(path) as handle:

@@ -39,15 +39,33 @@ WHAT THIS CAN AND CANNOT ANSWER
 """
 
 import argparse
+import gzip
 import json
 import math
-from typing import List, Optional, Tuple
+from pathlib import Path
+from typing import List, Optional
 
 
 def load(path: str):
-    with open(path) as fh:
+    result_path = Path(path)
+    with result_path.open() as fh:
         payload = json.load(fh)
     records = [r for r in payload.get("results", []) if r.get("status") == "evaluated"]
+    for record in records:
+        details_file = record.get("details_file")
+        if not details_file:
+            continue
+        details_path = result_path.parent / details_file
+        opener = gzip.open if details_path.suffix == ".gz" else open
+        with opener(details_path, "rt", encoding="utf-8") as fh:
+            details = json.load(fh)
+        for key, value in details.items():
+            if key == "uid":
+                continue
+            if isinstance(value, dict) and isinstance(record.get(key), dict):
+                record[key] = {**record[key], **value}
+            else:
+                record[key] = value
     config = payload.get("config", {})
     with_traces = [r for r in records if (r.get("stop") or {}).get("trace")]
     return records, with_traces, config

@@ -189,6 +189,8 @@ class ChunkExecution:
     #: "the policy commanded something odd" from "the controller failed to
     #: track it". Carried by reference, so it costs nothing.
     chunk: Optional[Any] = None
+    action_target_reached: Optional[bool] = None
+    action_sim_time: float = 0.0
 
     @property
     def end_lag(self) -> float:
@@ -209,8 +211,14 @@ class ChunkExecutor:
     """
 
     def __init__(
-        self, robot_sim, controller, dt: float, gap: int, collect_contacts: bool = False,
-        log_camera: bool = False, sensor_uuid: str = "color_sensor"
+        self,
+        robot_sim,
+        controller,
+        dt: float,
+        gap: int,
+        collect_contacts: bool = False,
+        log_camera: bool = False,
+        sensor_uuid: str = "color_sensor",
     ):
         self.robot_sim = robot_sim
         self.controller = controller
@@ -254,20 +262,56 @@ class ChunkExecutor:
         from continuous_demos.action_chunking import relative_to_pose
         from continuous_demos.pid_pose_controller import track_trajectory
 
-        poses = np.asarray(getattr(chunk, "poses", chunk), dtype=np.float64).reshape(-1, 3)
-        gap = min(self.gap, len(poses))
-        if gap == 0:
+        poses = np.asarray(getattr(chunk, "poses", chunk), dtype=np.float64).reshape(
+            -1, 3
+        )
+        if len(poses) == 0:
             raise ValueError("policy returned an empty action chunk")
 
         anchor = np.asarray(self.robot_sim.get_2d_pose(), dtype=np.float64)
-        setpoints = np.stack([relative_to_pose(anchor, poses[j]) for j in range(gap)])
+        extra = getattr(chunk, "extra", {}) or {}
+        completion = extra.get("action_target_completion")
+        if completion is None:
+            nominal_ticks = min(self.gap, len(poses))
+            nominal_setpoints = np.stack(
+                [relative_to_pose(anchor, poses[j]) for j in range(nominal_ticks)]
+            )
+            target_setpoint = nominal_setpoints[-1]
+            max_ticks = nominal_ticks
+            position_tolerance = yaw_tolerance = None
+        else:
+            nominal_ticks = len(poses)
+            nominal_setpoints = np.stack(
+                [relative_to_pose(anchor, pose) for pose in poses]
+            )
+            target_setpoint = relative_to_pose(anchor, poses[-1])
+            max_time = float(completion["max_sim_time_s"])
+            position_tolerance = float(completion["position_tolerance_m"])
+            yaw_tolerance = math.radians(float(completion["yaw_tolerance_deg"]))
+            if max_time <= 0 or position_tolerance < 0 or yaw_tolerance < 0:
+                raise ValueError("invalid action target completion limits")
+            max_ticks = int(math.floor(max_time / self.dt + 1e-9))
+            if max_ticks <= 0:
+                raise ValueError("action time limit is shorter than one control tick")
 
-        reached = np.zeros((gap, 3), dtype=np.float64)
+        camera_action = extra.get("camera_action")
+        if camera_action is not None:
+            self.robot_sim.apply_camera_action(
+                camera_action,
+                float(extra.get("camera_angle_deg", 30.0)),
+            )
+
+        reached = []
+        executed_setpoints = []
         ticks: List[TickRecord] = []
         stopped_early = False
+        target_reached = None if completion is None else False
         previous_setpoint = anchor
         previous_pose = anchor
-        for j, setpoint in enumerate(setpoints):
+        for j in range(max_ticks):
+            setpoint = (
+                nominal_setpoints[j] if j < len(nominal_setpoints) else target_setpoint
+            )
             segment = track_trajectory(
                 self.robot_sim,
                 self.controller,
@@ -276,7 +320,8 @@ class ChunkExecutor:
                 initial_pose=previous_setpoint,
             )
             pose = np.asarray(segment["actual_poses"][-1], dtype=np.float64)
-            reached[j] = pose
+            reached.append(pose)
+            executed_setpoints.append(setpoint)
             self.tick += 1
             self.sim_time += self.dt
             record = TickRecord(
@@ -298,7 +343,8 @@ class ChunkExecutor:
                 height=float(self.robot_sim.get_joint_state("joint_z")),
                 camera=(
                     camera_pose(self.robot_sim, self.sensor_uuid)
-                    if self.log_camera else None
+                    if self.log_camera
+                    else None
                 ),
             )
             ticks.append(record)
@@ -309,6 +355,19 @@ class ChunkExecutor:
             if stop_when is not None and stop_when(record):
                 stopped_early = True
                 break
+            if completion is not None:
+                position_error = float(np.linalg.norm(pose[:2] - target_setpoint[:2]))
+                yaw_error = abs(
+                    (float(pose[2] - target_setpoint[2]) + math.pi)
+                    % (2 * math.pi)
+                    - math.pi
+                )
+                target_reached = (
+                    position_error <= position_tolerance
+                    and yaw_error <= yaw_tolerance
+                )
+                if target_reached:
+                    break
 
         # Truncate to what ran. `reached` is preallocated, so a short chunk
         # would otherwise hand every probe trailing rows of zeros -- read as a
@@ -317,9 +376,11 @@ class ChunkExecutor:
         return ChunkExecution(
             chunk_index=chunk_index,
             anchor=anchor,
-            setpoints=setpoints[:n],
-            poses=reached[:n],
+            setpoints=np.asarray(executed_setpoints, dtype=np.float64).reshape(-1, 3),
+            poses=np.asarray(reached, dtype=np.float64).reshape(-1, 3),
             ticks=ticks,
             stopped_early=stopped_early,
             chunk=chunk,
+            action_target_reached=target_reached,
+            action_sim_time=n * self.dt,
         )

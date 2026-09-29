@@ -50,7 +50,7 @@ class EvalConfig:
     seed: int = 0
 
     # -- rollout ------------------------------------------------------------
-    max_steps: int = 200
+    max_steps: int = 500
     # WHICH CURRENCY THE EPISODE IS CAPPED IN. 'steps' (default) is the
     # historical behaviour: --max-steps policy steps and nothing else.
     # 'geometric' caps at --budget-units discrete-equivalent units of motion
@@ -95,6 +95,7 @@ class EvalConfig:
     # scene, what published ObjectNav numbers use). Changes what the metrics
     # mean, not how the robot moves. See navmesh.apply_navmesh_choice.
     navmesh: str = "dataset"
+    navmesh_step_filter: bool = False
     snap_start: bool = False
     screen_trivial: bool = True
     live_height: bool = True
@@ -102,13 +103,22 @@ class EvalConfig:
     # not fully restore the physics state, so an episode's trajectory depends on
     # what ran before it in the same process (~1.4% of path length, measured
     # with a stateless policy). Costs a scene load per episode.
-    fresh_sim_per_episode: bool = False
+    fresh_sim_per_episode: bool = True
+    # Reset Habitat's per-simulator and pathfinder RNG streams from the stable
+    # episode UID before each rollout. This makes simulator random draws
+    # independent of worker assignment without rebuilding the scene.
+    sim_seed_by_episode_uid: bool = False
     width: int = DEFAULT_WIDTH
     height: int = DEFAULT_HEIGHT
     sensor_uuid: str = "color_sensor"
+    depth_sensor_uuid: Optional[str] = None
 
     # -- video --------------------------------------------------------------
     record_video: bool = False
+    # Recorded HM3D videos pair the first-person camera with a static
+    # scene-RGB overhead view.  It is video-only: it never reaches the policy
+    # and does not alter the simulator state used for metrics.
+    video_bev: bool = True
     #: Draw the policy's commanded action chunk into each recorded frame. Default OFF, so
     #: an existing run's video is byte-identical to what it always was. It is a diagnostic
     #: and gates nothing: it shows what the model ASKED for next to where the robot went,
@@ -121,6 +131,7 @@ class EvalConfig:
     policy_backend: str = "vector_rollout"
     ckpt: Optional[str] = None
     device: str = "cuda"
+    merge_lora: bool = False
     max_context_tokens: int = 110000
     placeholder: Optional[str] = None
     policy_python: Optional[str] = None
@@ -135,12 +146,16 @@ class EvalConfig:
     # Distributional-head knobs (e.g. --policy-backend bin_rollout). None means "don't
     # forward this flag" so backends that don't accept it (vector_rollout) are unaffected.
     policy_decode: Optional[str] = None
-    policy_seed: Optional[int] = None
+    policy_seed: Optional[int] = 42
+    policy_seed_by_episode_uid: bool = False
     # Euler steps for the flow-matching head's ODE (flow_rollout). None = the
     # checkpoint's own `num_inference_steps`, which is what the run trained and
     # logged its metrics under; a value here is a deliberate sweep of the
     # integration, which changes the policy without changing the weights.
     policy_inference_steps: Optional[int] = None
+    # Compatibility only for a FlowSDE training checkpoint evaluated through the
+    # flow-matching harness: consume the raw sampler's discarded ODE permutation.
+    flow_ode_rng_preconsume_size: int = 0
     # Memory-length ablation. Expressed in SECONDS because that is the quantity
     # that stays meaningful: one policy step is gap*dt seconds, so a step count
     # silently changes duration the moment --dt or --gap moves -- the same trap
@@ -208,6 +223,10 @@ class EvalConfig:
     stop_temperature: Optional[float] = None
     stop_threshold: Optional[float] = None
     stop_inference: Optional[str] = None
+    stop_head_min_steps: int = 0
+    trajectory_stop_threshold_m: Optional[float] = None
+    trajectory_stop_yaw_threshold_rad: Optional[float] = None
+    trajectory_stop_min_steps: int = 0
     # Pose injection has no flag on purpose: whether the policy is shown its
     # pose is a property of the checkpoint (a `<pose>` modality spec with the
     # `pose_relative_first` transform), and a flag would let the command line
@@ -252,6 +271,10 @@ class EvalConfig:
         return max(1, round(1.0 / self.dt))
 
     def __post_init__(self) -> None:
+        if self.policy_seed_by_episode_uid:
+            raise ValueError(
+                "--policy-seed-by-episode-uid is incompatible with fixed per-episode seeding"
+            )
         # Both terminations at once would end each episode at whichever fired
         # first, and the run could not say which -- the oracle's arrival and the
         # policy's decision would share one `success` column. Rejected rather
@@ -271,6 +294,29 @@ class EvalConfig:
                 "--stop-requires-oracle gates the classifier, but --stop-head is off so "
                 "the classifier cannot end an episode anyway"
             )
+        if self.stop_head_min_steps < 0:
+            raise ValueError("--stop-head-min-steps must be non-negative")
+        if self.stop_head_min_steps and not self.stop_head:
+            raise ValueError("--stop-head-min-steps requires --stop-head")
+        if (
+            self.trajectory_stop_threshold_m is None
+        ) != (
+            self.trajectory_stop_yaw_threshold_rad is None
+        ):
+            raise ValueError(
+                "trajectory STOP requires both --trajectory-stop-threshold-m and "
+                "--trajectory-stop-yaw-threshold-rad"
+            )
+        if self.trajectory_stop_threshold_m is not None:
+            if self.stop_head:
+                raise ValueError("trajectory STOP and --stop-head are mutually exclusive")
+            if (
+                self.trajectory_stop_threshold_m < 0.0
+                or self.trajectory_stop_yaw_threshold_rad < 0.0
+            ):
+                raise ValueError("trajectory STOP thresholds must be non-negative")
+            if self.trajectory_stop_min_steps < 0:
+                raise ValueError("--trajectory-stop-min-steps must be non-negative")
         if self.auto_stop_delay and not self.auto_stop:
             raise ValueError(
                 "--auto-stop-delay without --auto-stop: nothing would open the window "
@@ -425,7 +471,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                           "reproducible from the flags alone")
 
     run = parser.add_argument_group("rollout")
-    run.add_argument("--max-steps", type=int, default=200, help="policy steps per episode")
+    run.add_argument("--max-steps", type=int, default=500, help="policy steps per episode")
     run.add_argument("--episode-budget", default="steps", choices=list(BUDGET_MODES),
                      help="WHICH CURRENCY THE EPISODE IS CAPPED IN. 'steps' (default) "
                           "is --max-steps and nothing else, the behaviour every result "
@@ -503,30 +549,46 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                           "within an episode. Neither changes how the robot moves; "
                           "it is a physics body either way. Runs using different "
                           "values are NOT comparable")
+    run.add_argument("--navmesh-step-filter", action="store_true",
+                     help="clip every physics substep to the selected --navmesh. "
+                          "Prevents the virtual gantry leaving the scene, but changes "
+                          "the executed trajectory and therefore benchmark results")
     run.add_argument("--snap-start", action="store_true",
                      help="snap the spawn onto the robot navmesh instead of using the "
                           "episode's start position verbatim")
     run.add_argument("--keep-trivial", dest="screen_trivial", action="store_false",
                      help="score episodes that start inside the success radius instead of "
                           "screening them out (they are free successes)")
-    run.add_argument("--fresh-sim-per-episode", action="store_true",
+    run.add_argument("--fresh-sim-per-episode", action=argparse.BooleanOptionalAction, default=True,
                      help="rebuild the simulator before every episode. HabitatRobotSim's "
                           "reset() leaves physics state behind, so without this an "
                           "episode's trajectory depends on what ran before it in the same "
                           "worker. Costs one scene load per episode; aggregate metrics are "
                           "stable without it, per-episode ones are not")
+    run.add_argument("--sim-seed-by-episode-uid", action="store_true",
+                     help="reset Habitat simulator and pathfinder RNGs from each stable "
+                          "episode UID before reset; avoids worker-order-dependent random "
+                          "draws without rebuilding the simulator")
     run.add_argument("--frozen-height", dest="live_height", action="store_false",
                      help="query goal distances at the spawn height for the whole episode "
                           "(the task layer's own behaviour) instead of tracking joint_z")
     run.add_argument("--width", type=int, default=DEFAULT_WIDTH)
     run.add_argument("--height", type=int, default=DEFAULT_HEIGHT)
     run.add_argument("--sensor-uuid", default="color_sensor")
-
+    run.add_argument(
+        "--depth-sensor-uuid",
+        default=None,
+        help="optional metric-depth camera, co-located with the RGB camera",
+    )
     vid = parser.add_argument_group("video")
     vid.add_argument("--record-video", action="store_true",
                      help="one MP4 per episode, one frame per control tick, so playback at "
                           "1/--dt fps is real time")
     vid.add_argument("--video-scale", type=float, default=1.0)
+    vid.add_argument(
+        "--no-video-bev", action="store_false", dest="video_bev",
+        help="record the legacy first-person-only video instead of RGB+BEV",
+    )
     vid.add_argument("--overlay-chunk", action="store_true",
                      help="draw the policy's commanded action chunk into each recorded "
                           "frame -- what the model ASKED for, next to where the robot "
@@ -546,6 +608,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                      help="policy head implementation loaded in the model environment")
     mdl.add_argument("--ckpt", default=None, help="trained checkpoint directory")
     mdl.add_argument("--device", default="cuda")
+    mdl.add_argument("--merge-lora", action="store_true",
+                     help="fold LoRA into the base model before inference; disabled by "
+                          "default because canonical RL checkpoint evaluation keeps the "
+                          "adapter unmerged")
     mdl.add_argument("--max-context-tokens", type=int, default=110000)
     mdl.add_argument("--placeholder", default=None)
     mdl.add_argument("--policy-python", default=os.environ.get("VECTOR_POLICY_PYTHON"),
@@ -573,6 +639,9 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                           "Setting it sweeps the integration: the same weights at 4 steps "
                           "and at 10 are different policies, so it is reported in the eval "
                           "log alongside the checkpoint")
+    mdl.add_argument("--flow-ode-rng-preconsume-size", type=int, default=0,
+                     help="flow_rollout compatibility: consume this many entries with "
+                          "torch.randperm before each ODE noise draw; 0 disables it")
     mdl.add_argument("--policy-memory-seconds", type=float, default=None,
                      help="MEMORY-LENGTH ABLATION. Drop rollout history (KV cache and "
                           "visual dedup DB) every this many seconds of simulated time, "
@@ -582,11 +651,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                           "same duration at any control rate. NB the memory is a SAWTOOTH "
                           "not a window: within a block, history runs from 0 up to this "
                           "value, averaging about half it")
-    mdl.add_argument("--policy-seed", type=int, default=None,
-                     help="base seed for a backend's per-episode seeded sampling "
-                          "(bin_rollout / ar_rollout with --policy-decode sample); "
-                          "combined with an episode counter so each episode gets its own "
-                          "fixed seed")
+    mdl.add_argument("--policy-seed", type=int, default=42,
+                     help="seed reset at the start of every policy episode")
+    mdl.add_argument("--policy-seed-by-episode-uid", action="store_true",
+                     help="deprecated: fixed per-episode policy seeding does not support it")
     mdl.add_argument("--stop-head", action="store_true",
                      help="let the checkpoint's own stop classifier end the episode. "
                           "Requires a checkpoint that has one. Run this INSTEAD OF "
@@ -654,11 +722,22 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                           "pinned at 0.5")
     mdl.add_argument("--stop-threshold", type=float, default=None,
                      help="stop probability at/above which --stop-inference threshold "
-                          "terminates. Unset = the checkpoint's own value")
+                     "terminates. Unset = the checkpoint's own value")
+    mdl.add_argument("--stop-head-min-steps", type=int, default=0,
+                     help="initial policy decisions during which --stop-head cannot "
+                     "terminate the episode")
     mdl.add_argument("--stop-temperature", type=float, default=None,
                      help="divides the stop logit before the sigmoid. A post-hoc "
                           "calibration knob -- it is not trained and does not change the "
                           "head's AP or AUC, only where its operating point sits")
+    mdl.add_argument("--trajectory-stop-threshold-m", type=float, default=None,
+                     help="terminate when decoded cumulative XY path is at or below this "
+                          "value and --trajectory-stop-yaw-threshold-rad also matches")
+    mdl.add_argument("--trajectory-stop-yaw-threshold-rad", type=float, default=None,
+                     help="terminate when decoded cumulative absolute yaw is at or below "
+                          "this value and --trajectory-stop-threshold-m also matches")
+    mdl.add_argument("--trajectory-stop-min-steps", type=int, default=0,
+                     help="number of initial policy decisions that cannot use trajectory STOP")
 
     ctrl = parser.add_argument_group("inference controller")
     ctrl.add_argument("--pid-preset", default="baseline",

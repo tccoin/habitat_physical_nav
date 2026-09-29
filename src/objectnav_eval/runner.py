@@ -25,6 +25,7 @@ strict interpretation for free.
 
 from __future__ import annotations
 
+from hashlib import blake2b
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,17 +41,31 @@ from objectnav_eval.budget import (
 )
 from objectnav_eval.episodes import EvalEpisode
 from objectnav_eval.executor import ChunkExecutor, TickRecord
-from objectnav_eval.navmesh import robot_position_3d
+from objectnav_eval.navmesh import (
+    camera_pose as physical_camera_pose,
+    navmesh_height,
+    robot_position_3d,
+)
 from objectnav_eval.policies import ActionChunk, Observation, Policy
 from objectnav_eval.probes import GoalDistanceProbe, RolloutProbe, TrackingDiagnostic
 from objectnav_eval.screening import ScreenResult
 from continuous_demos.viewport_overlay import draw_commanded_chunk
-from objectnav_eval.video import OverlayState, Recorder, annotate
+from objectnav_eval.video import (
+    BackgroundRecorder,
+    EpisodeBev,
+    OverlayState,
+    planar_xy,
+)
 
 # Metrics lifted out of the task and reported per episode. Adding a measure to
 # the task makes it appear here automatically -- this list only fixes the names
 # the summary knows how to aggregate as rates.
 RATE_METRICS = ("success", "oracle_success", "spl", "oracle_spl", "soft_spl")
+
+
+def _episode_sim_seed(uid: str) -> int:
+    """Return Habitat's 32-bit seed for one stable evaluation UID."""
+    return int.from_bytes(blake2b(uid.encode(), digest_size=4).digest(), "little")
 
 
 def _npwpl(start: float, closest: float, path: float) -> float:
@@ -104,6 +119,14 @@ class EpisodeRunner:
         config = ctx.config
         task = ctx.task
 
+        sim_seed: Optional[int] = None
+        if getattr(config, "sim_seed_by_episode_uid", False):
+            sim_seed = _episode_sim_seed(episode.uid)
+            # Keep Habitat's two independent random streams order-invariant.
+            # This deliberately does not touch Python, NumPy, or model RNGs.
+            ctx.robot_sim.sim.seed(sim_seed)
+            ctx.robot_sim.sim.pathfinder.seed(sim_seed)
+
         start_metrics = task.reset(episode.episode, snap_to_navmesh=config.snap_start)
         ctx.executor.reset()
         # The geometric budget is accumulated on EVERY run, whether or not it is
@@ -122,7 +145,7 @@ class EpisodeRunner:
         # charged from wherever tick 1 landed and the episode starts one tick
         # of travel in credit.
         budget.reset(ctx.robot_sim.get_2d_pose())
-        ctx.policy.reset(episode.object_category)
+        ctx.policy.reset(episode.object_category, episode_uid=episode.uid)
         for probe in ctx.probes:
             probe.reset(episode)
         goal_probe = GoalDistanceProbe()
@@ -152,10 +175,17 @@ class EpisodeRunner:
         min_distance = distance
         goal_probe.observe(distance)
 
-        recorder = Recorder(
-            self.video_path(episode), fps=config.fps, scale=config.video_scale,
+        bev = self._build_video_bev(episode) if (
+            config.record_video and getattr(config, "video_bev", True)
+        ) else None
+        recorder = BackgroundRecorder(
+            self.video_path(episode),
+            fps=config.fps,
+            scale=config.video_scale,
             enabled=config.record_video,
+            bev=bev,
         )
+        self._video_bev_enabled = bev is not None
 
         first_reach_step: Optional[int] = None
         # Separate from first_reach_step: arrival is judged at success_distance
@@ -163,6 +193,9 @@ class EpisodeRunner:
         # termination at config.stop_distance, which may be tighter.
         stop_step: Optional[int] = None
         latencies: List[float] = []
+        policy_runtime_s: List[Dict[str, float]] = []
+        step_wall_seconds: List[float] = []
+        execution_seconds: List[float] = []
         # Per-step stop-classifier scores, kept whether or not the head is acting.
         # A threshold and a temperature are one scalar each, fitted after the
         # fact on saved scores (`stop_head.py`: they do not change AP or AUC), so
@@ -170,12 +203,14 @@ class EpisodeRunner:
         # rather than a re-run of the whole split. `stop_trace` stays None on a
         # checkpoint without a stop head, so nothing else grows a column.
         stop_trace: Optional[List[List[float]]] = None
+        action_stop_trace: Optional[List[List[float]]] = None
         # Proof that pose injection actually happened, per step: the value the
         # model was *shown*, straight out of the policy. The failure this catches
         # is the silent one -- a checkpoint that declares a pose spec while the
         # harness feeds it nothing would still produce a full set of plausible
         # metrics, and this column would be empty.
         pose_trace: Optional[List[List[float]]] = None
+        sg_mapping_action_trace: Optional[List[Dict[str, Any]]] = None
         # Times the classifier said stop somewhere the oracle did not agree, under
         # --stop-requires-oracle. Counted rather than merely ignored: this IS the
         # head's false-positive rate at the configured operating point, measured
@@ -205,17 +240,22 @@ class EpisodeRunner:
                     stop_step = record.chunk_index
             # The next step's [obs] frame covers the final tick of this chunk,
             # so it is not re-rendered here.
-            if config.record_video and record.tick_in_chunk < ctx.executor.gap - 1:
+            if (
+                config.record_video
+                and (
+                    record.tick_in_chunk < ctx.executor.gap - 1
+                    or record.tick_in_chunk >= ctx.executor.gap
+                )
+            ):
                 recorder.add(
-                    annotate(
-                        self._overlay(config, ctx, self._render()),
-                        OverlayState(
-                            step=record.chunk_index, sim_time=record.sim_time,
-                            goal=episode.object_category, distance=distance,
-                            start_distance=start_distance,
-                            reached=first_reach_step is not None,
-                        ),
-                    )
+                    self._overlay(config, ctx, self._render()),
+                    OverlayState(
+                        step=record.chunk_index, sim_time=record.sim_time,
+                        goal=episode.object_category, distance=distance,
+                        start_distance=start_distance,
+                        reached=first_reach_step is not None,
+                    ),
+                    record.pose,
                 )
 
         # Which cap the episode budget rule fired on, set from inside the tick
@@ -255,19 +295,19 @@ class EpisodeRunner:
         try:
             for step in range(config.step_limit if hasattr(config, "step_limit")
                               else config.max_steps):
-                rgb = self._render()
+                step_started = time.perf_counter()
+                rgb, depth = self._render_policy_observation()
                 if config.record_video:
                     recorder.add(
-                        annotate(
-                            self._overlay(config, ctx, rgb),
-                            OverlayState(
-                                step=step, sim_time=ctx.executor.sim_time,
-                                goal=episode.object_category, distance=distance,
-                                start_distance=start_distance,
-                                reached=first_reach_step is not None,
-                                is_observation=True,
-                            ),
-                        )
+                        self._overlay(config, ctx, rgb),
+                        OverlayState(
+                            step=step, sim_time=ctx.executor.sim_time,
+                            goal=episode.object_category, distance=distance,
+                            start_distance=start_distance,
+                            reached=first_reach_step is not None,
+                            is_observation=True,
+                        ),
+                        ctx.robot_sim.get_2d_pose(),
                     )
 
                 observation = Observation(
@@ -282,6 +322,12 @@ class EpisodeRunner:
                     # and nothing here has to know about chaining. `None` for every
                     # ObjectNav episode, whose sources set no `goal2d`.
                     goal_pose=goal_pose,
+                    depth=depth,
+                    camera_pose=physical_camera_pose(
+                        ctx.robot_sim,
+                        config.depth_sensor_uuid or config.sensor_uuid,
+                    ),
+                    floor_height=navmesh_height(ctx.robot_sim),
                 )
                 # Sampled at *observation* time, because that is the frame the
                 # classifier looked at. Checking the post-chunk distance instead
@@ -289,11 +335,31 @@ class EpisodeRunner:
                 # seen when it decided.
                 distance_when_asked = distance
                 chunk = ctx.policy.act(observation)
+                if chunk.stats.get("sg_mapping_input") is not None:
+                    if sg_mapping_action_trace is None:
+                        sg_mapping_action_trace = []
+                    if step < 12 or step % 25 == 0:
+                        sg_mapping_action_trace.append(
+                            {
+                                "step": int(step),
+                                "input": chunk.stats["sg_mapping_input"],
+                                "mapper": chunk.stats.get("sg_mapping_snapshot"),
+                                "chunk_final_body": chunk.stats.get(
+                                    "action_chunk_final_body"
+                                ),
+                                "native_action": chunk.stats.get("native_action"),
+                            }
+                        )
                 # Held for the overlay only, and only when it is switched on: the frames
                 # drawn after this point belong to the chunk emitted here.
                 if config.record_video and config.overlay_chunk:
                     self._last_chunk = (observation.pose, chunk)
                 latencies.append(float(chunk.stats.get("latency_s", float("nan"))))
+                runtime = chunk.stats.get("runtime_s")
+                if isinstance(runtime, dict):
+                    policy_runtime_s.append(
+                        {str(key): float(value) for key, value in runtime.items()}
+                    )
                 if chunk.stats.get("stop_prob") is not None:
                     if stop_trace is None:
                         stop_trace = []
@@ -311,20 +377,43 @@ class EpisodeRunner:
                         float(chunk.stats.get("stop_logit", float("nan"))),
                         float(getattr(task.path_tracker, "length", float("nan"))),
                     ])
+                if chunk.stats.get("trajectory_stop") is not None:
+                    if action_stop_trace is None:
+                        action_stop_trace = []
+                    action_stop_trace.append([
+                        float(chunk.stats["action_path_length_m"]),
+                        float(chunk.stats["action_yaw_path_rad"]),
+                        float(bool(chunk.stats["trajectory_stop"])),
+                    ])
                 if chunk.stats.get("pose_value") is not None:
                     if pose_trace is None:
                         pose_trace = []
                     pose_trace.append([float(v) for v in chunk.stats["pose_value"]])
                 steps = step + 1
 
+                # STOP is a decision at this observation, so a hard stop must
+                # not execute the chunk that was decoded alongside it.
+                if chunk.stop:
+                    if config.stop_requires_oracle and not (
+                        distance_when_asked < config.success_distance
+                    ):
+                        stop_suppressed += 1
+                    else:
+                        terminated = "policy called stop"
+                        step_wall_seconds.append(time.perf_counter() - step_started)
+                        break
+
                 # The oracle stop, for a policy with no termination head of its
                 # own: end the episode on the tick the agent first gets close
                 # enough, not at the end of whatever chunk that tick fell in.
                 # `on_tick` runs first and sets `first_reach_step`, so the
                 # arriving tick is the one that stops it.
+                execution_started = time.perf_counter()
                 execution = ctx.executor.execute(
                     chunk, step, on_tick=on_tick, stop_when=stop_when,
                 )
+                execution_seconds.append(time.perf_counter() - execution_started)
+                step_wall_seconds.append(time.perf_counter() - step_started)
                 for probe in ctx.probes:
                     probe.on_chunk(execution)
                 goal_probe.observe(distance)
@@ -340,17 +429,6 @@ class EpisodeRunner:
                         TERMINATED_TIME: "sim time limit",
                     }[cap_fired]
                     break
-                if chunk.stop:
-                    # Gated: the classifier only gets to end the episode where the
-                    # oracle already agrees. Elsewhere its call is recorded as a
-                    # false positive and the rollout carries on.
-                    if config.stop_requires_oracle and not (
-                        distance_when_asked < config.success_distance
-                    ):
-                        stop_suppressed += 1
-                    else:
-                        terminated = "policy called stop"
-                        break
                 if ctx.robot_sim.is_tipped_over():
                     terminated = "robot tipped over"
                     break
@@ -379,16 +457,29 @@ class EpisodeRunner:
             first_reach_step=first_reach_step, terminated=terminated,
             start_euclidean=start_euclidean,
             latencies=latencies, goal_probe=goal_probe, recorder=recorder,
+            policy_runtime_s=policy_runtime_s,
+            step_wall_seconds=step_wall_seconds,
+            execution_seconds=execution_seconds,
             wall_seconds=time.perf_counter() - started, chunk=chunk,
-            stop_trace=stop_trace, pose_trace=pose_trace,
+            stop_trace=stop_trace, action_stop_trace=action_stop_trace,
+            pose_trace=pose_trace,
+            sg_mapping_action_trace=sg_mapping_action_trace,
             stop_suppressed=stop_suppressed, path_at_min=path_at_min,
             budget=budget,
+            sim_seed=sim_seed,
         )
 
     # ------------------------------------------------------------------
     def _render(self) -> np.ndarray:
         obs = self.ctx.robot_sim.get_obs()[self.ctx.config.sensor_uuid]
         return np.asarray(obs)[..., :3]
+
+    def _render_policy_observation(self):
+        observations = self.ctx.robot_sim.get_obs()
+        rgb = np.asarray(observations[self.ctx.config.sensor_uuid])[..., :3]
+        depth_uuid = getattr(self.ctx.config, "depth_sensor_uuid", None)
+        depth = None if not depth_uuid else np.asarray(observations[depth_uuid])
+        return rgb, depth
 
     def _overlay(self, config, ctx, rgb: np.ndarray) -> np.ndarray:
         """The commanded chunk drawn into a frame, when `--overlay-chunk` asked for it.
@@ -406,6 +497,63 @@ class EpisodeRunner:
         anchor, chunk = last
         return draw_commanded_chunk(rgb, ctx.robot_sim, anchor, chunk,
                                     sensor_uuid=config.sensor_uuid)
+
+    def _build_video_bev(self, episode: EvalEpisode) -> Optional[EpisodeBev]:
+        """Capture one scene-RGB overhead image and make its per-tick overlay.
+
+        The debug camera is a second agent in the existing Habitat simulator.
+        Opening a second simulator here is unsafe: Habitat can abort when two
+        simulators coexist, and a video diagnostic must not destabilise a run.
+        """
+        ctx = self.ctx
+        try:
+            start_xy = np.asarray(ctx.robot_sim.get_2d_pose(), dtype=np.float64)[:2]
+            view_xy = planar_xy(episode.view_points)
+            target_positions = [
+                np.asarray(goal.position, dtype=np.float64)
+                for goal in (getattr(episode.episode, "goals", None) or [])
+                if getattr(goal, "position", None) is not None
+            ]
+            target_xy = (
+                planar_xy(target_positions)
+                if target_positions else view_xy[:1]
+            )
+            planned_xy = self._video_bev_framing_path(episode)
+            focus = np.concatenate(
+                [start_xy[None, :], target_xy, view_xy, planned_xy], axis=0
+            )
+            center_xy = 0.5 * (focus.min(axis=0) + focus.max(axis=0))
+            _lower, upper = ctx.robot_sim.sim.pathfinder.get_bounds()
+            background = ctx.robot_sim.capture_topdown_rgb(
+                center_xy, float(upper[1]) + 2.0
+            )
+            return EpisodeBev(
+                background,
+                world_center_xy=center_xy,
+                world_span_m=ctx.robot_sim.topdown_world_span_m,
+                panel_size=(ctx.config.width, ctx.config.height),
+                target_xy=target_xy,
+                view_points_xy=view_xy,
+                start_xy=start_xy,
+                framing_xy=planned_xy,
+            )
+        except Exception as exc:  # noqa: BLE001 - video diagnostics are non-critical
+            print(f"    video BEV unavailable for {episode.uid}: {exc}", flush=True)
+            return None
+
+    def _video_bev_framing_path(self, episode: EvalEpisode) -> np.ndarray:
+        """Use a navmesh shortest path only to frame the map, never as an overlay."""
+        try:
+            import habitat_sim
+
+            path = habitat_sim.MultiGoalShortestPath()
+            path.requested_start = np.asarray(robot_position_3d(self.ctx.robot_sim), dtype=np.float32)
+            path.requested_ends = np.asarray(episode.view_points, dtype=np.float32).reshape(-1, 3)
+            if len(path.requested_ends) and self.ctx.robot_sim.sim.pathfinder.find_path(path):
+                return planar_xy(path.points)
+        except Exception:  # noqa: BLE001 - framing has a safe start/goal fallback
+            pass
+        return np.zeros((0, 2), dtype=np.float64)
 
     def _euclidean_to_goal(self, episode: EvalEpisode) -> float:
         """Straight-line distance to the nearest view point.
@@ -427,13 +575,19 @@ class EpisodeRunner:
         start_metrics: Dict[str, Any], distance: float, min_distance: float, steps: int,
         start_euclidean: float,
         first_reach_step: Optional[int], terminated: Optional[str],
-        latencies: List[float], goal_probe: GoalDistanceProbe, recorder: Recorder,
+        latencies: List[float], goal_probe: GoalDistanceProbe, recorder: BackgroundRecorder,
+        policy_runtime_s: List[Dict[str, float]],
         wall_seconds: float, chunk: Optional[ActionChunk],
+        step_wall_seconds: Optional[List[float]] = None,
+        execution_seconds: Optional[List[float]] = None,
         stop_trace: Optional[List[List[float]]] = None,
+        action_stop_trace: Optional[List[List[float]]] = None,
         pose_trace: Optional[List[List[float]]] = None,
+        sg_mapping_action_trace: Optional[List[Dict[str, Any]]] = None,
         stop_suppressed: int = 0,
         path_at_min: float = 0.0,
         budget: Optional[GeometricBudget] = None,
+        sim_seed: Optional[int] = None,
     ) -> Dict[str, Any]:
         ctx = self.ctx
         record: Dict[str, Any] = {
@@ -503,6 +657,8 @@ class EpisodeRunner:
             mean_policy_latency_s=(
                 float(np.nanmean(latencies)) if latencies else float("nan")
             ),
+            policy_runtime_s=policy_runtime_s,
+            sim_episode_seed=sim_seed,
             first_reach_step=first_reach_step,
             terminated=terminated or "max steps",
             # The same fact as `terminated`, as a stable code. `terminated` is
@@ -513,7 +669,13 @@ class EpisodeRunner:
             terminated_by=terminated_code(terminated),
             video=str(recorder.path) if recorder.enabled else None,
             video_frames=int(recorder.frames),
+            video_bev=bool(getattr(self, "_video_bev_enabled", False)),
             goal_distance=goal_probe.summary(),
+            step_timing={
+                "policy_latency_s": [float(value) for value in latencies],
+                "execution_wall_s": [float(value) for value in (execution_seconds or [])],
+                "total_wall_s": [float(value) for value in (step_wall_seconds or [])],
+            },
         )
         if budget is not None:
             # Always present, like path_length_m: an episode's consumption in
@@ -530,6 +692,8 @@ class EpisodeRunner:
             }
         for probe in ctx.probes:
             record[probe.name] = probe.summary()
+        if hasattr(ctx.robot_sim, "navmesh_step_filter_summary"):
+            record["navmesh_step_filter"] = ctx.robot_sim.navmesh_step_filter_summary()
         if chunk is not None and chunk.extra:
             record["policy_extra"] = chunk.extra
         if stop_trace is not None:
@@ -553,6 +717,20 @@ class EpisodeRunner:
                 # swept SPL exact rather than an estimate.
                 "trace": stop_trace,
             }
+        if action_stop_trace is not None:
+            if chunk is None:
+                raise RuntimeError("action STOP trace requires an action chunk")
+            record["action_stop"] = {
+                "translation_threshold_m": float(
+                    chunk.stats["trajectory_stop_threshold_m"]
+                ),
+                "yaw_threshold_rad": float(
+                    chunk.stats["trajectory_stop_yaw_threshold_rad"]
+                ),
+                "min_steps": int(chunk.stats["trajectory_stop_min_steps"]),
+                "acted": record["terminated"] == "policy called stop",
+                "trace": action_stop_trace,
+            }
         if pose_trace is not None:
             record["pose_injected"] = {
                 "steps": len(pose_trace),
@@ -562,6 +740,11 @@ class EpisodeRunner:
                 "first": pose_trace[0],
                 "last": pose_trace[-1],
                 "trace": pose_trace,
+            }
+        if sg_mapping_action_trace is not None:
+            record["sg_mapping_action_trace"] = {
+                "samples": sg_mapping_action_trace,
+                "sampled_steps": len(sg_mapping_action_trace),
             }
         return record
 

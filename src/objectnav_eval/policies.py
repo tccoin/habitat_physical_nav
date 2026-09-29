@@ -50,6 +50,17 @@ class Observation:
     # control can be a useful stand-in (drive the route) rather than a wall-finder
     # (drive the straight line).
     goal_path: Optional[np.ndarray] = None
+    # Metric depth from the co-located physical camera. RGB-only policies leave
+    # this unset and therefore keep the original bridge payload unchanged.
+    depth: Optional[np.ndarray] = None
+    # Live Habitat-world pose of the camera that produced ``rgb`` and ``depth``:
+    # [x, y, z, qw, qx, qy, qz].  Mapping policies need this rather than a
+    # camera pose synthesized from the robot base.
+    camera_pose: Optional[np.ndarray] = None
+    # Height of the current physical floor in Habitat world coordinates.  It
+    # makes a metric camera height available to mapping policies without
+    # assuming a fixed robot spawn or sensor mounting height.
+    floor_height: Optional[float] = None
 
 
 @dataclass
@@ -83,7 +94,7 @@ class Policy:
     #: can never be mistaken for a model run.
     uses_observation: bool = True
 
-    def reset(self, goal: Optional[str]) -> None:  # pragma: no cover - interface
+    def reset(self, goal: Optional[str], episode_uid: Optional[str] = None) -> None:  # pragma: no cover - interface
         raise NotImplementedError
 
     def act(self, obs: Observation) -> ActionChunk:  # pragma: no cover
@@ -112,8 +123,13 @@ class ConstantChunkPolicy(Policy):
 
     uses_observation = False
 
-    def __init__(self, kind: str = "zero", chunk_len: int = 10, dt: float = 0.05,
-                 speed: float = 1.0):
+    def __init__(
+        self,
+        kind: str = "zero",
+        chunk_len: int = 10,
+        dt: float = 0.05,
+        speed: float = 1.0,
+    ):
         if kind not in ("forward", "zero"):
             raise ValueError(f"unknown control policy '{kind}'")
         self.name = kind
@@ -125,7 +141,7 @@ class ConstantChunkPolicy(Policy):
         self._chunk = chunk
         self._speed = speed
 
-    def reset(self, goal: Optional[str]) -> None:
+    def reset(self, goal: Optional[str], episode_uid: Optional[str] = None) -> None:
         pass
 
     def act(self, obs: Observation) -> ActionChunk:
@@ -152,16 +168,38 @@ class BridgedPolicy(Policy):
         self.bridge = bridge
         self._last_stats: Dict[str, Any] = {}
 
-    def reset(self, goal: Optional[str]) -> None:
-        self.bridge.reset(goal)
+    def reset(self, goal: Optional[str], episode_uid: Optional[str] = None) -> None:
+        self.bridge.reset(goal, episode_uid=episode_uid)
 
     def act(self, obs: Observation) -> ActionChunk:
         # The pose goes over the wire on every step, whatever the checkpoint is.
         # Deciding here would mean the simulator side knowing which checkpoints
         # inject pose, and it is three floats next to a full RGB frame.
-        reply = self.bridge.act(obs.rgb, pose=obs.pose, goal=obs.goal_pose)
+        reply = self.bridge.act(
+            obs.rgb,
+            pose=obs.pose,
+            goal=obs.goal_pose,
+            depth=obs.depth,
+            camera_pose=obs.camera_pose,
+            floor_height=obs.floor_height,
+        )
         self._last_stats = reply["stats"]
-        return ActionChunk(reply["chunk"], stop=reply["stop"], stats=reply["stats"])
+        camera_action = reply["stats"].get("camera_action")
+        extra = {}
+        action_completion = reply["stats"].get("action_target_completion")
+        if action_completion is not None:
+            extra["action_target_completion"] = action_completion
+        if camera_action is not None:
+            extra.update({
+                "camera_action": camera_action,
+                "camera_angle_deg": float(reply["stats"]["camera_angle_deg"]),
+            })
+        return ActionChunk(
+            reply["chunk"],
+            stop=reply["stop"],
+            stats=reply["stats"],
+            extra=extra,
+        )
 
     def describe(self) -> str:
         return "model (bridged to a second interpreter)"
@@ -182,12 +220,16 @@ class InProcessPolicy(Policy):
     def __init__(self, backend: Any):
         self.backend = backend
 
-    def reset(self, goal: Optional[str]) -> None:
-        self.backend.reset(goal)
+    def reset(self, goal: Optional[str], episode_uid: Optional[str] = None) -> None:
+        if getattr(self.backend, "uses_episode_uid", False):
+            self.backend.reset(goal, episode_uid=episode_uid)
+        else:
+            self.backend.reset(goal)
 
     def act(self, obs: Observation) -> ActionChunk:
         chunk = self.backend.act(
-            np.ascontiguousarray(obs.rgb, dtype=np.uint8), pose=obs.pose,
+            np.ascontiguousarray(obs.rgb, dtype=np.uint8),
+            pose=obs.pose,
             goal=obs.goal_pose,
         )
         return ActionChunk(
@@ -222,7 +264,9 @@ def available_policies() -> list:
     return sorted(set(_POLICIES) | {"model"})
 
 
-def build_policy(config: Any, server_script: str, log_path: Optional[str] = None) -> Policy:
+def build_policy(
+    config: Any, server_script: str, log_path: Optional[str] = None
+) -> Policy:
     """Instantiate the policy named by ``config.policy``.
 
     ``model`` is special-cased because it is the only kind that needs the
@@ -246,6 +290,7 @@ def build_policy(config: Any, server_script: str, log_path: Optional[str] = None
         "ckpt": config.ckpt,
         "device": config.device,
         "backend": config.policy_backend,
+        "merge_lora": config.merge_lora,
         "max_context_tokens": config.max_context_tokens,
     }
     if config.placeholder:
@@ -256,8 +301,12 @@ def build_policy(config: Any, server_script: str, log_path: Optional[str] = None
         backend_args["decode"] = config.policy_decode
     if getattr(config, "policy_inference_steps", None) is not None:
         backend_args["num_inference_steps"] = config.policy_inference_steps
+    if getattr(config, "flow_ode_rng_preconsume_size", 0):
+        backend_args["ode_rng_preconsume_size"] = config.flow_ode_rng_preconsume_size
     if config.policy_seed is not None:
         backend_args["seed"] = config.policy_seed
+    if getattr(config, "policy_seed_by_episode_uid", False):
+        backend_args["seed_by_episode_uid"] = True
     if config.context_reset_every is not None:
         backend_args["context_reset_every"] = config.context_reset_every
     backend_args.update(_stop_head_args(config))
@@ -274,6 +323,7 @@ def build_policy(config: Any, server_script: str, log_path: Optional[str] = None
     in_process_kwargs = dict(
         ckpt=config.ckpt,
         device=config.device,
+        merge_lora=config.merge_lora,
         max_context_tokens=config.max_context_tokens,
         placeholder=config.placeholder,
     )
@@ -281,8 +331,12 @@ def build_policy(config: Any, server_script: str, log_path: Optional[str] = None
         in_process_kwargs["decode"] = config.policy_decode
     if getattr(config, "policy_inference_steps", None) is not None:
         in_process_kwargs["num_inference_steps"] = config.policy_inference_steps
+    if getattr(config, "flow_ode_rng_preconsume_size", 0):
+        in_process_kwargs["ode_rng_preconsume_size"] = config.flow_ode_rng_preconsume_size
     if config.policy_seed is not None:
         in_process_kwargs["seed"] = config.policy_seed
+    if getattr(config, "policy_seed_by_episode_uid", False):
+        in_process_kwargs["seed_by_episode_uid"] = True
     if config.context_reset_every is not None:
         in_process_kwargs["context_reset_every"] = config.context_reset_every
     in_process_kwargs.update(_stop_head_args(config))
@@ -305,6 +359,22 @@ def _stop_head_args(config: Any) -> Dict[str, Any]:
         value = getattr(config, name, None)
         if value is not None:
             args[name] = value
+    if getattr(config, "stop_head_min_steps", 0):
+        args["stop_head_min_steps"] = config.stop_head_min_steps
+    trajectory_stop_m = getattr(config, "trajectory_stop_threshold_m", None)
+    trajectory_stop_yaw = getattr(config, "trajectory_stop_yaw_threshold_rad", None)
+    if trajectory_stop_m is not None or trajectory_stop_yaw is not None:
+        if trajectory_stop_m is None or trajectory_stop_yaw is None:
+            raise ValueError(
+                "trajectory STOP requires both --trajectory-stop-threshold-m and "
+                "--trajectory-stop-yaw-threshold-rad"
+            )
+        args["trajectory_stop_threshold_m"] = trajectory_stop_m
+        args["trajectory_stop_yaw_threshold_rad"] = trajectory_stop_yaw
+        args["trajectory_stop_min_steps"] = getattr(
+            config, "trajectory_stop_min_steps", 0
+        )
+        args["trajectory_stop_prefix_points"] = config.control_chunk_len
     if getattr(config, "stop_requires_oracle", False):
         # Gating happens runner-side, not in the backend: the backend cannot see
         # the distance to goal. Recorded here only so the server log states it.

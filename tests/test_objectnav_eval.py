@@ -6,18 +6,34 @@ stay empirical, but selection, sharding, aggregation, serialisation and the
 tracking statistics are ordinary code and are pinned here.
 """
 
+import dataclasses
+import gzip
 import json
 import math
 
 import numpy as np
-import dataclasses
-
 import pytest
 
 from objectnav_eval.config import EvalConfig
-from objectnav_eval.episodes import EpisodeFilter, EvalEpisode, scene_name_of, select_by_uid
+from objectnav_eval.episodes import (
+    EpisodeFilter,
+    EvalEpisode,
+    scene_name_of,
+    select_by_uid,
+)
 from objectnav_eval.executor import ChunkExecution, TickRecord
-from objectnav_eval.parallel import shard_episodes
+from objectnav_eval.parallel import (
+    QUEUE_DONE,
+    QUEUE_WAIT,
+    append_shard_progress,
+    claim_task,
+    complete_task,
+    initialize_task_queue,
+    load_shard_progress,
+    requeue_worker_task,
+    shard_episodes,
+    task_queue_snapshot,
+)
 from objectnav_eval.policies import ActionChunk, ConstantChunkPolicy, Observation
 from objectnav_eval.probes import TrackingDiagnostic
 from objectnav_eval.reporting import (
@@ -27,8 +43,8 @@ from objectnav_eval.reporting import (
     summarize_probe,
     summarize_tracking,
     write_episode_lines,
+    write_results,
 )
-
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -162,6 +178,89 @@ def test_sharding_keeps_scene_blocks_together_when_it_can():
         assert len({e.scene_name for e in shard}) == 1
 
 
+def test_shard_progress_recovers_valid_records_after_a_truncated_line(tmp_path):
+    path = tmp_path / "shard_0_progress.jsonl"
+    append_shard_progress(path, "result", {"uid": "A:1", "value": 1})
+    append_shard_progress(path, "skipped", {"uid": "A:2", "reason": "blocked"})
+    with path.open("a") as handle:
+        handle.write('{"kind":"result","record":')
+    append_shard_progress(path, "result", {"uid": "A:3", "value": 3})
+
+    results, skipped = load_shard_progress(path)
+
+    assert results == [
+        {"uid": "A:1", "value": 1},
+        {"uid": "A:3", "value": 3},
+    ]
+    assert skipped == [{"uid": "A:2", "reason": "blocked"}]
+
+
+def test_shard_progress_prefers_a_result_over_an_earlier_skip(tmp_path):
+    path = tmp_path / "shard_0_progress.jsonl"
+    append_shard_progress(path, "skipped", {"uid": "A:1", "reason": "blocked"})
+    append_shard_progress(path, "result", {"uid": "A:1", "value": 2})
+
+    results, skipped = load_shard_progress(path)
+
+    assert results == [{"uid": "A:1", "value": 2}]
+    assert skipped == []
+
+
+def test_task_queue_claims_once_and_prefers_the_loaded_scene(tmp_path):
+    episodes = [
+        make_episode("A:1", scene="A", episode_id="1"),
+        make_episode("B:1", scene="B", episode_id="1"),
+        make_episode("A:2", scene="A", episode_id="2"),
+    ]
+    path = tmp_path / "task_queue.json"
+    initialize_task_queue(path, episodes)
+
+    status, first = claim_task(path, 0)
+    assert status == "task" and first["uid"] == "A:1"
+    status, sticky = claim_task(path, 1, episodes[0].scene_id)
+    assert status == "task" and sticky["uid"] == "A:2"
+    status, last = claim_task(path, 2)
+    assert status == "task" and last["uid"] == "B:1"
+    assert claim_task(path, 3) == (QUEUE_WAIT, None)
+
+    for worker, task in enumerate((first, sticky, last)):
+        complete_task(path, worker, task["uid"])
+    assert claim_task(path, 3) == (QUEUE_DONE, None)
+    assert task_queue_snapshot(path) == {
+        "expected": 3,
+        "pending": 0,
+        "claimed": 0,
+        "completed": 3,
+    }
+
+
+def test_task_queue_resume_releases_stale_claims_and_skips_durable_work(tmp_path):
+    episodes = [make_episode("A:1"), make_episode("A:2", episode_id="2")]
+    path = tmp_path / "task_queue.json"
+    initialize_task_queue(path, episodes)
+    assert claim_task(path, 7)[1]["uid"] == "A:1"
+
+    initialize_task_queue(path, episodes, completed_uids=["A:1"])
+
+    assert task_queue_snapshot(path) == {
+        "expected": 2,
+        "pending": 1,
+        "claimed": 0,
+        "completed": 1,
+    }
+    assert claim_task(path, 8)[1]["uid"] == "A:2"
+
+
+def test_task_queue_requeues_a_crashed_worker(tmp_path):
+    episode = make_episode("A:1")
+    path = tmp_path / "task_queue.json"
+    initialize_task_queue(path, [episode])
+    assert claim_task(path, 0)[1]["uid"] == episode.uid
+
+    assert requeue_worker_task(path, 0)
+    assert claim_task(path, 1)[1]["uid"] == episode.uid
+
+
 # ---------------------------------------------------------------------------
 # config round-trip (this is how a worker gets its configuration)
 # ---------------------------------------------------------------------------
@@ -188,6 +287,7 @@ def test_config_derived_values():
     assert EvalConfig(policy="zero").tag == "_zero"
     assert EvalConfig(gpus="4,5", workers_per_gpu=2).gpu_slots() == ["4", "4", "5", "5"]
     assert EvalConfig().gpu_slots() == [None]
+    assert EvalConfig().sim_seed_by_episode_uid is False
 
 
 # ---------------------------------------------------------------------------
@@ -553,6 +653,44 @@ def test_episode_line_is_strict_json_for_an_off_navmesh_episode():
     text = json.dumps(line)
     assert "Infinity" not in text
     assert json.loads(text)["final_m"] is None
+
+
+def test_write_results_externalizes_per_step_diagnostics(tmp_path):
+    record = make_result(
+        "A:1",
+        mean_policy_latency_s=0.25,
+        step_timing={
+            "policy_latency_s": [0.2, 0.3],
+            "execution_wall_s": [0.1, 0.1],
+            "total_wall_s": [0.3, 0.4],
+        },
+        goal_distance={"minimum": 0.4, "trace": [2.0, 0.4]},
+        stop={"acted": True, "trace": [[0.1, -2.0, 0.0], [0.9, 2.0, 1.0]]},
+        pose_injected={"steps": 2, "trace": [[0, 0, 0], [1, 0, 0]]},
+        sg_mapping_action_trace={"sampled_steps": 2, "samples": [{"step": 0}]},
+    )
+    path = write_results(tmp_path / "result.json", {}, [record], [])
+
+    compact = json.loads(path.read_text())["results"][0]
+    assert compact["mean_policy_latency_s"] == 0.25
+    assert "step_timing" not in compact
+    assert compact["goal_distance"] == {"minimum": 0.4}
+    assert compact["stop"] == {"acted": True}
+    assert compact["pose_injected"] == {"steps": 2}
+    assert compact["sg_mapping_action_trace"] == {"sampled_steps": 2}
+    assert compact["details_file"] == "episode_details/A%3A1.json.gz"
+
+    with gzip.open(tmp_path / compact["details_file"], "rt") as handle:
+        details = json.load(handle)
+    assert details["step_timing"]["policy_latency_s"] == [0.2, 0.3]
+    assert details["goal_distance"]["trace"] == [2.0, 0.4]
+    assert details["stop"]["trace"][1] == [0.9, 2.0, 1.0]
+    assert details["pose_injected"]["trace"][0] == [0, 0, 0]
+    assert details["sg_mapping_action_trace"]["samples"] == [{"step": 0}]
+
+    line = episode_line(record)
+    assert "step_timing" not in line
+    assert line["details_file"] == compact["details_file"]
 
 
 # ---------------------------------------------------------------------------
